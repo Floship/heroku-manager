@@ -16,59 +16,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-WORKER_SETTINGS_MAP = {
-    'normal_worker': {
-      'downscale_on_non_empty_queue': False,
-    },
-    'webhooks_worker': {
-      'downscale_on_non_empty_queue': True,
-    },
-    'warehouse_worker': {
-      'downscale_on_non_empty_queue': True,
-    },
-    'crowdfunding_worker': {
-      'downscale_on_non_empty_queue': False,
-    },
-    'approve_worker': {
-      'downscale_on_non_empty_queue': False,
-    },
-    'postfulfill_worker': {
-      'downscale_on_non_empty_queue': False,
-    },
-    'high_p_worker': {
-      'downscale_on_non_empty_queue': False,
-    },
-    'shipping_worker': {
-      'downscale_on_non_empty_queue': True,
-    },
-    'performance_worker': {
-      'downscale_on_non_empty_queue': False,
-    },
-    'lazy_worker': {
-      'downscale_on_non_empty_queue': True,
-    },
-    'invoice_worker': {
-      'downscale_on_non_empty_queue': False,
-    },
-    'integration_worker': {
-      'downscale_on_non_empty_queue': True,
-    },
-    'integration_sync_inventory_worker': {
-      'downscale_on_non_empty_queue': False,
-    },
-    'low_p_worker': {
-      'downscale_on_non_empty_queue': True,
-    },
-    'bulk_action_worker': {
-      'downscale_on_non_empty_queue': False,
-    },
-    'analytics_worker': {
-      'downscale_on_non_empty_queue': False,
-    },
-    'beatworker': {
-      'downscale_on_non_empty_queue': True,
-    },
-}
 
 # Dyno size hierarchy with memory mapping
 DYNO_SIZES = {
@@ -197,7 +144,7 @@ class HerokuDyno:
     def settings(self):
         settings = {}
         settings.update(get_dyno_settings(self.formation_size))
-        settings.update(WORKER_SETTINGS_MAP.get(self.formation_name, {}))
+        settings.update(settings.WORKER_SETTINGS_MAP.get(self.formation_name, {}))
         return settings
 
     @cached_property
