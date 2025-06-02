@@ -653,6 +653,52 @@ class HerokuDyno:
             logger.error(f"Failed to restart dyno {dyno_name}. Response: {response.status_code} - {response.text}")
             return
 
+    def increment_dyno_counter(self, dyno_name=None):
+        """
+        Increments a counter in cache for the specified dyno_name.
+        If the counter exceeds the threshold (from settings), restarts the dyno.
+        The TTL is set only during initialization and never updated.
+
+        Args:
+            dyno_name (str, optional): The name of the dyno. Defaults to self.dyno_name.
+
+        Returns:
+            int: The current counter value after increment
+        """
+        dyno_name = dyno_name or self.dyno_name
+        if not dyno_name:
+            return 0
+
+        cache_key = f'heroku:dyno_counter:{dyno_name}'
+
+        # Get the current counter value
+        counter = cache.get(cache_key)
+
+        # If counter doesn't exist, initialize it with TTL
+        if counter is None:
+            counter = 1
+            # Set TTL from settings or default to 1 hour
+            ttl = getattr(settings, 'DYNO_COUNTER_TTL', 60 * 60)  # Default to 1 hour
+            cache.set(cache_key, counter, timeout=ttl)
+            logger.info(f"Initialized counter for dyno {dyno_name} with value 1 and TTL {ttl} seconds")
+        else:
+            # Increment the counter without changing the TTL
+            counter = cache.incr(cache_key)
+            logger.info(f"Incremented counter for dyno {dyno_name} to {counter}")
+
+        # Get the threshold from settings or default to 15
+        threshold = getattr(settings, 'DYNO_RESTART_THRESHOLD', 15)
+
+        # If counter exceeds threshold, restart the dyno
+        if counter >= threshold:
+            logger.warning(f"Counter for dyno {dyno_name} reached threshold {threshold}. Restarting dyno...")
+            self.restart_dyno(dyno_name)
+            # Reset the counter after restart
+            cache.delete(cache_key)
+            return 0
+
+        return counter
+
     @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10), retry=retry_if_exception_type((SSLError, ConnectionError, Timeout)))
     def get_heroku_logs(self, source="heroku", date_from=None):
         if not self.heroku_api_key:
