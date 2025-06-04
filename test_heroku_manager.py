@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 try:
     # Import the package
-    from heroku_manager import HerokuManager, HerokuDyno, get_dyno_settings, DYNO_SIZES, WORKER_SETTINGS_MAP
+    from heroku_manager import HerokuManager, HerokuDyno, get_dyno_settings, DYNO_SIZES
     logger.info("Successfully imported heroku_manager package")
 
     # Test get_dyno_settings function
@@ -26,9 +26,6 @@ try:
 
     # Test DYNO_SIZES constant
     logger.info(f"Available dyno sizes: {list(DYNO_SIZES.keys())}")
-
-    # Test WORKER_SETTINGS_MAP constant
-    logger.info(f"Worker settings map keys: {list(WORKER_SETTINGS_MAP.keys())}")
 
     # Test HerokuManager singleton
     if not os.environ.get('HEROKU_API_KEY'):
