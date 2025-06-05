@@ -142,10 +142,10 @@ class HerokuDyno:
 
     @cached_property
     def settings(self):
-        settings = {}
-        settings.update(get_dyno_settings(self.formation_size))
-        settings.update(settings.WORKER_SETTINGS_MAP.get(self.formation_name, {}))
-        return settings
+        dyno_settings = {}
+        dyno_settings.update(get_dyno_settings(self.formation_size))
+        dyno_settings.update(settings.WORKER_SETTINGS_MAP.get(self.formation_name, {}))
+        return dyno_settings
 
     @cached_property
     def downscale_on_non_empty_queue(self):
