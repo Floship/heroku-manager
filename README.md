@@ -44,6 +44,14 @@ The package requires the following environment variables:
 - `HEROKU_APP_NAME`: The name of your Heroku app
 - `DYNO`: The name of the current dyno (automatically set by Heroku)
 
+Additionally, you must enable Heroku runtime metrics for proper memory monitoring:
+
+```bash
+heroku labs:enable log-runtime-metrics -a {app_name}
+```
+
+Without this, the `current_memory` feature will not work correctly.
+
 ## Django Settings
 
 When used with Django, the following settings are available:
