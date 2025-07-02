@@ -1,8 +1,10 @@
 import os
 import re
 import requests
+import subprocess
 import threading
 import time
+from datetime import datetime, timedelta
 from requests.exceptions import SSLError, ConnectionError, Timeout
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -110,6 +112,7 @@ class HerokuDyno:
         self._stop_event = threading.Event()
         self._autoscale_thread = None
         self._thread_lock = threading.Lock()
+        self._last_file_cleaning = None
 
     @cached_property
     def _get_proc_class_by_formation_name(self):
@@ -415,7 +418,47 @@ class HerokuDyno:
             self.check_in_dyno()
             self.check_for_sibling_zombie_dynos()
             self.autoscale(continuous=True)
+
+            # Check if it's time to clean old files
+            self.check_and_clean_old_files()
+
             time.sleep(settings.DYNO_AUTOSCALE_INTERVAL)
+
+    def check_and_clean_old_files(self):
+        """
+        Check if it's time to clean old files and perform the cleaning if necessary.
+        """
+        # Get the file cleaning interval from settings or use default (24 hours)
+        file_cleaning_interval = getattr(settings, 'DYNO_FILE_CLEANING_INTERVAL', 24 * 60 * 60)
+
+        # Get the file age threshold from settings or use default (48 hours)
+        file_age_hours = getattr(settings, 'DYNO_FILE_AGE_THRESHOLD', 48)
+
+        # Get the directory to clean from settings or use default (/tmp)
+        directory = getattr(settings, 'DYNO_FILE_CLEANING_DIRECTORY', '/tmp')
+
+        # Check if file cleaning is enabled
+        if not getattr(settings, 'DYNO_FILE_CLEANING_ENABLED', False):
+            return
+
+        # Check if it's time to clean files
+        now = timezone.now()
+        if (self._last_file_cleaning is None or 
+            (now - self._last_file_cleaning).total_seconds() >= file_cleaning_interval):
+
+            logger.info(f"Starting to clean files in {directory} older than {file_age_hours} hours on dyno {self.dyno_name}...")
+
+            # Clean old files
+            success = self.clean_old_files(directory=directory, hours=file_age_hours)
+
+            if success:
+                # Update the last file cleaning timestamp
+                self._last_file_cleaning = now
+                logger.info(f"Successfully cleaned old files in {directory} on dyno {self.dyno_name}. Next cleaning in {file_cleaning_interval/3600:.1f} hours.")
+            else:
+                # If cleaning failed, try again after a shorter interval
+                self._last_file_cleaning = now - timezone.timedelta(seconds=file_cleaning_interval * 0.9)
+                logger.warning(f"Failed to clean old files in {directory} on dyno {self.dyno_name}. Will try again soon.")
 
     def start_continuous_autoscale(self):
         """
@@ -896,3 +939,81 @@ class HerokuDyno:
         patterns = [r"Error R14 \((.*?)\)"]
         timeout = getattr(settings, 'DYNO_ERRORS_TIMEOUT_DURATION', 3600)  # Default to 1 hour
         return self.extract_latest_metric(patterns, cache_key="heroku:r14_error", timeout=timeout, result_type=bool)
+
+    def exec_connect(self, dyno_name=None):
+        """
+        Connect to a dyno using Heroku exec.
+
+        Args:
+            dyno_name (str, optional): The name of the dyno to connect to. Defaults to self.dyno_name.
+
+        Returns:
+            subprocess.Popen: A subprocess object connected to the dyno.
+        """
+        dyno_name = dyno_name or self.dyno_name
+        if not self.app_name or not dyno_name:
+            logger.error("Cannot connect to dyno: app_name or dyno_name is not set.")
+            return None
+
+        try:
+            # Execute the heroku exec command
+            logger.info(f"Connecting to dyno {dyno_name} via heroku exec...")
+            process = subprocess.Popen(
+                ["heroku", "ps:exec", "--dyno", dyno_name, "-a", self.app_name],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            return process
+        except Exception as e:
+            logger.error(f"Failed to connect to dyno {dyno_name} via heroku exec. Error: {e}", exc_info=True)
+            return None
+
+    def clean_old_files(self, dyno_name=None, directory="/tmp", hours=48):
+        """
+        Clean files in the specified directory that are older than the specified number of hours.
+
+        Args:
+            dyno_name (str, optional): The name of the dyno to connect to. Defaults to self.dyno_name.
+            directory (str, optional): The directory to clean. Defaults to "/tmp".
+            hours (int, optional): The age threshold in hours. Defaults to 48.
+
+        Returns:
+            bool: True if the operation was successful, False otherwise.
+        """
+        dyno_name = dyno_name or self.dyno_name
+        if not self.app_name or not dyno_name:
+            logger.error("Cannot clean old files: app_name or dyno_name is not set.")
+            return False
+
+        try:
+            # Connect to the dyno
+            process = self.exec_connect(dyno_name)
+            if not process:
+                return False
+
+            # Create the find command to delete files older than the specified hours
+            find_cmd = f"find {directory} -type f -mtime +{hours/24} -delete\n"
+            logger.info(f"Cleaning files in {directory} older than {hours} hours on dyno {dyno_name}...")
+
+            # Send the command to the dyno
+            process.stdin.write(find_cmd)
+            process.stdin.flush()
+
+            # Wait for the command to complete
+            stdout, stderr = process.communicate(timeout=60)
+
+            if process.returncode != 0:
+                logger.error(f"Failed to clean old files on dyno {dyno_name}. Error: {stderr}")
+                return False
+
+            logger.info(f"Successfully cleaned old files in {directory} on dyno {dyno_name}.")
+            return True
+        except subprocess.TimeoutExpired:
+            process.kill()
+            logger.error(f"Command timed out while cleaning old files on dyno {dyno_name}.")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to clean old files on dyno {dyno_name}. Error: {e}", exc_info=True)
+            return False
