@@ -951,6 +951,7 @@ class HerokuDyno:
             subprocess.Popen: A subprocess object connected to the dyno.
         """
         dyno_name = dyno_name or self.dyno_name
+        app_name = self.app_name
         if not self.app_name or not dyno_name:
             logger.error("Cannot connect to dyno: app_name or dyno_name is not set.")
             return None
@@ -959,11 +960,12 @@ class HerokuDyno:
             # Execute the heroku exec command
             logger.info(f"Connecting to dyno {dyno_name} via heroku exec...")
             process = subprocess.Popen(
-                ["heroku", "ps:exec", "--dyno", dyno_name, "-a", self.app_name],
+                f"heroku ps:exec --dyno {dyno_name} -a {app_name}",
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                shell=True
             )
             return process
         except Exception as e:
