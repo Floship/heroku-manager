@@ -2,6 +2,7 @@ import os
 import re
 import requests
 import subprocess
+from subprocess import run
 import threading
 import time
 from datetime import datetime, timedelta
@@ -940,15 +941,16 @@ class HerokuDyno:
         timeout = getattr(settings, 'DYNO_ERRORS_TIMEOUT_DURATION', 3600)  # Default to 1 hour
         return self.extract_latest_metric(patterns, cache_key="heroku:r14_error", timeout=timeout, result_type=bool)
 
-    def exec_connect(self, dyno_name=None):
+    def exec_connect(self, dyno_name=None, command=None):
         """
-        Connect to a dyno using Heroku exec.
+        Connect to a dyno using Heroku exec and optionally run a command.
 
         Args:
             dyno_name (str, optional): The name of the dyno to connect to. Defaults to self.dyno_name.
+            command (str, optional): The command to run on the dyno. If None, just tests the connection.
 
         Returns:
-            subprocess.Popen: A subprocess object connected to the dyno.
+            subprocess.CompletedProcess: The result of the command execution, or None if the connection failed.
         """
         dyno_name = dyno_name or self.dyno_name
         app_name = self.app_name
@@ -957,17 +959,31 @@ class HerokuDyno:
             return None
 
         try:
+            # Build the command
+            heroku_cmd = [
+                'heroku',
+                'ps:exec',
+                '--dyno', dyno_name,
+                '-a', app_name
+            ]
+
+            # If a command is provided, add it to the heroku command
+            if command:
+                heroku_cmd.extend(['--', 'bash', '-c', command])
+
             # Execute the heroku exec command
             logger.info(f"Connecting to dyno {dyno_name} via heroku exec...")
-            process = subprocess.Popen(
-                f"heroku ps:exec --dyno {dyno_name} -a {app_name}",
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+            result = run(
+                heroku_cmd,
+                capture_output=True,
                 text=True,
-                shell=True
+                check=False  # Don't raise an exception on non-zero return code
             )
-            return process
+
+            if result.returncode != 0:
+                logger.error(f"Command execution failed on dyno {dyno_name}. Error: {result.stderr}")
+
+            return result
         except Exception as e:
             logger.error(f"Failed to connect to dyno {dyno_name} via heroku exec. Error: {e}", exc_info=True)
             return None
@@ -990,32 +1006,23 @@ class HerokuDyno:
             return False
 
         try:
-            # Connect to the dyno
-            process = self.exec_connect(dyno_name)
-            if not process:
-                return False
-
             # Create the find command to delete files older than the specified hours
-            find_cmd = f"find {directory} -type f -mtime +{hours/24} -delete\n"
+            find_cmd = f"find {directory} -type f -mtime +{hours/24} -delete"
             logger.info(f"Cleaning files in {directory} older than {hours} hours on dyno {dyno_name}...")
 
-            # Send the command to the dyno
-            process.stdin.write(find_cmd)
-            process.stdin.flush()
+            # Execute the command on the dyno
+            result = self.exec_connect(dyno_name, command=find_cmd)
 
-            # Wait for the command to complete
-            stdout, stderr = process.communicate(timeout=60)
+            if not result:
+                logger.error(f"Failed to connect to dyno {dyno_name}.")
+                return False
 
-            if process.returncode != 0:
-                logger.error(f"Failed to clean old files on dyno {dyno_name}. Error: {stderr}")
+            if result.returncode != 0:
+                logger.error(f"Failed to clean old files on dyno {dyno_name}. Error: {result.stderr}")
                 return False
 
             logger.info(f"Successfully cleaned old files in {directory} on dyno {dyno_name}.")
             return True
-        except subprocess.TimeoutExpired:
-            process.kill()
-            logger.error(f"Command timed out while cleaning old files on dyno {dyno_name}.")
-            return False
         except Exception as e:
             logger.error(f"Failed to clean old files on dyno {dyno_name}. Error: {e}", exc_info=True)
             return False
