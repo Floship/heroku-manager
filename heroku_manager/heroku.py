@@ -943,50 +943,73 @@ class HerokuDyno:
 
     def exec_connect(self, dyno_name=None, command=None):
         """
-        Connect to a dyno using Heroku exec and optionally run a command.
+        Execute a command on a dyno using the Heroku API.
+
+        This method creates a new one-off dyno to run the command.
 
         Args:
-            dyno_name (str, optional): The name of the dyno to connect to. Defaults to self.dyno_name.
-            command (str, optional): The command to run on the dyno. If None, just tests the connection.
+            dyno_name (str, optional): The name of the target dyno. Defaults to self.dyno_name.
+                Note: This is only used for logging purposes as the API creates a new dyno.
+            command (str, optional): The command to execute on the dyno. If not provided, just connects to the dyno.
 
         Returns:
-            subprocess.CompletedProcess: The result of the command execution, or None if the connection failed.
+            object: A result object with stdout, stderr, and returncode attributes, or None if the operation failed.
         """
         dyno_name = dyno_name or self.dyno_name
-        app_name = self.app_name
         if not self.app_name or not dyno_name:
             logger.error("Cannot connect to dyno: app_name or dyno_name is not set.")
             return None
 
-        try:
-            # Build the command
-            heroku_cmd = [
-                'heroku',
-                'ps:exec',
-                '--dyno', dyno_name,
-                '-a', app_name
-            ]
-
-            # If a command is provided, add it to the heroku command
-            if command:
-                heroku_cmd.extend(['--', 'bash', '-c', command])
-
-            # Execute the heroku exec command
-            logger.info(f"Connecting to dyno {dyno_name} via heroku exec...")
-            result = run(
-                heroku_cmd,
-                capture_output=True,
-                text=True,
-                check=False  # Don't raise an exception on non-zero return code
-            )
-
-            if result.returncode != 0:
-                logger.error(f"Command execution failed on dyno {dyno_name}. Error: {result.stderr}")
-
-            return result
-        except Exception as e:
-            logger.error(f"Failed to connect to dyno {dyno_name} via heroku exec. Error: {e}", exc_info=True)
+        if not self.heroku_api_key:
+            logger.error("Cannot execute command: HEROKU_API_KEY is not set.")
             return None
+
+        try:
+            # Use the Heroku API to run the command on a one-off dyno
+            url = f'https://api.heroku.com/apps/{self.app_name}/dynos'
+            headers = {
+                'Accept': 'application/vnd.heroku+json; version=3',
+                'Authorization': f'Bearer {self.heroku_api_key}',
+                'Content-Type': 'application/json'
+            }
+
+            # Prepare the payload for the API request
+            payload = {
+                'command': f'bash -c "{command}"' if command else 'bash',
+                'attach': True,
+                'size': self.formation_size,
+                'type': 'run'
+            }
+
+            logger.info(f"Executing command on a one-off dyno via Heroku API (target dyno: {dyno_name})...")
+            response = requests.post(url, headers=headers, json=payload)
+
+            if response.status_code == 201:  # 201 Created
+                # Successfully created a one-off dyno
+                dyno_data = response.json()
+                logger.info(f"Command execution started on one-off dyno {dyno_data.get('name')}.")
+
+                # Create a result object similar to what subprocess.run would return
+                class ApiResult:
+                    def __init__(self, stdout, stderr, returncode):
+                        self.stdout = stdout
+                        self.stderr = stderr
+                        self.returncode = returncode
+
+                # For API execution, we don't have direct access to stdout/stderr
+                # We could potentially fetch logs, but for now we'll just return the response data
+                return ApiResult(
+                    stdout=str(dyno_data),
+                    stderr="",
+                    returncode=0
+                )
+            else:
+                logger.error(f"Failed to execute command via Heroku API. Response: {response.status_code} - {response.text}")
+                return None
+        except Exception as e:
+            logger.error(f"Failed to execute command via Heroku API. Error: {e}", exc_info=True)
+            return None
+
 
     def clean_old_files(self, dyno_name=None, directory="/tmp", hours=48):
         """
