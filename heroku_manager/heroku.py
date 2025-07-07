@@ -1,8 +1,11 @@
 import os
 import re
 import requests
+import subprocess
+from subprocess import run
 import threading
 import time
+from datetime import datetime, timedelta
 from requests.exceptions import SSLError, ConnectionError, Timeout
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -110,6 +113,7 @@ class HerokuDyno:
         self._stop_event = threading.Event()
         self._autoscale_thread = None
         self._thread_lock = threading.Lock()
+        self._last_file_cleaning = None
 
     @cached_property
     def _get_proc_class_by_formation_name(self):
@@ -415,7 +419,47 @@ class HerokuDyno:
             self.check_in_dyno()
             self.check_for_sibling_zombie_dynos()
             self.autoscale(continuous=True)
+
+            # Check if it's time to clean old files
+            self.check_and_clean_old_files()
+
             time.sleep(settings.DYNO_AUTOSCALE_INTERVAL)
+
+    def check_and_clean_old_files(self):
+        """
+        Check if it's time to clean old files and perform the cleaning if necessary.
+        """
+        # Get the file cleaning interval from settings or use default (24 hours)
+        file_cleaning_interval = getattr(settings, 'DYNO_FILE_CLEANING_INTERVAL', 24 * 60 * 60)
+
+        # Get the file age threshold from settings or use default (48 hours)
+        file_age_hours = getattr(settings, 'DYNO_FILE_AGE_THRESHOLD', 48)
+
+        # Get the directory to clean from settings or use default (/tmp)
+        directory = getattr(settings, 'DYNO_FILE_CLEANING_DIRECTORY', '/tmp')
+
+        # Check if file cleaning is enabled
+        if not getattr(settings, 'DYNO_FILE_CLEANING_ENABLED', False):
+            return
+
+        # Check if it's time to clean files
+        now = timezone.now()
+        if (self._last_file_cleaning is None or 
+            (now - self._last_file_cleaning).total_seconds() >= file_cleaning_interval):
+
+            logger.info(f"Starting to clean files in {directory} older than {file_age_hours} hours on dyno {self.dyno_name}...")
+
+            # Clean old files
+            success = self.clean_old_files(directory=directory, hours=file_age_hours)
+
+            if success:
+                # Update the last file cleaning timestamp
+                self._last_file_cleaning = now
+                logger.info(f"Successfully cleaned old files in {directory} on dyno {self.dyno_name}. Next cleaning in {file_cleaning_interval/3600:.1f} hours.")
+            else:
+                # If cleaning failed, try again after a shorter interval
+                self._last_file_cleaning = now - timezone.timedelta(seconds=file_cleaning_interval * 0.9)
+                logger.warning(f"Failed to clean old files in {directory} on dyno {self.dyno_name}. Will try again soon.")
 
     def start_continuous_autoscale(self):
         """
@@ -896,3 +940,112 @@ class HerokuDyno:
         patterns = [r"Error R14 \((.*?)\)"]
         timeout = getattr(settings, 'DYNO_ERRORS_TIMEOUT_DURATION', 3600)  # Default to 1 hour
         return self.extract_latest_metric(patterns, cache_key="heroku:r14_error", timeout=timeout, result_type=bool)
+
+    def exec_connect(self, dyno_name=None, command=None):
+        """
+        Execute a command on a dyno using the Heroku API.
+
+        This method creates a new one-off dyno to run the command.
+
+        Args:
+            dyno_name (str, optional): The name of the target dyno. Defaults to self.dyno_name.
+                Note: This is only used for logging purposes as the API creates a new dyno.
+            command (str, optional): The command to execute on the dyno. If not provided, just connects to the dyno.
+
+        Returns:
+            object: A result object with stdout, stderr, and returncode attributes, or None if the operation failed.
+        """
+        dyno_name = dyno_name or self.dyno_name
+        if not self.app_name or not dyno_name:
+            logger.error("Cannot connect to dyno: app_name or dyno_name is not set.")
+            return None
+
+        if not self.heroku_api_key:
+            logger.error("Cannot execute command: HEROKU_API_KEY is not set.")
+            return None
+
+        try:
+            # Use the Heroku API to run the command on a one-off dyno
+            url = f'https://api.heroku.com/apps/{self.app_name}/dynos'
+            headers = {
+                'Accept': 'application/vnd.heroku+json; version=3',
+                'Authorization': f'Bearer {self.heroku_api_key}',
+                'Content-Type': 'application/json'
+            }
+
+            # Prepare the payload for the API request
+            payload = {
+                'command': f'bash -c "{command}"' if command else 'bash',
+                'attach': True,
+                'size': self.formation_size,
+                'type': 'run'
+            }
+
+            logger.info(f"Executing command on a one-off dyno via Heroku API (target dyno: {dyno_name})...")
+            response = requests.post(url, headers=headers, json=payload)
+
+            if response.status_code == 201:  # 201 Created
+                # Successfully created a one-off dyno
+                dyno_data = response.json()
+                logger.info(f"Command execution started on one-off dyno {dyno_data.get('name')}.")
+
+                # Create a result object similar to what subprocess.run would return
+                class ApiResult:
+                    def __init__(self, stdout, stderr, returncode):
+                        self.stdout = stdout
+                        self.stderr = stderr
+                        self.returncode = returncode
+
+                # For API execution, we don't have direct access to stdout/stderr
+                # We could potentially fetch logs, but for now we'll just return the response data
+                return ApiResult(
+                    stdout=str(dyno_data),
+                    stderr="",
+                    returncode=0
+                )
+            else:
+                logger.error(f"Failed to execute command via Heroku API. Response: {response.status_code} - {response.text}")
+                return None
+        except Exception as e:
+            logger.error(f"Failed to execute command via Heroku API. Error: {e}", exc_info=True)
+            return None
+
+
+    def clean_old_files(self, dyno_name=None, directory="/tmp", hours=48):
+        """
+        Clean files in the specified directory that are older than the specified number of hours.
+
+        Args:
+            dyno_name (str, optional): The name of the dyno to connect to. Defaults to self.dyno_name.
+            directory (str, optional): The directory to clean. Defaults to "/tmp".
+            hours (int, optional): The age threshold in hours. Defaults to 48.
+
+        Returns:
+            bool: True if the operation was successful, False otherwise.
+        """
+        dyno_name = dyno_name or self.dyno_name
+        if not self.app_name or not dyno_name:
+            logger.error("Cannot clean old files: app_name or dyno_name is not set.")
+            return False
+
+        try:
+            # Create the find command to delete files older than the specified hours
+            find_cmd = f"find {directory} -type f -mtime +{hours/24} -delete"
+            logger.info(f"Cleaning files in {directory} older than {hours} hours on dyno {dyno_name}...")
+
+            # Execute the command on the dyno
+            result = self.exec_connect(dyno_name, command=find_cmd)
+
+            if not result:
+                logger.error(f"Failed to connect to dyno {dyno_name}.")
+                return False
+
+            if result.returncode != 0:
+                logger.error(f"Failed to clean old files on dyno {dyno_name}. Error: {result.stderr}")
+                return False
+
+            logger.info(f"Successfully cleaned old files in {directory} on dyno {dyno_name}.")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clean old files on dyno {dyno_name}. Error: {e}", exc_info=True)
+            return False
