@@ -1030,8 +1030,9 @@ class HerokuDyno:
 
         try:
             # Create the find command to delete files older than the specified hours
-            find_cmd = f"find {directory} -type f -mtime +{hours/24} -delete"
-            logger.info(f"Cleaning files in {directory} older than {hours} hours on dyno {dyno_name}...")
+            # Exclude env.d and mask directories
+            find_cmd = f"find {directory} -type f -mtime +{hours/24} -not -path '{directory}/env.d*' -not -path '{directory}/mask*' -delete"
+            logger.info(f"Cleaning files in {directory} older than {hours} hours on dyno {dyno_name}, excluding env.d and mask...")
 
             # Execute the command on the dyno
             result = self.exec_connect(dyno_name, command=find_cmd)
