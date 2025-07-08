@@ -112,6 +112,7 @@ class HerokuDyno:
         self.heroku_api_key = os.environ.get('HEROKU_API_KEY')
         self._stop_event = threading.Event()
         self._autoscale_thread = None
+        self._file_cleaning_thread = None
         self._thread_lock = threading.Lock()
         self._last_file_cleaning = None
 
@@ -425,6 +426,13 @@ class HerokuDyno:
 
             time.sleep(settings.DYNO_AUTOSCALE_INTERVAL)
 
+    def _run_continuous_file_cleaning(self):
+        while not self._stop_event.is_set():
+            # Check if it's time to clean old files
+            self.check_and_clean_old_files()
+
+            time.sleep(settings.DYNO_AUTOSCALE_INTERVAL)
+
     def check_and_clean_old_files(self):
         """
         Check if it's time to clean old files and perform the cleaning if necessary.
@@ -476,6 +484,21 @@ class HerokuDyno:
             logger.info(f"Continuous autoscaling thread started for {self.dyno_name} with interval {settings.DYNO_AUTOSCALE_INTERVAL} seconds.")
             return self._autoscale_thread
 
+    def start_continuous_file_cleaning(self):
+        """
+        Start continuous file cleaning on a separate thread.
+        """
+        with self._thread_lock:
+            if self._file_cleaning_thread and self._file_cleaning_thread.is_alive():
+                logger.warning(f"File cleaning thread for {self.dyno_name} is already running.")
+                return
+
+            self._stop_event.clear()
+            self._file_cleaning_thread = threading.Thread(target=self._supervised_run_file_cleaning, args=(), daemon=True)
+            self._file_cleaning_thread.start()
+            logger.info(f"Continuous file cleaning thread started for {self.dyno_name} with interval {settings.DYNO_AUTOSCALE_INTERVAL} seconds.")
+            return self._file_cleaning_thread
+
     def stop_continuous_autoscale(self):
         """Stop the continuous autoscaling thread."""
         with self._thread_lock:
@@ -494,6 +517,22 @@ class HerokuDyno:
             self._autoscale_thread = None
             logger.info(f"Stopped continuous autoscaling for {self.dyno_name}.")
 
+    def stop_continuous_file_cleaning(self):
+        """Stop the continuous file cleaning thread."""
+        with self._thread_lock:
+            if not self._file_cleaning_thread or not self._file_cleaning_thread.is_alive():
+                # logger.warning(f"No running file cleaning thread to stop for {self.dyno_name}.")
+                return
+
+            self._stop_event.set()
+
+            # Ensure we are not calling join on the current thread
+            if threading.current_thread() != self._file_cleaning_thread:
+                self._file_cleaning_thread.join()
+
+            self._file_cleaning_thread = None
+            logger.info(f"Stopped continuous file cleaning for {self.dyno_name}.")
+
     def _supervised_run(self):
         """Supervised loop to restart the thread if it exits."""
         while not self._stop_event.is_set():
@@ -501,6 +540,15 @@ class HerokuDyno:
                 self._run_continuous()
             except Exception as e:
                 logger.error(f"Autoscaler thread for {self.dyno_name} crashed. Restarting... Error: {e}", exc_info=True)
+                time.sleep(15)  # Short delay before restarting
+
+    def _supervised_run_file_cleaning(self):
+        """Supervised loop to restart the file cleaning thread if it exits."""
+        while not self._stop_event.is_set():
+            try:
+                self._run_continuous_file_cleaning()
+            except Exception as e:
+                logger.error(f"File cleaning thread for {self.dyno_name} crashed. Restarting... Error: {e}", exc_info=True)
                 time.sleep(15)  # Short delay before restarting
 
     # Registers dyno as alive in redis cache table so other workers can check if it's alive and restart it if it doesn't respond for a while
