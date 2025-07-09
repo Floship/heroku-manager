@@ -437,8 +437,8 @@ class HerokuDyno:
         """
         Check if it's time to clean old files and perform the cleaning if necessary.
         """
-        # Get the file cleaning interval from settings or use default (24 hours)
-        file_cleaning_interval = getattr(settings, 'DYNO_FILE_CLEANING_INTERVAL', 24 * 60 * 60)
+        # Get the file cleaning interval from settings or use default (1 hour)
+        file_cleaning_interval = int(getattr(settings, 'DYNO_FILE_CLEANING_INTERVAL', 60 * 60))
 
         # Get the file age threshold from settings or use default (48 hours)
         file_age_hours = getattr(settings, 'DYNO_FILE_AGE_THRESHOLD', 48)
