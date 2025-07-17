@@ -914,6 +914,11 @@ class HerokuDyno:
         # Search for matches in reverse order to find the most recent occurrence
         for log_entry in reversed(logs_parsed):
             message = log_entry.get("message", "")
+            timestamp = log_entry.get("timestamp")
+            seconds_ago = (timezone.now() - timestamp).total_seconds() if timestamp else None
+            if seconds_ago is not None and seconds_ago > timeout:
+                # Skip logs older than the timeout period
+                continue
             for pattern in compiled_patterns:
                 match = pattern.search(message)
                 if match:
@@ -975,7 +980,7 @@ class HerokuDyno:
             bool: The R15 error message if found, or None if not found.
         """
         patterns = [r"Error R15 \((.*?)\)"]
-        timeout = getattr(settings, 'DYNO_ERRORS_TIMEOUT_DURATION', 3600)  # Default to 1 hour
+        timeout = getattr(settings, 'DYNO_ERRORS_TIMEOUT_DURATION', 60)  # Default to 60 seconds
         return self.extract_latest_metric(patterns, cache_key="heroku:r15_error", timeout=timeout, result_type=bool)
 
     def get_r14_from_logs(self):
@@ -986,7 +991,7 @@ class HerokuDyno:
             bool: The R14 error message if found, or None if not found.
         """
         patterns = [r"Error R14 \((.*?)\)"]
-        timeout = getattr(settings, 'DYNO_ERRORS_TIMEOUT_DURATION', 3600)  # Default to 1 hour
+        timeout = getattr(settings, 'DYNO_ERRORS_TIMEOUT_DURATION', 60)  # Default to 60 seconds
         return self.extract_latest_metric(patterns, cache_key="heroku:r14_error", timeout=timeout, result_type=bool)
 
     def exec_connect(self, dyno_name=None, command=None):
