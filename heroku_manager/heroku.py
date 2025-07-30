@@ -203,6 +203,8 @@ class HerokuDyno:
 
     @property
     def is_on_original_formation_size_or_lower(self):
+        if self.original_formation_size is None:
+            self.set_original_formation_size()
         # Determine lower or equal formation sizes
         lower_size_formations = [
             dyno for dyno, details in DYNO_SIZES.items()
@@ -319,8 +321,8 @@ class HerokuDyno:
     def original_size_cache_key(self):
         return f'heroku:original_formation_size:{self.formation_name}'
 
-    def set_original_formation_size(self):
-        if not cache.get(self.original_size_cache_key):
+    def set_original_formation_size(self, value=None):
+        if not cache.get(self.original_size_cache_key) or value:
             cache.set(self.original_size_cache_key, {"size": self.formation_size, "time": timezone.now()}, timeout=None)
 
     def clear_original_formation_size(self):
