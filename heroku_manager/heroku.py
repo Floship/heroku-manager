@@ -224,22 +224,25 @@ class HerokuDyno:
 
     @property
     def requires_upscale(self):
-        return self.current_memory_usage_percentage > settings.UPSCALE_PERCENTAGE_HIGH_MEM_USE or self.detected_r15
+        return bool(self.current_memory_usage_percentage > settings.UPSCALE_PERCENTAGE_HIGH_MEM_USE or self.detected_r15)
 
     @property
-    def allow_downscale(self):
+    def allow_downscale(self, shutdown=False):
         return not self.requires_upscale and \
             not self.is_still_high_memory_usage_for_downscale and \
             not self.detected_r14 and \
-            (self.downscale_on_non_empty_queue or self.no_tasks_in_queue)
+            (
+                shutdown or \
+                (self.downscale_on_non_empty_queue or self.no_tasks_in_queue)
+            )
 
     @property
     def detected_r15(self):
-        return self.get_r15_from_logs()
+        return bool(self.get_r15_from_logs())
 
     @property
     def detected_r14(self):
-        return self.get_r14_from_logs()
+        return bool(self.get_r14_from_logs())
 
     @property
     def avg_load_1min(self):
@@ -676,11 +679,6 @@ class HerokuDyno:
             return
 
         with cache.lock(self.downscale_cache_key, expire=30):
-            if original_formation_size == self.formation_size:
-                logger.info("Formation is already at the original size.")
-                self.clear_original_formation_size()
-                return
-
             # Check if formation is on lower size than original size and skip downscale
             if self.is_on_original_formation_size_or_lower:
                 logger.info(f"Formation {self.formation_name} is already at original or lower size than the original size.")
