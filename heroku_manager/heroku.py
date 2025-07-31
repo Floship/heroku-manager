@@ -203,7 +203,7 @@ class HerokuDyno:
 
     @property
     def is_on_original_formation_size_or_lower(self):
-        if self.original_formation_size is None:
+        if not self.original_formation_size or self.original_formation_size not in DYNO_SIZES:
             self.set_original_formation_size()
         # Determine lower or equal formation sizes
         lower_size_formations = [
@@ -315,7 +315,7 @@ class HerokuDyno:
                         return dyno
             return default_formation_size
 
-        return response.json().get('size').lower()
+        return response.json().get('size').lower() or default_formation_size
 
     @cached_property
     def next_formation_size(self):
