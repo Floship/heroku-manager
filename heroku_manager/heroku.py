@@ -234,7 +234,7 @@ class HerokuDyno:
             (self.downscale_on_non_empty_queue or self.no_tasks_in_queue)
             
     @property
-    def allow_downcale_on_shutdown(self):
+    def allow_downscale_on_shutdown(self):
         """
         Allow downscale on shutdown if the dyno is not in high memory usage state.
         """
