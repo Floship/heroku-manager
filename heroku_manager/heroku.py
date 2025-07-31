@@ -227,14 +227,20 @@ class HerokuDyno:
         return bool(self.current_memory_usage_percentage > settings.UPSCALE_PERCENTAGE_HIGH_MEM_USE or self.detected_r15)
 
     @property
-    def allow_downscale(self, shutdown=False):
+    def allow_downscale(self):
         return not self.requires_upscale and \
             not self.is_still_high_memory_usage_for_downscale and \
             not self.detected_r14 and \
-            (
-                shutdown or \
-                (self.downscale_on_non_empty_queue or self.no_tasks_in_queue)
-            )
+            (self.downscale_on_non_empty_queue or self.no_tasks_in_queue)
+            
+    @property
+    def allow_downcale_on_shutdown(self):
+        """
+        Allow downscale on shutdown if the dyno is not in high memory usage state.
+        """
+        return not self.requires_upscale and \
+            not self.is_still_high_memory_usage_for_downscale and \
+            not self.detected_r14
 
     @property
     def detected_r15(self):
