@@ -150,14 +150,19 @@ class HerokuDyno:
         dyno_settings = {}
         dyno_settings.update(get_dyno_settings(self.formation_size))
         dyno_settings.update(settings.WORKER_SETTINGS_MAP.get(self.formation_name, {}))
+        
         return dyno_settings
 
     @cached_property
     def downscale_on_non_empty_queue(self):
         return self.settings.get("downscale_on_non_empty_queue", True)
+    
+    @cached_property
+    def max_dyno_size(self):
+        return self.settings.get("max_dyno_size", "performance-2xl")
 
     @cached_property
-    def threads_avaiable(self):
+    def threads_available(self):
         return self.settings.get("threads_available", 1)
 
     @property
@@ -598,8 +603,12 @@ class HerokuDyno:
         '''
         Upscale the dyno to the next level in the hierarchy for a period of X hours
         '''
-        # Ensure upscale is only executed once every settings.DYNO_TIME_BETWEEN_SCALES seconds for this dyno type
+        # Check if not already at max_dyno_size
+        if self.formation_size == self.max_dyno_size:
+            logger.info(f"Formation {self.formation_name} is already at max size {self.max_dyno_size}.")
+            return
 
+        # Ensure upscale is only executed once every settings.DYNO_TIME_BETWEEN_SCALES seconds for this dyno type
         with cache.lock(self.upscaling_cache_key, expire=30):
             if self.is_upscaling:
                 logger.info(f"Upscaling formation {self.formation_name} is already in progress.")
