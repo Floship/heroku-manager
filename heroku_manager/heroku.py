@@ -802,7 +802,7 @@ class HerokuDyno:
             self.restart_dyno(dyno_name)
             # Reset the counter after restart
             cache.delete(cache_key)
-            return 0
+            return 'restarted'
 
         return counter
 
