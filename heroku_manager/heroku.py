@@ -150,14 +150,19 @@ class HerokuDyno:
         dyno_settings = {}
         dyno_settings.update(get_dyno_settings(self.formation_size))
         dyno_settings.update(settings.WORKER_SETTINGS_MAP.get(self.formation_name, {}))
+        
         return dyno_settings
 
     @cached_property
     def downscale_on_non_empty_queue(self):
         return self.settings.get("downscale_on_non_empty_queue", True)
+    
+    @cached_property
+    def max_dyno_size(self):
+        return self.settings.get("max_dyno_size", "performance-2xl")
 
     @cached_property
-    def threads_avaiable(self):
+    def threads_available(self):
         return self.settings.get("threads_available", 1)
 
     @property
@@ -203,6 +208,8 @@ class HerokuDyno:
 
     @property
     def is_on_original_formation_size_or_lower(self):
+        if not self.original_formation_size or self.original_formation_size not in DYNO_SIZES:
+            self.set_original_formation_size()
         # Determine lower or equal formation sizes
         lower_size_formations = [
             dyno for dyno, details in DYNO_SIZES.items()
@@ -222,7 +229,7 @@ class HerokuDyno:
 
     @property
     def requires_upscale(self):
-        return self.current_memory_usage_percentage > settings.UPSCALE_PERCENTAGE_HIGH_MEM_USE or self.detected_r15
+        return bool(self.current_memory_usage_percentage > settings.UPSCALE_PERCENTAGE_HIGH_MEM_USE or self.detected_r15)
 
     @property
     def allow_downscale(self):
@@ -230,14 +237,23 @@ class HerokuDyno:
             not self.is_still_high_memory_usage_for_downscale and \
             not self.detected_r14 and \
             (self.downscale_on_non_empty_queue or self.no_tasks_in_queue)
+            
+    @property
+    def allow_downscale_on_shutdown(self):
+        """
+        Allow downscale on shutdown if the dyno is not in high memory usage state.
+        """
+        return not self.requires_upscale and \
+            not self.is_still_high_memory_usage_for_downscale and \
+            not self.detected_r14
 
     @property
     def detected_r15(self):
-        return self.get_r15_from_logs()
+        return bool(self.get_r15_from_logs())
 
     @property
     def detected_r14(self):
-        return self.get_r14_from_logs()
+        return bool(self.get_r14_from_logs())
 
     @property
     def avg_load_1min(self):
@@ -304,7 +320,7 @@ class HerokuDyno:
                         return dyno
             return default_formation_size
 
-        return response.json().get('size').lower()
+        return response.json().get('size').lower() or default_formation_size
 
     @cached_property
     def next_formation_size(self):
@@ -319,8 +335,8 @@ class HerokuDyno:
     def original_size_cache_key(self):
         return f'heroku:original_formation_size:{self.formation_name}'
 
-    def set_original_formation_size(self):
-        if not cache.get(self.original_size_cache_key):
+    def set_original_formation_size(self, value=None):
+        if not cache.get(self.original_size_cache_key) or value:
             cache.set(self.original_size_cache_key, {"size": self.formation_size, "time": timezone.now()}, timeout=None)
 
     def clear_original_formation_size(self):
@@ -587,8 +603,12 @@ class HerokuDyno:
         '''
         Upscale the dyno to the next level in the hierarchy for a period of X hours
         '''
-        # Ensure upscale is only executed once every settings.DYNO_TIME_BETWEEN_SCALES seconds for this dyno type
+        # Check if not already at max_dyno_size
+        if self.formation_size == self.max_dyno_size:
+            logger.info(f"Formation {self.formation_name} is already at max size {self.max_dyno_size}.")
+            return
 
+        # Ensure upscale is only executed once every settings.DYNO_TIME_BETWEEN_SCALES seconds for this dyno type
         with cache.lock(self.upscaling_cache_key, expire=30):
             if self.is_upscaling:
                 logger.info(f"Upscaling formation {self.formation_name} is already in progress.")
@@ -674,11 +694,6 @@ class HerokuDyno:
             return
 
         with cache.lock(self.downscale_cache_key, expire=30):
-            if original_formation_size == self.formation_size:
-                logger.info("Formation is already at the original size.")
-                self.clear_original_formation_size()
-                return
-
             # Check if formation is on lower size than original size and skip downscale
             if self.is_on_original_formation_size_or_lower:
                 logger.info(f"Formation {self.formation_name} is already at original or lower size than the original size.")
@@ -918,6 +933,11 @@ class HerokuDyno:
         # Search for matches in reverse order to find the most recent occurrence
         for log_entry in reversed(logs_parsed):
             message = log_entry.get("message", "")
+            timestamp = log_entry.get("timestamp")
+            seconds_ago = (timezone.now() - timestamp).total_seconds() if timestamp else None
+            if seconds_ago is not None and seconds_ago > timeout:
+                # Skip logs older than the timeout period
+                continue
             for pattern in compiled_patterns:
                 match = pattern.search(message)
                 if match:
@@ -979,7 +999,7 @@ class HerokuDyno:
             bool: The R15 error message if found, or None if not found.
         """
         patterns = [r"Error R15 \((.*?)\)"]
-        timeout = getattr(settings, 'DYNO_ERRORS_TIMEOUT_DURATION', 3600)  # Default to 1 hour
+        timeout = getattr(settings, 'DYNO_ERRORS_TIMEOUT_DURATION', 60)  # Default to 60 seconds
         return self.extract_latest_metric(patterns, cache_key="heroku:r15_error", timeout=timeout, result_type=bool)
 
     def get_r14_from_logs(self):
@@ -990,7 +1010,7 @@ class HerokuDyno:
             bool: The R14 error message if found, or None if not found.
         """
         patterns = [r"Error R14 \((.*?)\)"]
-        timeout = getattr(settings, 'DYNO_ERRORS_TIMEOUT_DURATION', 3600)  # Default to 1 hour
+        timeout = getattr(settings, 'DYNO_ERRORS_TIMEOUT_DURATION', 60)  # Default to 60 seconds
         return self.extract_latest_metric(patterns, cache_key="heroku:r14_error", timeout=timeout, result_type=bool)
 
     def exec_connect(self, dyno_name=None, command=None):
