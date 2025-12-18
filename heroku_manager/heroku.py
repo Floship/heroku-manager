@@ -815,6 +815,7 @@ class HerokuDyno:
                         "lines": 200  # Adjusting this almost does nothing
                     }
 
+                    response = None
                     try:
                         # Step 2: Start a log session and retrieve logs
                         response = requests.post(url, headers=headers, json=payload)
@@ -823,7 +824,10 @@ class HerokuDyno:
                         logger.error(f"SSLEOFError occurred while retrieving log session: {e}")
                         return None
                     except requests.exceptions.RequestException as e:
-                        logger.error(f"Failed to retrieve log session. Status code: {response.status_code} - {response.text}")
+                        error_response = getattr(e, "response", None) or response
+                        status_code = getattr(error_response, "status_code", "n/a")
+                        response_text = getattr(error_response, "text", str(e))
+                        logger.error(f"Failed to retrieve log session. Status code: {status_code} - {response_text}")
                         return None
 
                     log_url = response.json().get("logplex_url")
