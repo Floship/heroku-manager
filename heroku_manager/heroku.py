@@ -406,14 +406,14 @@ class HerokuDyno:
 
         # If continuous mode, return stats
         if continuous:
-            logger.info(f"Dyno {self.dyno_name} stats: "
-                        f"Formation Size: {self.formation_size}, "
-                        f"Memory Usage: {self.current_memory_usage} / {self.available_memory} MB, "
-                        f"Load Avg (1min): {self.avg_load_1min}, "
-                        f"Tasks in Queue: {self.tasks_in_queue}, "
-                        f"Threads Used: {self.threads_used}, "
-                        f"Detected R14: {self.detected_r14}, "
-                        f"Detected R15: {self.detected_r15}, "
+            logger.debug(f"Dyno {self.dyno_name} stats: "
+                         f"Formation Size: {self.formation_size}, "
+                         f"Memory Usage: {self.current_memory_usage} / {self.available_memory} MB, "
+                         f"Load Avg (1min): {self.avg_load_1min}, "
+                         f"Tasks in Queue: {self.tasks_in_queue}, "
+                         f"Threads Used: {self.threads_used}, "
+                         f"Detected R14: {self.detected_r14}, "
+                         f"Detected R15: {self.detected_r15}, "
                     )
 
         # ignore beatworker if settings.DYNO_AUTOSCALE_ENABLED_FOR_BEATWORKER is False
@@ -471,7 +471,7 @@ class HerokuDyno:
         if (self._last_file_cleaning is None or 
             (now - self._last_file_cleaning).total_seconds() >= file_cleaning_interval):
 
-            logger.info(f"Starting to clean files in {directory} older than {file_age_hours} hours on dyno {self.dyno_name}...")
+            logger.debug(f"Starting to clean files in {directory} older than {file_age_hours} hours on dyno {self.dyno_name}...")
 
             # Clean old files
             success = self.clean_old_files(directory=directory, hours=file_age_hours)
@@ -479,7 +479,7 @@ class HerokuDyno:
             if success:
                 # Update the last file cleaning timestamp
                 self._last_file_cleaning = now
-                logger.info(f"Successfully cleaned old files in {directory} on dyno {self.dyno_name}. Next cleaning in {file_cleaning_interval/3600:.1f} hours.")
+                logger.debug(f"Successfully cleaned old files in {directory} on dyno {self.dyno_name}. Next cleaning in {file_cleaning_interval/3600:.1f} hours.")
             else:
                 # If cleaning failed, try again after a shorter interval
                 self._last_file_cleaning = now - timezone.timedelta(seconds=file_cleaning_interval * 0.9)
@@ -497,7 +497,7 @@ class HerokuDyno:
             self._stop_event.clear()
             self._autoscale_thread = threading.Thread(target=self._supervised_run, args=(), daemon=True)
             self._autoscale_thread.start()
-            logger.info(f"Continuous autoscaling thread started for {self.dyno_name} with interval {settings.DYNO_AUTOSCALE_INTERVAL} seconds.")
+            logger.debug(f"Continuous autoscaling thread started for {self.dyno_name} with interval {settings.DYNO_AUTOSCALE_INTERVAL} seconds.")
             return self._autoscale_thread
 
     def start_continuous_file_cleaning(self):
@@ -512,7 +512,7 @@ class HerokuDyno:
             self._stop_event.clear()
             self._file_cleaning_thread = threading.Thread(target=self._supervised_run_file_cleaning, args=(), daemon=True)
             self._file_cleaning_thread.start()
-            logger.info(f"Continuous file cleaning thread started for {self.dyno_name} with interval {settings.DYNO_AUTOSCALE_INTERVAL} seconds.")
+            logger.debug(f"Continuous file cleaning thread started for {self.dyno_name} with interval {settings.DYNO_AUTOSCALE_INTERVAL} seconds.")
             return self._file_cleaning_thread
 
     def stop_continuous_autoscale(self):
@@ -531,7 +531,7 @@ class HerokuDyno:
                 self._autoscale_thread.join()
 
             self._autoscale_thread = None
-            logger.info(f"Stopped continuous autoscaling for {self.dyno_name}.")
+            logger.debug(f"Stopped continuous autoscaling for {self.dyno_name}.")
 
     def stop_continuous_file_cleaning(self):
         """Stop the continuous file cleaning thread."""
@@ -547,7 +547,7 @@ class HerokuDyno:
                 self._file_cleaning_thread.join()
 
             self._file_cleaning_thread = None
-            logger.info(f"Stopped continuous file cleaning for {self.dyno_name}.")
+            logger.debug(f"Stopped continuous file cleaning for {self.dyno_name}.")
 
     def _supervised_run(self):
         """Supervised loop to restart the thread if it exits."""
@@ -605,13 +605,13 @@ class HerokuDyno:
         '''
         # Check if not already at max_dyno_size
         if self.formation_size == self.max_dyno_size:
-            logger.info(f"Formation {self.formation_name} is already at max size {self.max_dyno_size}.")
+            logger.debug(f"Formation {self.formation_name} is already at max size {self.max_dyno_size}.")
             return
 
         # Ensure upscale is only executed once every settings.DYNO_TIME_BETWEEN_SCALES seconds for this dyno type
         with cache.lock(self.upscaling_cache_key, expire=30):
             if self.is_upscaling:
-                logger.info(f"Upscaling formation {self.formation_name} is already in progress.")
+                logger.debug(f"Upscaling formation {self.formation_name} is already in progress.")
                 return
 
             self.set_upscaling()
@@ -622,7 +622,7 @@ class HerokuDyno:
 
         next_level = self.next_formation_size
         if not next_level:
-            logger.info("Formation is already at the highest level or unrecognized size.")
+            logger.debug("Formation is already at the highest level or unrecognized size.")
             return self.formation_size
 
         # Store original dyno size in Redis cache
@@ -696,7 +696,7 @@ class HerokuDyno:
         with cache.lock(self.downscale_cache_key, expire=30):
             # Check if formation is on lower size than original size and skip downscale
             if self.is_on_original_formation_size_or_lower:
-                logger.info(f"Formation {self.formation_name} is already at original or lower size than the original size.")
+                logger.debug(f"Formation {self.formation_name} is already at original or lower size than the original size.")
                 self.clear_original_formation_size()
                 return
 
@@ -732,7 +732,7 @@ class HerokuDyno:
         cache_key = f'heroku:restart_dyno:{dyno_name}'
         with cache.lock(cache_key, expire=30):
             if cache.get(cache_key):
-                logger.info(f"Restarting dyno {dyno_name} is already in progress.")
+                logger.debug(f"Restarting dyno {dyno_name} is already in progress.")
                 return
 
             if hasattr(settings, 'DYNO_TIME_BETWEEN_RESTARTS'):
@@ -787,11 +787,11 @@ class HerokuDyno:
             # Set TTL from settings or default to 1 hour
             ttl = getattr(settings, 'DYNO_COUNTER_TTL', 60 * 60)  # Default to 1 hour
             cache.set(cache_key, counter, timeout=ttl)
-            logger.info(f"Initialized counter for dyno {dyno_name} with value 1 and TTL {ttl} seconds")
+            logger.debug(f"Initialized counter for dyno {dyno_name} with value 1 and TTL {ttl} seconds")
         else:
             # Increment the counter without changing the TTL
             counter = cache.incr(cache_key)
-            logger.info(f"Incremented counter for dyno {dyno_name} to {counter}")
+            logger.debug(f"Incremented counter for dyno {dyno_name} to {counter}")
 
         # Get the threshold from settings or default to 15
         threshold = getattr(settings, 'DYNO_RESTART_THRESHOLD', 15)
