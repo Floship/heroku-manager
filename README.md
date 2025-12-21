@@ -5,15 +5,23 @@ A Python package for managing Heroku dynos with autoscaling capabilities.
 ## Features
 
 - Automatic scaling of Heroku dynos based on memory usage and load
-- Monitoring of dyno health and performance
-- Automatic restart of unresponsive dynos
+- Dyno health monitoring (R14/R15 detection, load averages, memory quota)
+- Automatic restart of unresponsive or zombie dynos
+- Max dyno size guardrails with timed upscale/downscale windows
+- Dyno restart counters with threshold-based protection
 - Integration with Django for caching and configuration
-- Automatic cleaning of old files in specified directories via Heroku exec
+- Automatic cleaning of old files in specified directories via Heroku exec (with safe exclusions)
 
 ## Installation
 
 ```bash
 pip install heroku-manager
+```
+
+Enable Heroku runtime metrics (required for memory/load signals):
+
+```bash
+heroku labs:enable log-runtime-metrics -a <app_name>
 ```
 
 ## Usage
@@ -37,6 +45,19 @@ elif autoscaler.allow_downscale:
 
 # Stop autoscaling
 autoscaler.stop_continuous_autoscale()
+```
+
+### Restart Counter Safeguard
+
+Automatically restart a dyno after N events (e.g., failures) while respecting a TTL:
+
+```python
+from heroku_manager import HerokuManager
+
+autoscaler = HerokuManager.get_autoscaler()
+
+# Increment counter; if threshold is reached the dyno is restarted automatically
+autoscaler.increment_dyno_counter()
 ```
 
 ### File Cleaning
@@ -71,21 +92,25 @@ autoscaler = HerokuManager.get_autoscaler()
 autoscaler.clean_old_files(directory='/tmp', hours=48)
 ```
 
-## Configuration
+### One-off Exec Helper
 
-The package requires the following environment variables:
+Run a command on a one-off dyno using the Heroku API (uses the current formation size):
 
-- `HEROKU_API_KEY`: Your Heroku API key
-- `HEROKU_APP_NAME`: The name of your Heroku app
-- `DYNO`: The name of the current dyno (automatically set by Heroku)
-
-Additionally, you must enable Heroku runtime metrics for proper memory monitoring:
-
-```bash
-heroku labs:enable log-runtime-metrics -a {app_name}
+```python
+result = autoscaler.exec_connect(command="echo 'hello' && env")
 ```
 
-Without this, the `current_memory` feature will not work correctly.
+## Configuration
+
+Environment variables:
+- `HEROKU_API_KEY` (required): Heroku API key.
+- `HEROKU_APP_NAME` (required): Heroku app name.
+- `DYNO` (auto-set on Heroku): Current dyno name, used for formation detection.
+- `DYNO_RAM` (optional): Force the formation size via memory mapping when API calls are unavailable.
+
+Operational notes:
+- Enable Heroku runtime metrics (see Installation) so memory/load signals are available.
+- Autoscaling and cleaning rely on Django cache; ensure your cache backend is configured and shared across dynos.
 
 ## Django Settings
 
@@ -107,9 +132,29 @@ When used with Django, the following settings are available:
 - `UPSCALE_PERCENTAGE_HIGH_MEM_USE`: Memory usage percentage threshold for upscaling
 - `DOWNSCALE_PERCENTAGE_HIGH_MEM_USE`: Memory usage percentage threshold for downscaling
 - `HIGH_MEM_USE_MB`: High memory usage threshold in MB
+- `DYNO_RAM`: Memory size (MB) for mapping to formation when API access is limited
+- `WORKER_SETTINGS_MAP`: Per-formation overrides (e.g., max_dyno_size, downscale_on_non_empty_queue)
 
 ### File Cleaning Settings
 - `DYNO_FILE_CLEANING_ENABLED`: Enable automatic cleaning of old files (default: False)
 - `DYNO_FILE_CLEANING_INTERVAL`: Interval between file cleaning operations in seconds (default: 24 hours)
 - `DYNO_FILE_AGE_THRESHOLD`: Age threshold for files to be deleted in hours (default: 48 hours)
 - `DYNO_FILE_CLEANING_DIRECTORY`: Directory to clean (default: /tmp)
+
+### Restart / Counter Settings
+- `DYNO_RESTART_THRESHOLD`: Counter threshold that triggers a restart (default: 15)
+- `DYNO_COUNTER_TTL`: TTL (seconds) for the counter key (default: 3600)
+- `DYNO_TIME_BETWEEN_RESTARTS`: Minimum time between restarts for a dyno (default: 300)
+
+## Dyno Size Mapping
+
+The package ships with a memory-based formation map (`DYNO_SIZES`) including standard/performance tiers (1x, 2x, m, l, l-ram, xl, 2xl) and their RAM, thread hints, and pricing metadata. You can override per-formation behavior via `WORKER_SETTINGS_MAP`.
+
+## Logging
+
+- Routine autoscaler/file-cleaning stats now log at debug to reduce noise. Raise your log level to debug when troubleshooting.
+- Errors and warnings remain at higher levels for visibility.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
