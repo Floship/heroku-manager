@@ -6,7 +6,7 @@ from subprocess import run
 import threading
 import time
 from datetime import datetime, timedelta
-from requests.exceptions import SSLError, ConnectionError, Timeout
+from requests.exceptions import SSLError, ConnectionError, HTTPError, Timeout
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from django.conf import settings
@@ -806,7 +806,7 @@ class HerokuDyno:
 
         return counter
 
-    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10), retry=retry_if_exception_type((SSLError, ConnectionError, Timeout)))
+    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10), retry=retry_if_exception_type((SSLError, ConnectionError, Timeout, HTTPError)))
     def get_heroku_logs(self, source="heroku", date_from=None):
         if not self.heroku_api_key:
             return None
@@ -838,11 +838,21 @@ class HerokuDyno:
                     except SSLError as e:
                         logger.error(f"SSLEOFError occurred while retrieving log session: {e}")
                         return None
+                    except HTTPError as e:
+                        # Re-raise server errors (5xx) so @retry can handle them
+                        status_code = e.response.status_code if e.response is not None else 0
+                        if 500 <= status_code < 600:
+                            logger.warning(f"Transient Heroku API error (HTTP {status_code}), will retry. {e}")
+                            raise
+                        # Client errors (4xx) are not retryable
+                        response_text = e.response.text if e.response is not None else str(e)
+                        logger.error(f"Failed to retrieve log session. Status code: {status_code} - {response_text}")
+                        return None
                     except requests.exceptions.RequestException as e:
                         error_response = getattr(e, "response", None) or response
                         status_code = getattr(error_response, "status_code", "n/a")
                         response_text = getattr(error_response, "text", str(e))
-                        logger.error(f"Failed to retrieve log session. Status code: {status_code} - {response_text}")
+                        logger.warning(f"Failed to retrieve log session. Status code: {status_code} - {response_text}")
                         return None
 
                     log_url = response.json().get("logplex_url")
