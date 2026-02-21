@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.6 - 2025-06-28
+- **Critical fix**: `formation_size` now queries Heroku API as source of truth instead of relying on `DYNO_RAM` env var. Prevents workers from getting permanently stuck on upscaled sizes after restart.
+- Convert `next_formation_size`, `previous_formation_size`, `available_memory` from `@cached_property` to `@property` so they reflect actual formation size changes.
+- Fix `is_upscaling` and `is_downscaling` properties that were missing `return` statements (guards against rapid scaling were silently broken).
+- Add startup safety check to detect workers stuck in upscaled state (e.g., due to Redis key loss) and automatically restore the downscale timer.
+- Add `_invalidate_formation_cache()` to clear stale cached values after successful scale operations.
+
+## 0.1.5 - 2026-02-17
+- Retry on 5xx Heroku API errors in `get_heroku_logs` with exponential backoff (up to 5 attempts).
+- Catch `HTTPError` separately: re-raise 5xx for retry, log 4xx as error.
+- Downgrade `RequestException` log level from error to warning for transient network issues.
+
 ## 0.1.4 - 2025-12-21
 - Reduce autoscaler and housekeeping logs to debug to cut info noise.
 - Improve Heroku log session error handling and messaging (FP-16794).

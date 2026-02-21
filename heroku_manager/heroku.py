@@ -115,6 +115,7 @@ class HerokuDyno:
         self._file_cleaning_thread = None
         self._thread_lock = threading.Lock()
         self._last_file_cleaning = None
+        self._formation_size_cached = None  # (size, timestamp) tuple for instance-level caching
 
     @cached_property
     def _get_proc_class_by_formation_name(self):
@@ -177,7 +178,7 @@ class HerokuDyno:
     def max_price_per_month(self):
         return self.settings.get("max_price_per_month", 25.00)
 
-    @cached_property
+    @property
     def available_memory(self):
         return DYNO_SIZES.get(self.formation_size, {}).get("memory", 512)
 
@@ -287,42 +288,80 @@ class HerokuDyno:
             logger.error(f"Failed to call Heroku API. Response: {response.status_code} - {response.text}, URL: {url}")
         return response
 
-    @cached_property
+    @property
     def formation_size(self):
-        default_formation_size = 'standard-1x'
+        """
+        Get current formation size, preferring Heroku API for accuracy.
+        Uses instance-level caching with TTL to avoid excessive API calls.
+        Falls back to DYNO_RAM env var only when the API is unavailable.
+        """
+        now = time.time()
+        cache_duration = getattr(settings, 'DYNO_AUTOSCALE_INTERVAL', 30)
 
-        if not self.remote_monitoring and hasattr(settings, 'DYNO_RAM') and settings.DYNO_RAM:
+        # Return from instance cache if still fresh
+        if self._formation_size_cached:
+            cached_size, cached_time = self._formation_size_cached
+            if now - cached_time < cache_duration:
+                return cached_size
+
+        # Try Heroku API first (authoritative source of truth)
+        size = self._fetch_formation_size_from_api()
+        if size:
+            self._formation_size_cached = (size, now)
+            return size
+
+        # Fallback: try to determine size from Heroku logs
+        available_memory = self.get_total_available_memory_from_logs()
+        if available_memory:
             for dyno, details in DYNO_SIZES.items():
-                if details["memory"] == settings.DYNO_RAM:
+                if details["memory"] == available_memory:
+                    self._formation_size_cached = (dyno, now)
                     return dyno
 
-        # Fallback to Heroku API if not set in settings
+        # Last resort: use DYNO_RAM env var
+        default_formation_size = 'standard-1x'
+        if hasattr(settings, 'DYNO_RAM') and settings.DYNO_RAM:
+            for dyno, details in DYNO_SIZES.items():
+                if details["memory"] == settings.DYNO_RAM:
+                    self._formation_size_cached = (dyno, now)
+                    return dyno
 
+        self._formation_size_cached = (default_formation_size, now)
+        return default_formation_size
+
+    def _fetch_formation_size_from_api(self):
+        """Fetch current formation size from Heroku API."""
         if not self.heroku_api_key:
-            logger.error("HEROKU_API_KEY is not set. Cannot perform operations.")
-            return default_formation_size
+            logger.debug("HEROKU_API_KEY is not set. Cannot fetch formation size from API.")
+            return None
 
         if not self.app_name or not self.formation_name:
-            logger.error("DYNO or HEROKU_APP_NAME is not set. Cannot perform operations.")
-            return default_formation_size
+            logger.debug("DYNO or HEROKU_APP_NAME is not set. Cannot fetch formation size from API.")
+            return None
 
-        url = f'https://api.heroku.com/apps/{self.app_name}/formation/{self.formation_name}'
-        response = self.call_heroku_api("GET", url)
+        try:
+            url = f'https://api.heroku.com/apps/{self.app_name}/formation/{self.formation_name}'
+            response = self.call_heroku_api("GET", url)
+            if response.status_code == 200:
+                size = response.json().get('size', '').lower()
+                if size and size in DYNO_SIZES:
+                    return size
+                logger.warning(f"Unrecognized formation size from API: {size}")
+            else:
+                logger.debug(f"Failed to fetch formation size from API: {response.status_code}")
+        except Exception as e:
+            logger.warning(f"Error fetching formation size from API: {e}")
+        return None
 
-        if response.status_code != 200:
-            logger.error(f"Failed to retrieve current dyno size from Heroku API. Response: {response.status_code} - {response.text}, URL: {url}")
-            logger.info("Attempting to retrieve dyno size from logs...")
+    def _invalidate_formation_cache(self):
+        """Invalidate the formation size cache to force a fresh API read on next access."""
+        self._formation_size_cached = None
+        # Also invalidate dependent cached_property values that were computed from the old size
+        for attr in ('settings', 'downscale_on_non_empty_queue', 'max_dyno_size',
+                     'threads_available', 'price_per_hour', 'max_price_per_month'):
+            self.__dict__.pop(attr, None)
 
-            available_memory = self.get_total_available_memory_from_logs()
-            if available_memory:
-                for dyno, details in DYNO_SIZES.items():
-                    if details["memory"] == available_memory:
-                        return dyno
-            return default_formation_size
-
-        return response.json().get('size').lower() or default_formation_size
-
-    @cached_property
+    @property
     def next_formation_size(self):
         if self.formation_size in DYNO_SIZES:
             return DYNO_SIZES.get(self.formation_size, {}).get("next")
@@ -353,7 +392,7 @@ class HerokuDyno:
         original_size = cache.get(self.original_size_cache_key)
         return original_size.get("time") if original_size else None
 
-    @cached_property
+    @property
     def previous_formation_size(self):
         if self.formation_size in DYNO_SIZES:
             return DYNO_SIZES[self.formation_size].get("previous")
@@ -364,7 +403,7 @@ class HerokuDyno:
 
     @property
     def is_upscaling(self):
-        cache.get(self.upscaling_cache_key)
+        return cache.get(self.upscaling_cache_key)
 
     def set_upscaling(self):
         cache.set(self.upscaling_cache_key, True, timeout=settings.DYNO_TIME_BETWEEN_SCALES)
@@ -375,7 +414,7 @@ class HerokuDyno:
 
     @property
     def is_downscaling(self):
-        cache.get(self.downscale_cache_key)
+        return cache.get(self.downscale_cache_key)
 
     def set_downscaling(self):
         cache.set(self.downscale_cache_key, True, timeout=settings.DYNO_TIME_BETWEEN_SCALES)
@@ -431,7 +470,47 @@ class HerokuDyno:
         except Exception as e:
             logger.error(f"Failed to autoscale dyno {self.dyno_name}. Error: {e}", exc_info=True)
 
+    def _check_formation_on_startup(self):
+        """
+        Safety check on startup: detect if formation is stuck in an upscaled state
+        (e.g., due to Redis key loss or missed downscale) and restore the downscale timer.
+        Also ensures original_formation_size is always recorded as a baseline.
+        """
+        try:
+            current_size = self.formation_size
+            original_size = self.original_formation_size
+            upscale_until = cache.get(self.upscale_until_cache_key)
+
+            if original_size and original_size in DYNO_SIZES and current_size in DYNO_SIZES:
+                current_memory = DYNO_SIZES[current_size]["memory"]
+                original_memory = DYNO_SIZES[original_size]["memory"]
+
+                if current_memory > original_memory and not upscale_until:
+                    # Formation is upscaled but there's no upscale_until key —
+                    # the downscale timer was lost. Restore it so downscale can proceed.
+                    logger.warning(
+                        f"Startup safety check: {self.formation_name} is on {current_size} "
+                        f"but original size is {original_size} with no upscale_until key. "
+                        f"Restoring downscale timer."
+                    )
+                    delta = getattr(settings, 'DYNO_DOWNSCALE_CHECK_INTERVAL', 300) + \
+                            getattr(settings, 'DYNO_AUTOSCALE_INTERVAL', 30)
+                    until = timezone.now() + timezone.timedelta(seconds=delta)
+                    cache.set(self.upscale_until_cache_key, until, timeout=delta)
+
+            # Always set original formation size on startup if not already set
+            if not original_size:
+                self.set_original_formation_size()
+                logger.info(
+                    f"Recorded baseline formation size for {self.formation_name}: {current_size}"
+                )
+        except Exception as e:
+            logger.error(f"Startup formation check failed: {e}", exc_info=True)
+
     def _run_continuous(self):
+        # On startup, check for stuck upscaled state and record baseline
+        self._check_formation_on_startup()
+
         while not self._stop_event.is_set():
             self.check_in_dyno()
             self.check_for_sibling_zombie_dynos()
@@ -638,6 +717,7 @@ class HerokuDyno:
         response = requests.patch(url, headers=headers, json={"size": next_level})
         if response.status_code == 200:
             logger.info(f"Upscaled formation {self.formation_name} from {self.formation_size} to {next_level} with {DYNO_SIZES[next_level]['memory']} MB memory.")
+            self._invalidate_formation_cache()
 
             # Set cache key that expires in X hour to downscale back to original size
             if hasattr(settings, 'DYNO_DOWNSCALE_CHECK_INTERVAL') and hasattr(settings, 'DYNO_MIN_UPSCALE_DURATION') and hasattr(settings, 'DYNO_AUTOSCALE_INTERVAL'):
@@ -717,6 +797,7 @@ class HerokuDyno:
         response = requests.patch(url, headers=headers, json={"size": original_formation_size})
         if response.status_code == 200:
             logger.info(f"Downscaled formation {self.formation_name} back to {original_formation_size} with {DYNO_SIZES[original_formation_size]['memory']} MB memory.")
+            self._invalidate_formation_cache()
             self.clear_original_formation_size()
             self.stop_continuous_autoscale()
         else:
