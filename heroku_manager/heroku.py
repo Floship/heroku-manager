@@ -5,9 +5,9 @@ import subprocess
 from subprocess import run
 import threading
 import time
+import random
 from datetime import datetime, timedelta
-from requests.exceptions import SSLError, ConnectionError, HTTPError, Timeout
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from requests.exceptions import SSLError, ConnectionError, Timeout
 
 from django.conf import settings
 from django.core.cache import cache
@@ -265,98 +265,168 @@ class HerokuDyno:
         previous_formation_memory = DYNO_SIZES.get(self.previous_formation_size, {}).get("memory", 0)
         return self.current_memory_usage >= (previous_formation_memory * settings.DOWNSCALE_PERCENTAGE_HIGH_MEM_USE / 100)
 
-    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10), retry=retry_if_exception_type((SSLError, ConnectionError, Timeout)))
+    def _acquire_rate_limit_token(self):
+        """
+        Acquire a token from the shared Redis-based rate limiter.
+        Coordinates across all dynos to stay within Heroku's 4,500 calls/hour limit.
+        Blocks (with back-off) if the per-minute budget is exhausted; returns False
+        after 3 consecutive waits.
+        """
+        rate_limit = int(getattr(settings, 'HEROKU_API_RATE_LIMIT_PER_MINUTE', 50))
+        cache_key = f'heroku:api_rate:{self.app_name}'
+
+        for attempt in range(3):
+            current = cache.get(cache_key)
+            if current is None:
+                cache.set(cache_key, 1, timeout=60)
+                return True
+            if current < rate_limit:
+                try:
+                    cache.incr(cache_key)
+                except ValueError:
+                    # Key expired between get and incr
+                    cache.set(cache_key, 1, timeout=60)
+                return True
+
+            # Budget exhausted — wait for the current window to reset
+            ttl = cache.ttl(cache_key) or 60
+            wait = min(ttl + random.uniform(1, 5), 65)
+            logger.warning(
+                f"[{self.formation_name}] Heroku API rate limit reached "
+                f"({current}/{rate_limit}/min). Waiting {wait:.1f}s "
+                f"(attempt {attempt + 1}/3)..."
+            )
+            time.sleep(wait)
+
+        logger.error(
+            f"[{self.formation_name}] Heroku API rate limit still exceeded "
+            f"after 3 waits. Skipping API call."
+        )
+        return False
+
     def call_heroku_api(self, method, url, custom_headers={}, data=None):
+        """
+        Central method for ALL Heroku Platform API calls.
+
+        Features:
+        - Shared Redis rate limiter (coordinates across all dynos)
+        - Automatic 429 back-off using Retry-After header
+        - Retry on transient network errors (SSL, connection, timeout)
+        - GET response caching (5 s)
+        """
         headers = {
             "Accept": "application/vnd.heroku+json; version=3",
             "Authorization": f"Bearer {self.heroku_api_key}"
         }
         headers.update(custom_headers)
 
+        # Return cached GET responses before consuming a rate-limit token
+        request_hash = None
         if method == "GET":
             request_hash = hash(f"{method}{url}")
-            response = cache.get(f'heroku:api_response:{request_hash}')
-            if response:
+            cached_response = cache.get(f'heroku:api_response:{request_hash}')
+            if cached_response:
+                return cached_response
+
+        max_attempts = 5
+        for attempt in range(1, max_attempts + 1):
+            # ---- shared rate limit ----
+            if not self._acquire_rate_limit_token():
+                return None
+
+            try:
+                response = requests.request(method, url, headers=headers, json=data)
+            except (SSLError, ConnectionError, Timeout) as exc:
+                if attempt < max_attempts:
+                    wait = min(4 * (2 ** (attempt - 1)), 30)
+                    logger.warning(
+                        f"[{self.formation_name}] Heroku API {method} {url} "
+                        f"transient error (attempt {attempt}/{max_attempts}): {exc}. "
+                        f"Retrying in {wait}s..."
+                    )
+                    time.sleep(wait)
+                    continue
+                logger.error(
+                    f"[{self.formation_name}] Heroku API {method} {url} "
+                    f"failed after {max_attempts} attempts: {exc}",
+                    exc_info=True,
+                )
+                return None
+
+            # ---- 429 back-off ----
+            if response.status_code == 429:
+                retry_after = int(response.headers.get('Retry-After', 30))
+                backoff = min(retry_after + random.uniform(1, 5), 120)
+                logger.warning(
+                    f"[{self.formation_name}] Heroku API 429 on {method} {url}. "
+                    f"Backing off {backoff:.0f}s (attempt {attempt}/{max_attempts})."
+                )
+                if attempt < max_attempts:
+                    time.sleep(backoff)
+                    continue
                 return response
 
-        response = requests.request(method, url, headers=headers, json=data)
+            # ---- cache successful GETs ----
+            if method == "GET" and response.status_code == 200 and request_hash is not None:
+                cache.set(f'heroku:api_response:{request_hash}', response, timeout=5)
 
-        if method == "GET" and response.status_code == 200:
-            cache.set(f'heroku:api_response:{request_hash}', response, timeout=5)
+            # ---- log unexpected errors ----
+            if response.status_code >= 400:
+                logger.error(
+                    f"[{self.formation_name}] Heroku API {method} {url} "
+                    f"returned {response.status_code}: {response.text}"
+                )
 
-        if response.status_code != 200:
-            logger.error(f"Failed to call Heroku API. Response: {response.status_code} - {response.text}, URL: {url}")
-        return response
+            return response
+
+        return None
 
     @property
     def formation_size(self):
         """
-        Get current formation size, preferring Heroku API for accuracy.
-        Uses instance-level caching with TTL to avoid excessive API calls.
-        Falls back to DYNO_RAM env var only when the API is unavailable.
+        Get current formation size from Redis cache (set by scale operations)
+        or derive from DYNO_RAM env var.  Does NOT call the Heroku API,
+        keeping API budget for operations that actually need it.
         """
+        # 1. Instance-level cache (avoids Redis round-trip every access)
         now = time.time()
         cache_duration = getattr(settings, 'DYNO_AUTOSCALE_INTERVAL', 30)
-
-        # Return from instance cache if still fresh
         if self._formation_size_cached:
             cached_size, cached_time = self._formation_size_cached
             if now - cached_time < cache_duration:
                 return cached_size
 
-        # Try Heroku API first (authoritative source of truth)
-        size = self._fetch_formation_size_from_api()
-        if size:
-            self._formation_size_cached = (size, now)
-            return size
+        # 2. Redis cache (updated by _update_formation_size after scale ops)
+        redis_key = f'heroku:formation_size:{self.app_name}:{self.formation_name}'
+        cached_size = cache.get(redis_key)
+        if cached_size and cached_size in DYNO_SIZES:
+            self._formation_size_cached = (cached_size, now)
+            return cached_size
 
-        # Fallback: try to determine size from Heroku logs
-        available_memory = self.get_total_available_memory_from_logs()
-        if available_memory:
-            for dyno, details in DYNO_SIZES.items():
-                if details["memory"] == available_memory:
-                    self._formation_size_cached = (dyno, now)
-                    return dyno
+        # 3. Derive from DYNO_RAM env var (set by Heroku at boot)
+        dyno_memory = int(os.environ.get('DYNO_RAM', 512))
+        for dyno, details in DYNO_SIZES.items():
+            if details['memory'] == dyno_memory:
+                self._formation_size_cached = (dyno, now)
+                # Persist to Redis so other lookups are consistent
+                cache.set(redis_key, dyno, timeout=None)
+                return dyno
 
-        # Last resort: use DYNO_RAM env var
-        default_formation_size = 'standard-1x'
-        if hasattr(settings, 'DYNO_RAM') and settings.DYNO_RAM:
-            for dyno, details in DYNO_SIZES.items():
-                if details["memory"] == settings.DYNO_RAM:
-                    self._formation_size_cached = (dyno, now)
-                    return dyno
+        default = 'standard-1x'
+        self._formation_size_cached = (default, now)
+        return default
 
-        self._formation_size_cached = (default_formation_size, now)
-        return default_formation_size
-
-    def _fetch_formation_size_from_api(self):
-        """Fetch current formation size from Heroku API."""
-        if not self.heroku_api_key:
-            logger.debug("HEROKU_API_KEY is not set. Cannot fetch formation size from API.")
-            return None
-
-        if not self.app_name or not self.formation_name:
-            logger.debug("DYNO or HEROKU_APP_NAME is not set. Cannot fetch formation size from API.")
-            return None
-
-        try:
-            url = f'https://api.heroku.com/apps/{self.app_name}/formation/{self.formation_name}'
-            response = self.call_heroku_api("GET", url)
-            if response.status_code == 200:
-                size = response.json().get('size', '').lower()
-                if size and size in DYNO_SIZES:
-                    return size
-                logger.warning(f"Unrecognized formation size from API: {size}")
-            else:
-                logger.debug(f"Failed to fetch formation size from API: {response.status_code}")
-        except Exception as e:
-            logger.warning(f"Error fetching formation size from API: {e}")
-        return None
-
-    def _invalidate_formation_cache(self):
-        """Invalidate the formation size cache to force a fresh API read on next access."""
-        self._formation_size_cached = None
-        # Also invalidate dependent cached_property values that were computed from the old size
+    def _update_formation_size(self, new_size):
+        """
+        Record the new formation size in Redis + instance cache after a
+        successful scale operation.  Also invalidates dependent cached_property
+        values so they are recomputed from the new size.
+        """
+        now = time.time()
+        self._formation_size_cached = (new_size, now)
+        redis_key = f'heroku:formation_size:{self.app_name}:{self.formation_name}'
+        cache.set(redis_key, new_size, timeout=None)
+        # Invalidate dependent cached_property values
         for attr in ('settings', 'downscale_on_non_empty_queue', 'max_dyno_size',
                      'threads_available', 'price_per_hour', 'max_price_per_month'):
             self.__dict__.pop(attr, None)
@@ -519,7 +589,10 @@ class HerokuDyno:
             # Check if it's time to clean old files
             self.check_and_clean_old_files()
 
-            time.sleep(settings.DYNO_AUTOSCALE_INTERVAL)
+            # Jitter ±20 % to prevent thundering-herd across dynos
+            base = settings.DYNO_AUTOSCALE_INTERVAL
+            jitter = base * random.uniform(-0.2, 0.2)
+            time.sleep(base + jitter)
 
     def _run_continuous_file_cleaning(self):
         while not self._stop_event.is_set():
@@ -707,17 +780,12 @@ class HerokuDyno:
         # Store original dyno size in Redis cache
         self.set_original_formation_size()
 
-        # Update dyno to upscale
+        # Update dyno to upscale (routed through call_heroku_api for rate limiting)
         url = f'https://api.heroku.com/apps/{self.app_name}/formation/{self.formation_name}'
-        headers = {
-            'Accept': 'application/vnd.heroku+json; version=3',
-            'Authorization': f'Bearer {self.heroku_api_key}',
-        }
-
-        response = requests.patch(url, headers=headers, json={"size": next_level})
-        if response.status_code == 200:
+        response = self.call_heroku_api("PATCH", url, data={"size": next_level})
+        if response and response.status_code == 200:
             logger.info(f"Upscaled formation {self.formation_name} from {self.formation_size} to {next_level} with {DYNO_SIZES[next_level]['memory']} MB memory.")
-            self._invalidate_formation_cache()
+            self._update_formation_size(next_level)
 
             # Set cache key that expires in X hour to downscale back to original size
             if hasattr(settings, 'DYNO_DOWNSCALE_CHECK_INTERVAL') and hasattr(settings, 'DYNO_MIN_UPSCALE_DURATION') and hasattr(settings, 'DYNO_AUTOSCALE_INTERVAL'):
@@ -726,8 +794,10 @@ class HerokuDyno:
                 cache.set(self.upscale_until_cache_key, until, timeout=delta)
 
             self.stop_continuous_autoscale()
-        else:
+        elif response:
             logger.error(f"Failed to upscale formation {self.formation_name}. Response: {response.status_code} - {response.text}")
+        else:
+            logger.error(f"Failed to upscale formation {self.formation_name}. API call was rate-limited or failed.")
 
     def check_and_downscale_to_original_formation_size(self):
         """
@@ -787,21 +857,18 @@ class HerokuDyno:
 
             self.set_downscaling()
 
-        # Scale formation back to original size
+        # Scale formation back to original size (routed through call_heroku_api for rate limiting)
         url = f'https://api.heroku.com/apps/{self.app_name}/formation/{self.formation_name}'
-        headers = {
-            'Accept': 'application/vnd.heroku+json; version=3',
-            'Authorization': f'Bearer {self.heroku_api_key}',
-        }
-
-        response = requests.patch(url, headers=headers, json={"size": original_formation_size})
-        if response.status_code == 200:
+        response = self.call_heroku_api("PATCH", url, data={"size": original_formation_size})
+        if response and response.status_code == 200:
             logger.info(f"Downscaled formation {self.formation_name} back to {original_formation_size} with {DYNO_SIZES[original_formation_size]['memory']} MB memory.")
-            self._invalidate_formation_cache()
+            self._update_formation_size(original_formation_size)
             self.clear_original_formation_size()
             self.stop_continuous_autoscale()
-        else:
+        elif response:
             logger.error(f"Failed to downscale formation {self.formation_name}. Response: {response.status_code} - {response.text}")
+        else:
+            logger.error(f"Failed to downscale formation {self.formation_name}. API call was rate-limited or failed.")
 
     def restart_dyno(self, dyno_name=None):
         if not self.app_name or (not self.dyno_name and not dyno_name):
@@ -822,24 +889,20 @@ class HerokuDyno:
                 cache.set(cache_key, True, timeout=300)  # Default to 5 minutes
 
 
-        # Restart the dyno via Heroku API
+        # Restart the dyno via Heroku API (routed through call_heroku_api for rate limiting)
         url = f'https://api.heroku.com/apps/{self.app_name}/dynos/{dyno_name}'
-        headers = {
-            'Accept': 'application/vnd.heroku+json; version=3',
-            'Authorization': f'Bearer {self.heroku_api_key}',
-        }
-
-        response = requests.delete(url, headers=headers)
-        if response.status_code == 202:
+        response = self.call_heroku_api("DELETE", url)
+        if response and response.status_code == 202:
             logger.info(f"Restarting dyno {dyno_name}...")
 
             if dyno_name == self.dyno_name:
                 self.stop_continuous_autoscale()
             else:
                 self.remove_dyno_from_alive_cache(dyno_name)
-        else:
+        elif response:
             logger.error(f"Failed to restart dyno {dyno_name}. Response: {response.status_code} - {response.text}")
-            return
+        else:
+            logger.error(f"Failed to restart dyno {dyno_name}. API call was rate-limited or failed.")
 
     def increment_dyno_counter(self, dyno_name=None):
         """
@@ -887,7 +950,6 @@ class HerokuDyno:
 
         return counter
 
-    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=10), retry=retry_if_exception_type((SSLError, ConnectionError, Timeout, HTTPError)))
     def get_heroku_logs(self, source="heroku", date_from=None):
         if not self.heroku_api_key:
             return None
@@ -900,10 +962,6 @@ class HerokuDyno:
                 if not logs:
                     # Step 1: Set up API request to retrieve logs
                     url = f"https://api.heroku.com/apps/{self.app_name}/log-sessions"
-                    headers = {
-                        "Accept": "application/vnd.heroku+json; version=3",
-                        "Authorization": f"Bearer {self.heroku_api_key}",
-                    }
                     payload = {
                         "dyno": self.dyno_name,
                         "tail": False,
@@ -911,29 +969,13 @@ class HerokuDyno:
                         "lines": 200  # Adjusting this almost does nothing
                     }
 
-                    response = None
-                    try:
-                        # Step 2: Start a log session and retrieve logs
-                        response = requests.post(url, headers=headers, json=payload)
-                        response.raise_for_status()
-                    except SSLError as e:
-                        logger.error(f"SSLEOFError occurred while retrieving log session: {e}")
+                    # Step 2: Start a log session via call_heroku_api (rate-limited + retry)
+                    response = self.call_heroku_api("POST", url, data=payload)
+                    if not response:
+                        logger.warning("Failed to retrieve log session (rate-limited or network error).")
                         return None
-                    except HTTPError as e:
-                        # Re-raise server errors (5xx) so @retry can handle them
-                        status_code = e.response.status_code if e.response is not None else 0
-                        if 500 <= status_code < 600:
-                            logger.warning(f"Transient Heroku API error (HTTP {status_code}), will retry. {e}")
-                            raise
-                        # Client errors (4xx) are not retryable
-                        response_text = e.response.text if e.response is not None else str(e)
-                        logger.error(f"Failed to retrieve log session. Status code: {status_code} - {response_text}")
-                        return None
-                    except requests.exceptions.RequestException as e:
-                        error_response = getattr(e, "response", None) or response
-                        status_code = getattr(error_response, "status_code", "n/a")
-                        response_text = getattr(error_response, "text", str(e))
-                        logger.warning(f"Failed to retrieve log session. Status code: {status_code} - {response_text}")
+                    if response.status_code >= 400:
+                        logger.warning(f"Failed to retrieve log session. Status code: {response.status_code} - {response.text}")
                         return None
 
                     log_url = response.json().get("logplex_url")
@@ -947,10 +989,8 @@ class HerokuDyno:
                         return None
 
                     logs = log_response.text or "\n" # Ensure logs is not empty to not overload API
-                    if hasattr(settings, 'DYNO_LOGS_CACHE_DURATION'):
-                        cache.set(cache_key, logs, timeout=settings.DYNO_LOGS_CACHE_DURATION)
-                    else:
-                        cache.set(cache_key, logs, timeout=60)  # Default to 1 minute
+                    log_cache_ttl = getattr(settings, 'DYNO_LOGS_CACHE_DURATION', 90)
+                    cache.set(cache_key, logs, timeout=log_cache_ttl)
 
         logs_parsed = []
 
@@ -1130,11 +1170,6 @@ class HerokuDyno:
         try:
             # Use the Heroku API to run the command on a one-off dyno
             url = f'https://api.heroku.com/apps/{self.app_name}/dynos'
-            headers = {
-                'Accept': 'application/vnd.heroku+json; version=3',
-                'Authorization': f'Bearer {self.heroku_api_key}',
-                'Content-Type': 'application/json'
-            }
 
             # Prepare the payload for the API request
             payload = {
@@ -1145,9 +1180,9 @@ class HerokuDyno:
             }
 
             logger.info(f"Executing command on a one-off dyno via Heroku API (target dyno: {dyno_name})...")
-            response = requests.post(url, headers=headers, json=payload)
+            response = self.call_heroku_api("POST", url, custom_headers={'Content-Type': 'application/json'}, data=payload)
 
-            if response.status_code == 201:  # 201 Created
+            if response and response.status_code == 201:  # 201 Created
                 # Successfully created a one-off dyno
                 dyno_data = response.json()
                 logger.info(f"Command execution started on one-off dyno {dyno_data.get('name')}.")
@@ -1166,8 +1201,11 @@ class HerokuDyno:
                     stderr="",
                     returncode=0
                 )
-            else:
+            elif response:
                 logger.error(f"Failed to execute command via Heroku API. Response: {response.status_code} - {response.text}")
+                return None
+            else:
+                logger.error(f"Failed to execute command via Heroku API. API call was rate-limited or failed.")
                 return None
         except Exception as e:
             logger.error(f"Failed to execute command via Heroku API. Error: {e}", exc_info=True)

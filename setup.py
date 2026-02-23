@@ -2,12 +2,11 @@ from setuptools import setup, find_packages
 
 setup(
     name="heroku_manager",
-    version="0.1.6",
+    version="0.2.0",
     packages=find_packages(),
     install_requires=[
         "django>=2.2",
         "requests>=2.0.0",
-        "tenacity>=6.0.0",
     ],
     author="Floship",
     author_email="stas@floship.com",
