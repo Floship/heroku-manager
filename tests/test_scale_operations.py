@@ -165,16 +165,34 @@ class TestCheckAndDownscale(BaseLockTestCase):
         expected_threshold = 512 * 105 / 100  # 537.6 MB
         self.assertAlmostEqual(dyno._downscale_memory_threshold, expected_threshold, places=1)
 
-    def test_extends_upscale_when_ttl_above_interval(self):
+    def test_no_early_downscale_when_not_safe_and_ttl_high(self):
+        """When memory is still elevated and TTL is high, no downscale should occur."""
         dyno = make_dyno(formation_size="performance-m")
         from django.utils import timezone
         from django.core.cache.backends.locmem import LocMemCache
         until = timezone.now() + timezone.timedelta(seconds=600)
         cache.set(dyno.upscale_until_cache_key, until, timeout=600)
         with patch.object(LocMemCache, "ttl", return_value=600):
-            with patch.object(dyno, "downscale_formation_to_original_size") as mock_down:
-                dyno.check_and_downscale_to_original_formation_size()
+            with patch.object(type(dyno), "allow_downscale",
+                              new_callable=PropertyMock, return_value=False):
+                with patch.object(dyno, "downscale_formation_to_original_size") as mock_down:
+                    dyno.check_and_downscale_to_original_formation_size()
         mock_down.assert_not_called()
+
+    def test_early_downscale_when_safe_even_if_ttl_high(self):
+        """P1-5 fix: downscale should happen as soon as allow_downscale is True, not only near TTL expiry."""
+        dyno = make_dyno(formation_size="performance-m")
+        from django.utils import timezone
+        from django.core.cache.backends.locmem import LocMemCache
+        cache.set(dyno.original_size_cache_key, {"size": "standard-2x"}, timeout=None)
+        until = timezone.now() + timezone.timedelta(seconds=600)
+        cache.set(dyno.upscale_until_cache_key, until, timeout=600)
+        with patch.object(LocMemCache, "ttl", return_value=600):
+            with patch.object(type(dyno), "allow_downscale",
+                              new_callable=PropertyMock, return_value=True):
+                with patch.object(dyno, "downscale_formation_to_original_size") as mock_down:
+                    dyno.check_and_downscale_to_original_formation_size()
+        mock_down.assert_called_once()
 
     def test_restarts_dyno_when_r14_and_high_memory_and_no_tasks(self):
         dyno = make_dyno(formation_size="performance-m")
@@ -336,6 +354,113 @@ class TestCheckFormationOnStartup(BaseLockTestCase):
         cache.set(dyno.original_size_cache_key, {"size": "standard-2x"}, timeout=None)
         dyno._check_formation_on_startup()
         self.assertIsNone(cache.get(dyno.upscale_until_cache_key))
+
+
+class TestRemoteMonitoringGuard(BaseLockTestCase):
+    """P0-6: stop_continuous_autoscale must NOT be called after scale on remote-monitored dynos."""
+
+    def test_upscale_does_not_stop_autoscale_for_remote_monitoring(self):
+        dyno = make_dyno(formation_size="standard-2x")
+        with patch.object(type(dyno), "remote_monitoring",
+                          new_callable=PropertyMock, return_value=True):
+            with patch.object(dyno, "call_heroku_api", return_value=_mock_response(200)):
+                with patch.object(dyno, "stop_continuous_autoscale") as mock_stop:
+                    dyno.upscale_formation_to_next_level()
+        mock_stop.assert_not_called()
+
+    def test_upscale_stops_autoscale_for_local_dyno(self):
+        dyno = make_dyno(formation_size="standard-2x")
+        with patch.object(type(dyno), "remote_monitoring",
+                          new_callable=PropertyMock, return_value=False):
+            with patch.object(dyno, "call_heroku_api", return_value=_mock_response(200)):
+                with patch.object(dyno, "stop_continuous_autoscale") as mock_stop:
+                    dyno.upscale_formation_to_next_level()
+        mock_stop.assert_called_once()
+
+    def test_downscale_does_not_stop_autoscale_for_remote_monitoring(self):
+        dyno = make_dyno(formation_size="performance-m")
+        cache.set(dyno.original_size_cache_key, {"size": "standard-2x"}, timeout=None)
+        with patch.object(type(dyno), "remote_monitoring",
+                          new_callable=PropertyMock, return_value=True):
+            with patch.object(dyno, "call_heroku_api", return_value=_mock_response(200)):
+                with patch.object(dyno, "stop_continuous_autoscale") as mock_stop:
+                    dyno.downscale_formation_to_original_size()
+        mock_stop.assert_not_called()
+
+
+class TestClearUpscalingOnFailure(BaseLockTestCase):
+    """P1-2: clear_upscaling() must be called when upscale API call fails so retries are not blocked."""
+
+    def test_clear_upscaling_called_on_api_error_response(self):
+        dyno = make_dyno(formation_size="standard-2x")
+        with patch.object(dyno, "call_heroku_api", return_value=_mock_response(500)):
+            with patch.object(dyno, "clear_upscaling") as mock_clear:
+                dyno.upscale_formation_to_next_level()
+        mock_clear.assert_called_once()
+
+    def test_clear_upscaling_called_on_api_none_response(self):
+        dyno = make_dyno(formation_size="standard-2x")
+        with patch.object(dyno, "call_heroku_api", return_value=None):
+            with patch.object(dyno, "clear_upscaling") as mock_clear:
+                dyno.upscale_formation_to_next_level()
+        mock_clear.assert_called_once()
+
+    def test_clear_upscaling_not_called_on_success(self):
+        dyno = make_dyno(formation_size="standard-2x")
+        with patch.object(type(dyno), "remote_monitoring",
+                          new_callable=PropertyMock, return_value=True):
+            with patch.object(dyno, "call_heroku_api", return_value=_mock_response(200)):
+                with patch.object(dyno, "clear_upscaling") as mock_clear:
+                    dyno.upscale_formation_to_next_level()
+        mock_clear.assert_not_called()
+
+
+class TestRestartDynoReturnValue(BaseLockTestCase):
+    """P0-8: restart_dyno must return True on success and False on failure."""
+
+    def test_returns_true_on_202(self):
+        dyno = make_dyno()
+        with patch.object(dyno, "call_heroku_api", return_value=_mock_response(202)):
+            with patch.object(dyno, "stop_continuous_autoscale"):
+                result = dyno.restart_dyno()
+        self.assertTrue(result)
+
+    def test_returns_false_on_api_error(self):
+        dyno = make_dyno()
+        with patch.object(dyno, "call_heroku_api", return_value=_mock_response(500)):
+            result = dyno.restart_dyno()
+        self.assertFalse(result)
+
+    def test_returns_false_when_already_restarting(self):
+        dyno = make_dyno()
+        cache.set(f"heroku:restart_dyno:{dyno.dyno_name}", True, timeout=300)
+        result = dyno.restart_dyno()
+        self.assertFalse(result)
+
+
+class TestCounterNoDeleteOnFailedRestart(BaseLockTestCase):
+    """P1-6: counter must NOT be deleted when restart_dyno returns False."""
+
+    def test_counter_preserved_when_restart_fails(self):
+        from django.conf import settings as ds
+        dyno = make_dyno()
+        threshold = getattr(ds, "DYNO_RESTART_THRESHOLD", 15)
+        key = f"heroku:dyno_counter:{dyno.dyno_name}"
+        cache.set(key, threshold - 1, timeout=3600)
+        with patch.object(dyno, "restart_dyno", return_value=False):
+            dyno.increment_dyno_counter()
+        # Counter should still exist because restart failed
+        self.assertIsNotNone(cache.get(key))
+
+    def test_counter_deleted_when_restart_succeeds(self):
+        from django.conf import settings as ds
+        dyno = make_dyno()
+        threshold = getattr(ds, "DYNO_RESTART_THRESHOLD", 15)
+        key = f"heroku:dyno_counter:{dyno.dyno_name}"
+        cache.set(key, threshold - 1, timeout=3600)
+        with patch.object(dyno, "restart_dyno", return_value=True):
+            dyno.increment_dyno_counter()
+        self.assertIsNone(cache.get(key))
 
 
 if __name__ == "__main__":

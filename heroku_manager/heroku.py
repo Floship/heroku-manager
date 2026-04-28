@@ -1,8 +1,8 @@
+import math
 import os
 import re
+import shlex
 import requests
-import subprocess
-from subprocess import run
 import threading
 import time
 import random
@@ -83,13 +83,22 @@ DYNO_SIZES = {
 def get_dyno_settings(formation_size=None):
     dyno_memory = int(os.environ.get('DYNO_RAM', 512))
     if not formation_size:
-        for dyno, settings in DYNO_SIZES.items():
-            if settings["memory"] == dyno_memory:
-                formation_size = dyno
-                return settings
+        for dyno, size_info in DYNO_SIZES.items():
+            if size_info["memory"] == dyno_memory:
+                return dict(size_info)
 
         formation_size = 'standard-1x'
-    return DYNO_SIZES.get(formation_size, {})
+    return dict(DYNO_SIZES.get(formation_size, {}))
+
+class _ApiResult:
+    """Minimal result object returned by exec_connect, mirrors subprocess.run output."""
+    __slots__ = ('stdout', 'stderr', 'returncode')
+
+    def __init__(self, stdout: str, stderr: str, returncode: int) -> None:
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
 
 class HerokuManager:
     _instance = None
@@ -110,14 +119,15 @@ class HerokuDyno:
         # self.dyno_name = 'webhooks_worker.1'
         self.formation_name = self.dyno_name.split('.')[0] if self.dyno_name else None
         self.heroku_api_key = os.environ.get('HEROKU_API_KEY')
-        self._stop_event = threading.Event()
+        self._stop_autoscale_event = threading.Event()
+        self._stop_file_cleaning_event = threading.Event()
         self._autoscale_thread = None
         self._file_cleaning_thread = None
         self._thread_lock = threading.Lock()
         self._last_file_cleaning = None
         self._formation_size_cached = None  # (size, timestamp) tuple for instance-level caching
 
-    @cached_property
+    @property
     def _get_proc_class_by_formation_name(self):
         """
         Dynamically find and return the proc class corresponding to the formation_name
@@ -209,16 +219,10 @@ class HerokuDyno:
 
     @property
     def is_on_original_formation_size_or_lower(self):
-        if not self.original_formation_size or self.original_formation_size not in DYNO_SIZES:
-            self.set_original_formation_size()
-        # Determine lower or equal formation sizes
-        lower_size_formations = [
-            dyno for dyno, details in DYNO_SIZES.items()
-            if details["memory"] <= DYNO_SIZES[self.original_formation_size]["memory"]
-        ]
-
-        # Check if current size is within the lower or equal list
-        return self.formation_size in lower_size_formations
+        original = self.original_formation_size
+        if not original or original not in DYNO_SIZES or self.formation_size not in DYNO_SIZES:
+            return False
+        return DYNO_SIZES[self.formation_size]["memory"] <= DYNO_SIZES[original]["memory"]
 
     @property
     def is_memory_usage_high(self):
@@ -277,12 +281,19 @@ class HerokuDyno:
         memory was still 1034 MB and causing immediate R14 errors.
         """
         target_size = self.original_formation_size or self.previous_formation_size
+        if not target_size:
+            logger.warning(
+                f"[{self.formation_name}] Cannot compute downscale threshold: "
+                f"no original or previous formation size known. Blocking downscale."
+            )
+            return float('inf')
         target_memory = DYNO_SIZES.get(target_size, {}).get("memory", 0)
         return target_memory * settings.DOWNSCALE_PERCENTAGE_HIGH_MEM_USE / 100
 
     @property
     def is_still_high_memory_usage_for_downscale(self):
-        return self.current_memory_usage >= self._downscale_memory_threshold
+        threshold = self._downscale_memory_threshold
+        return math.isinf(threshold) or self.current_memory_usage >= threshold
 
     def _acquire_rate_limit_token(self):
         """
@@ -294,36 +305,34 @@ class HerokuDyno:
         rate_limit = int(getattr(settings, 'HEROKU_API_RATE_LIMIT_PER_MINUTE', 50))
         cache_key = f'heroku:api_rate:{self.app_name}'
 
-        for attempt in range(3):
-            current = cache.get(cache_key)
-            if current is None:
+        current = cache.get(cache_key)
+        if current is None:
+            cache.set(cache_key, 1, timeout=60)
+            return True
+        if current < rate_limit:
+            try:
+                new_count = cache.incr(cache_key)
+            except ValueError:
+                # Key expired between get and incr
                 cache.set(cache_key, 1, timeout=60)
                 return True
-            if current < rate_limit:
-                try:
-                    cache.incr(cache_key)
-                except ValueError:
-                    # Key expired between get and incr
-                    cache.set(cache_key, 1, timeout=60)
-                return True
+            if new_count > rate_limit:
+                # Lost the TOCTOU race — another dyno incremented past the limit
+                logger.warning(
+                    f"[{self.formation_name}] Heroku API rate limit exceeded "
+                    f"({new_count}/{rate_limit}/min). Skipping cycle."
+                )
+                return False
+            return True
 
-            # Budget exhausted — wait for the current window to reset
-            ttl = cache.ttl(cache_key) or 60
-            wait = min(ttl + random.uniform(1, 5), 65)
-            logger.warning(
-                f"[{self.formation_name}] Heroku API rate limit reached "
-                f"({current}/{rate_limit}/min). Waiting {wait:.1f}s "
-                f"(attempt {attempt + 1}/3)..."
-            )
-            time.sleep(wait)
-
-        logger.error(
-            f"[{self.formation_name}] Heroku API rate limit still exceeded "
-            f"after 3 waits. Skipping API call."
+        # Budget exhausted — skip this cycle instead of blocking the autoscale thread
+        logger.warning(
+            f"[{self.formation_name}] Heroku API rate limit reached "
+            f"({current}/{rate_limit}/min). Skipping API call this cycle."
         )
         return False
 
-    def call_heroku_api(self, method, url, custom_headers={}, data=None):
+    def call_heroku_api(self, method, url, custom_headers=None, data=None):
         """
         Central method for ALL Heroku Platform API calls.
 
@@ -333,6 +342,7 @@ class HerokuDyno:
         - Retry on transient network errors (SSL, connection, timeout)
         - GET response caching (5 s)
         """
+        custom_headers = custom_headers or {}
         headers = {
             "Accept": "application/vnd.heroku+json; version=3",
             "Authorization": f"Bearer {self.heroku_api_key}"
@@ -409,7 +419,7 @@ class HerokuDyno:
         """
         # 1. Instance-level cache (avoids Redis round-trip every access)
         now = time.time()
-        cache_duration = getattr(settings, 'DYNO_AUTOSCALE_INTERVAL', 30)
+        cache_duration = getattr(settings, 'DYNO_AUTOSCALE_INTERVAL', 30) * 5
         if self._formation_size_cached:
             cached_size, cached_time = self._formation_size_cached
             if now - cached_time < cache_duration:
@@ -435,20 +445,26 @@ class HerokuDyno:
         self._formation_size_cached = (default, now)
         return default
 
+    # cached_properties that depend on formation_size and must be cleared after a resize.
+    _FORMATION_DEPENDENT_CACHE = (
+        'settings', 'downscale_on_non_empty_queue', 'max_dyno_size',
+        'threads_available', 'price_per_hour', 'max_price_per_month',
+    )
+
+    def _invalidate_formation_dependent_cache(self):
+        for attr in self._FORMATION_DEPENDENT_CACHE:
+            self.__dict__.pop(attr, None)
+
     def _update_formation_size(self, new_size):
         """
         Record the new formation size in Redis + instance cache after a
         successful scale operation.  Also invalidates dependent cached_property
         values so they are recomputed from the new size.
         """
-        now = time.time()
-        self._formation_size_cached = (new_size, now)
+        self._formation_size_cached = (new_size, time.time())
         redis_key = f'heroku:formation_size:{self.app_name}:{self.formation_name}'
         cache.set(redis_key, new_size, timeout=None)
-        # Invalidate dependent cached_property values
-        for attr in ('settings', 'downscale_on_non_empty_queue', 'max_dyno_size',
-                     'threads_available', 'price_per_hour', 'max_price_per_month'):
-            self.__dict__.pop(attr, None)
+        self._invalidate_formation_dependent_cache()
 
     @property
     def next_formation_size(self):
@@ -495,7 +511,13 @@ class HerokuDyno:
         return cache.get(self.upscaling_cache_key)
 
     def set_upscaling(self):
-        cache.set(self.upscaling_cache_key, True, timeout=settings.DYNO_TIME_BETWEEN_SCALES)
+        # Extend TTL to cover the full scale cool-down plus worst-case API round-trip time
+        # (up to 5 retries × 30 s backoff ≈ 150 s) so the flag never expires mid-call.
+        ttl = settings.DYNO_TIME_BETWEEN_SCALES + 150
+        cache.set(self.upscaling_cache_key, True, timeout=ttl)
+
+    def clear_upscaling(self):
+        cache.delete(self.upscaling_cache_key)
 
     @cached_property
     def downscale_cache_key(self):
@@ -510,7 +532,7 @@ class HerokuDyno:
 
     @cached_property
     def threads_used_cache_key(self):
-        return f'heroku:threads_used::{self.app_name}:{self.dyno_name}'
+        return f'heroku:threads_used:{self.app_name}:{self.dyno_name}'
 
     def get_threads_used(self):
         if self.remote_monitoring:
@@ -521,7 +543,8 @@ class HerokuDyno:
     def set_threads_used(self):
         threads_used = len(threading.enumerate())
         if threads_used:
-            cache.set(self.threads_used_cache_key, threads_used, timeout=1 * 60 * 60)
+            ttl = getattr(settings, 'DYNO_AUTOSCALE_INTERVAL', 30) * 2
+            cache.set(self.threads_used_cache_key, threads_used, timeout=ttl)
         return threads_used
 
     def autoscale(self, continuous=True):
@@ -545,11 +568,11 @@ class HerokuDyno:
                     )
 
         # ignore beatworker if settings.DYNO_AUTOSCALE_ENABLED_FOR_BEATWORKER is False
-        if 'beatworker' == self.formation_name and hasattr(settings, 'DYNO_AUTOSCALE_ENABLED_FOR_BEATWORKER') and not settings.DYNO_AUTOSCALE_ENABLED_FOR_BEATWORKER:
+        if 'beatworker' == self.formation_name and not getattr(settings, 'DYNO_AUTOSCALE_ENABLED_FOR_BEATWORKER', True):
             return
 
         try:
-            if hasattr(settings, 'DYNO_LOG_THREADS_USED') and settings.DYNO_LOG_THREADS_USED:
+            if getattr(settings, 'DYNO_LOG_THREADS_USED', False):
                 self.set_threads_used()
 
             if self.requires_upscale:
@@ -584,7 +607,7 @@ class HerokuDyno:
                     )
                     delta = getattr(settings, 'DYNO_DOWNSCALE_CHECK_INTERVAL', 300) + \
                             getattr(settings, 'DYNO_AUTOSCALE_INTERVAL', 30)
-                    until = timezone.now() + timezone.timedelta(seconds=delta)
+                    until = timezone.now() + timedelta(seconds=delta)
                     cache.set(self.upscale_until_cache_key, until, timeout=delta)
 
             # Always set original formation size on startup if not already set
@@ -600,13 +623,10 @@ class HerokuDyno:
         # On startup, check for stuck upscaled state and record baseline
         self._check_formation_on_startup()
 
-        while not self._stop_event.is_set():
+        while not self._stop_autoscale_event.is_set():
             self.check_in_dyno()
             self.check_for_sibling_zombie_dynos()
             self.autoscale(continuous=True)
-
-            # Check if it's time to clean old files
-            self.check_and_clean_old_files()
 
             # Jitter ±20 % to prevent thundering-herd across dynos
             base = settings.DYNO_AUTOSCALE_INTERVAL
@@ -614,10 +634,8 @@ class HerokuDyno:
             time.sleep(base + jitter)
 
     def _run_continuous_file_cleaning(self):
-        while not self._stop_event.is_set():
-            # Check if it's time to clean old files
+        while not self._stop_file_cleaning_event.is_set():
             self.check_and_clean_old_files()
-
             time.sleep(settings.DYNO_AUTOSCALE_INTERVAL)
 
     def check_and_clean_old_files(self):
@@ -653,7 +671,7 @@ class HerokuDyno:
                 logger.debug(f"Successfully cleaned old files in {directory} on dyno {self.dyno_name}. Next cleaning in {file_cleaning_interval/3600:.1f} hours.")
             else:
                 # If cleaning failed, try again after a shorter interval
-                self._last_file_cleaning = now - timezone.timedelta(seconds=file_cleaning_interval * 0.9)
+                self._last_file_cleaning = now - timedelta(seconds=file_cleaning_interval * 0.9)
                 logger.warning(f"Failed to clean old files in {directory} on dyno {self.dyno_name}. Will try again soon.")
 
     def start_continuous_autoscale(self):
@@ -665,7 +683,7 @@ class HerokuDyno:
                 logger.warning(f"Autoscaling thread for {self.dyno_name} is already running.")
                 return
 
-            self._stop_event.clear()
+            self._stop_autoscale_event.clear()
             self._autoscale_thread = threading.Thread(target=self._supervised_run, args=(), daemon=True)
             self._autoscale_thread.start()
             logger.debug(f"Continuous autoscaling thread started for {self.dyno_name} with interval {settings.DYNO_AUTOSCALE_INTERVAL} seconds.")
@@ -680,7 +698,7 @@ class HerokuDyno:
                 logger.warning(f"File cleaning thread for {self.dyno_name} is already running.")
                 return
 
-            self._stop_event.clear()
+            self._stop_file_cleaning_event.clear()
             self._file_cleaning_thread = threading.Thread(target=self._supervised_run_file_cleaning, args=(), daemon=True)
             self._file_cleaning_thread.start()
             logger.debug(f"Continuous file cleaning thread started for {self.dyno_name} with interval {settings.DYNO_AUTOSCALE_INTERVAL} seconds.")
@@ -692,10 +710,9 @@ class HerokuDyno:
             self.remove_dyno_from_alive_cache()
 
             if not self._autoscale_thread or not self._autoscale_thread.is_alive():
-                # logger.warning(f"No running autoscaling thread to stop for {self.dyno_name}.")
                 return
 
-            self._stop_event.set()
+            self._stop_autoscale_event.set()
 
             # Ensure we are not calling join on the current thread
             if threading.current_thread() != self._autoscale_thread:
@@ -708,10 +725,9 @@ class HerokuDyno:
         """Stop the continuous file cleaning thread."""
         with self._thread_lock:
             if not self._file_cleaning_thread or not self._file_cleaning_thread.is_alive():
-                # logger.warning(f"No running file cleaning thread to stop for {self.dyno_name}.")
                 return
 
-            self._stop_event.set()
+            self._stop_file_cleaning_event.set()
 
             # Ensure we are not calling join on the current thread
             if threading.current_thread() != self._file_cleaning_thread:
@@ -722,7 +738,7 @@ class HerokuDyno:
 
     def _supervised_run(self):
         """Supervised loop to restart the thread if it exits."""
-        while not self._stop_event.is_set():
+        while not self._stop_autoscale_event.is_set():
             try:
                 self._run_continuous()
             except Exception as e:
@@ -731,7 +747,7 @@ class HerokuDyno:
 
     def _supervised_run_file_cleaning(self):
         """Supervised loop to restart the file cleaning thread if it exits."""
-        while not self._stop_event.is_set():
+        while not self._stop_file_cleaning_event.is_set():
             try:
                 self._run_continuous_file_cleaning()
             except Exception as e:
@@ -747,7 +763,7 @@ class HerokuDyno:
         cache.set(f'heroku:dyno_alive:{self.dyno_name}', now, timeout=ttl)
         # Publish own memory so siblings can gate formation downscale decisions.
         mem = self.current_memory_usage
-        if mem:
+        if mem is not None:
             cache.set(f'heroku:dyno_memory:{self.dyno_name}', mem, timeout=ttl)
 
     def remove_dyno_from_alive_cache(self, dyno_name=None):
@@ -768,7 +784,7 @@ class HerokuDyno:
         own_key = f'heroku:dyno_memory:{self.dyno_name}'
         # Use a literal dot-terminated prefix so 'normal_worker' never matches
         # keys belonging to 'normal_worker_extra' or other longer formation names.
-        for key in cache.keys(f'heroku:dyno_memory:{self.formation_name}.'):
+        for key in cache.keys(f'heroku:dyno_memory:{self.formation_name}.*'):
             if key == own_key:
                 continue  # already checked via is_still_high_memory_usage_for_downscale
             sibling_mem = cache.get(key)
@@ -786,14 +802,14 @@ class HerokuDyno:
         have not checked in within the DYNO_ZOMBIE_THRESHOLD seconds.
         """
         # Make sure only one dyno is checking for zombie dynos at a time
-        with cache.lock('heroku:dyno_alive', expire=30):
+        zombie_threshold = getattr(settings, 'DYNO_ZOMBIE_THRESHOLD', 24 * 60 * 60)
+        with cache.lock('heroku:lock:dyno_alive_check', expire=30):
             siblings = [dyno for dyno in cache.keys('heroku:dyno_alive:*')]
             for sibling in siblings:
                 last_checkin = cache.get(sibling)
                 if last_checkin:
                     last_checkin_seconds_ago = (timezone.now() - last_checkin).total_seconds()
-                    # logger.info(f"Sibling dyno: {sibling}. Last check-in: {last_checkin} ({last_checkin_seconds_ago:.2f} seconds ago).")
-                    if hasattr(settings, 'DYNO_ZOMBIE_THRESHOLD') and last_checkin_seconds_ago > settings.DYNO_ZOMBIE_THRESHOLD:
+                    if last_checkin_seconds_ago > zombie_threshold:
                         last_checkin_minutes_ago = last_checkin_seconds_ago // 60
                         dyno_name = sibling.split(':')[-1]
                         logger.error(f"Zombie dyno detected: {dyno_name}. Last check-in: {last_checkin_minutes_ago:.0f} minutes ago. Restarting...")
@@ -839,16 +855,22 @@ class HerokuDyno:
             logger.info(f"Upscaled formation {self.formation_name} from {self.formation_size} to {next_level} with {DYNO_SIZES[next_level]['memory']} MB memory.")
             self._update_formation_size(next_level)
 
-            # Set cache key that expires in X hour to downscale back to original size
-            if hasattr(settings, 'DYNO_DOWNSCALE_CHECK_INTERVAL') and hasattr(settings, 'DYNO_MIN_UPSCALE_DURATION') and hasattr(settings, 'DYNO_AUTOSCALE_INTERVAL'):
-                delta = settings.DYNO_DOWNSCALE_CHECK_INTERVAL + settings.DYNO_MIN_UPSCALE_DURATION + settings.DYNO_AUTOSCALE_INTERVAL
-                until = timezone.now() + timezone.timedelta(seconds=delta)
-                cache.set(self.upscale_until_cache_key, until, timeout=delta)
+            # Set cache key that expires after min upscale duration to gate downscale checks
+            delta = (
+                getattr(settings, 'DYNO_DOWNSCALE_CHECK_INTERVAL', 300) +
+                getattr(settings, 'DYNO_MIN_UPSCALE_DURATION', 300) +
+                getattr(settings, 'DYNO_AUTOSCALE_INTERVAL', 30)
+            )
+            until = timezone.now() + timedelta(seconds=delta)
+            cache.set(self.upscale_until_cache_key, until, timeout=delta)
 
-            self.stop_continuous_autoscale()
+            if not self.remote_monitoring:
+                self.stop_continuous_autoscale()
         elif response:
+            self.clear_upscaling()
             logger.error(f"Failed to upscale formation {self.formation_name}. Response: {response.status_code} - {response.text}")
         else:
+            self.clear_upscaling()
             logger.error(f"Failed to upscale formation {self.formation_name}. API call was rate-limited or failed.")
 
     def check_and_downscale_to_original_formation_size(self):
@@ -856,28 +878,30 @@ class HerokuDyno:
         Checks if formation should be downscaled by checking memory usage and downscale if necessary
         """
         # Check if formation is upscaled and if it should be downscaled
+        check_interval = getattr(settings, 'DYNO_DOWNSCALE_CHECK_INTERVAL', 300)
         upscaled_until = cache.get(self.upscale_until_cache_key)
         if upscaled_until:
-            # if ttl of cach is about to expire (5 min before) - check if memory usage is still high and extend the scaled time
             current_ttl = cache.ttl(self.upscale_until_cache_key)
-            if hasattr(settings, 'DYNO_DOWNSCALE_CHECK_INTERVAL') and current_ttl < settings.DYNO_DOWNSCALE_CHECK_INTERVAL:
-                if self.allow_downscale:
-                    self.downscale_formation_to_original_size()
-                elif ((self.detected_r14 and not self.detected_r15) or self.is_still_high_memory_usage_for_downscale) and self.no_tasks_in_queue:
+            # Allow early downscale whenever memory is safe, not just near TTL expiry
+            if self.allow_downscale:
+                self.downscale_formation_to_original_size()
+            elif current_ttl < check_interval:
+                # Near expiry — either restart if hot, or extend the timer
+                if ((self.detected_r14 and not self.detected_r15) or self.is_still_high_memory_usage_for_downscale) and self.no_tasks_in_queue:
                     self.restart_dyno()
                 else:
                     load_avg = f'{self.avg_load_1min:.2f}' if self.avg_load_1min else 'unknown'
                     memory_usage = f'{self.current_memory_usage_percentage}% ({self.current_memory_usage:.2f}MB / {self.available_memory}MB)' \
                         if self.current_memory_usage and self.available_memory and self.current_memory_usage_percentage else 'unknown'
-                    logger.warning(f"Extending the time for {self.formation_name} to stay upscaled by {settings.DYNO_DOWNSCALE_CHECK_INTERVAL} seconds. "
+                    logger.warning(f"Extending the time for {self.formation_name} to stay upscaled by {check_interval} seconds. "
                                     f"Current Memory Usage: {memory_usage}. Current Load Avg: {load_avg}. Tasks in Queue: {self.tasks_in_queue}.")
-                    new_until = upscaled_until + timezone.timedelta(seconds=settings.DYNO_DOWNSCALE_CHECK_INTERVAL)
-                    new_timeout = current_ttl + settings.DYNO_DOWNSCALE_CHECK_INTERVAL
+                    new_until = upscaled_until + timedelta(seconds=check_interval)
+                    new_timeout = current_ttl + check_interval
                     cache.set(self.upscale_until_cache_key, new_until, timeout=new_timeout)
             return
 
         # if on original formation size and memory usage is high, restart the dyno
-        if hasattr(settings, 'DOWNSCALE_PERCENTAGE_HIGH_MEM_USE') and self.current_memory_usage_percentage > settings.DOWNSCALE_PERCENTAGE_HIGH_MEM_USE and self.detected_r14 and not self.detected_r15 and self.no_tasks_in_queue:
+        if self.current_memory_usage_percentage > getattr(settings, 'DOWNSCALE_PERCENTAGE_HIGH_MEM_USE', 105) and self.detected_r14 and not self.detected_r15 and self.no_tasks_in_queue:
             self.restart_dyno()
             return
 
@@ -931,7 +955,8 @@ class HerokuDyno:
             logger.info(f"Downscaled formation {self.formation_name} back to {original_formation_size} with {DYNO_SIZES[original_formation_size]['memory']} MB memory.")
             self._update_formation_size(original_formation_size)
             self.clear_original_formation_size()
-            self.stop_continuous_autoscale()
+            if not self.remote_monitoring:
+                self.stop_continuous_autoscale()
         elif response:
             logger.error(f"Failed to downscale formation {self.formation_name}. Response: {response.status_code} - {response.text}")
         else:
@@ -943,18 +968,13 @@ class HerokuDyno:
 
         dyno_name = dyno_name or self.dyno_name
 
-        # Ensure restart is only executed once every settings.DYNO_TIME_BETWEEN_RESTARTS seconds for this dyno
-        cache_key = f'heroku:restart_dyno:{dyno_name}'
-        with cache.lock(cache_key, expire=30):
-            if cache.get(cache_key):
+        # Ensure restart is only executed once every DYNO_TIME_BETWEEN_RESTARTS seconds for this dyno
+        restart_cache_key = f'heroku:restart_dyno:{dyno_name}'
+        with cache.lock(restart_cache_key, expire=30):
+            if cache.get(restart_cache_key):
                 logger.debug(f"Restarting dyno {dyno_name} is already in progress.")
-                return
-
-            if hasattr(settings, 'DYNO_TIME_BETWEEN_RESTARTS'):
-                cache.set(cache_key, True, timeout=settings.DYNO_TIME_BETWEEN_RESTARTS)
-            else:
-                cache.set(cache_key, True, timeout=300)  # Default to 5 minutes
-
+                return False
+            cache.set(restart_cache_key, True, timeout=getattr(settings, 'DYNO_TIME_BETWEEN_RESTARTS', 300))
 
         # Restart the dyno via Heroku API (routed through call_heroku_api for rate limiting)
         url = f'https://api.heroku.com/apps/{self.app_name}/dynos/{dyno_name}'
@@ -966,10 +986,12 @@ class HerokuDyno:
                 self.stop_continuous_autoscale()
             else:
                 self.remove_dyno_from_alive_cache(dyno_name)
+            return True
         elif response:
             logger.error(f"Failed to restart dyno {dyno_name}. Response: {response.status_code} - {response.text}")
         else:
             logger.error(f"Failed to restart dyno {dyno_name}. API call was rate-limited or failed.")
+        return False
 
     def increment_dyno_counter(self, dyno_name=None):
         """
@@ -1010,10 +1032,10 @@ class HerokuDyno:
         # If counter exceeds threshold, restart the dyno
         if counter >= threshold:
             logger.warning(f"Counter for dyno {dyno_name} reached threshold {threshold}. Restarting dyno...")
-            self.restart_dyno(dyno_name)
-            # Reset the counter after restart
-            cache.delete(cache_key)
-            return 'restarted'
+            restarted = self.restart_dyno(dyno_name)
+            if restarted:
+                cache.delete(cache_key)
+            return 0
 
         return counter
 
@@ -1050,7 +1072,11 @@ class HerokuDyno:
                         logger.info("Log URL not found in the response.")
                         return None
 
-                    log_response = requests.get(log_url)
+                    try:
+                        log_response = requests.get(log_url, timeout=30)
+                    except (SSLError, ConnectionError, Timeout) as exc:
+                        logger.warning(f"Failed to fetch logplex URL: {exc}")
+                        return None
                     if log_response.status_code != 200:
                         logger.info(f"Failed to retrieve logs. Status code: {log_response.status_code} - {log_response.text}")
                         return None
@@ -1103,20 +1129,18 @@ class HerokuDyno:
         """
         if timeout is None:
             timeout = 24 * 60 * 60  # Default to 24 hours
-            cache_refresh_interval = getattr(settings, 'DYNO_GENERAL_CACHE_DURATION', 300)  # Default to 5 minutes
+            cache_refresh_interval = getattr(settings, 'DYNO_GENERAL_CACHE_DURATION', 300)
         else:
-            timeout = timeout
             cache_refresh_interval = timeout
 
         cache_key = f'{cache_key}:{self.app_name}:{self.dyno_name}'
 
-        # Fetch from cache
+        # Fetch from cache; ttl > 0 means the key exists and has time remaining
         cached_value = cache.get(cache_key)
-        ttl = cache.ttl(cache_key) or 0
-        cache_age = timeout - ttl  # Calculate cache age in seconds
+        ttl = cache.ttl(cache_key)
+        cache_is_fresh = ttl is not None and ttl > 0 and (timeout - ttl) < cache_refresh_interval
 
-        # If cache is fresh, return cached value
-        if cache_age < cache_refresh_interval and cached_value is not None:
+        if cache_is_fresh and cached_value is not None:
             return cached_value
 
         # Fetch and parse logs
@@ -1134,12 +1158,10 @@ class HerokuDyno:
             timestamp = log_entry.get("timestamp")
             seconds_ago = (timezone.now() - timestamp).total_seconds() if timestamp else None
             if seconds_ago is not None and seconds_ago > timeout:
-                # Skip logs older than the timeout period
                 continue
             for pattern in compiled_patterns:
                 match = pattern.search(message)
                 if match:
-                    # Extract the matched value
                     extracted_value = match.group(1)
                     latest_value = result_type(extracted_value) if extracted_value.replace('.', '', 1).isdigit() else extracted_value
                     break
@@ -1147,9 +1169,11 @@ class HerokuDyno:
                 break
 
         if result_type == bool:
+            # Explicit False when no recent match found — prevents cached True from latching forever
             latest_value = bool(latest_value)
+            cache.set(cache_key, latest_value, timeout=timeout)
+            return latest_value
 
-        # Update cache with the latest value
         if latest_value is not None:
             cache.set(cache_key, latest_value, timeout=timeout)
 
@@ -1238,9 +1262,10 @@ class HerokuDyno:
             # Use the Heroku API to run the command on a one-off dyno
             url = f'https://api.heroku.com/apps/{self.app_name}/dynos'
 
-            # Prepare the payload for the API request
+            # Quote the command to prevent shell injection
+            safe_command = shlex.quote(command) if command else None
             payload = {
-                'command': f'bash -c "{command}"' if command else 'bash',
+                'command': f'bash -c {safe_command}' if safe_command else 'bash',
                 'attach': True,
                 'size': self.formation_size,
                 'type': 'run'
@@ -1250,24 +1275,9 @@ class HerokuDyno:
             response = self.call_heroku_api("POST", url, custom_headers={'Content-Type': 'application/json'}, data=payload)
 
             if response and response.status_code == 201:  # 201 Created
-                # Successfully created a one-off dyno
                 dyno_data = response.json()
                 logger.info(f"Command execution started on one-off dyno {dyno_data.get('name')}.")
-
-                # Create a result object similar to what subprocess.run would return
-                class ApiResult:
-                    def __init__(self, stdout, stderr, returncode):
-                        self.stdout = stdout
-                        self.stderr = stderr
-                        self.returncode = returncode
-
-                # For API execution, we don't have direct access to stdout/stderr
-                # We could potentially fetch logs, but for now we'll just return the response data
-                return ApiResult(
-                    stdout=str(dyno_data),
-                    stderr="",
-                    returncode=0
-                )
+                return _ApiResult(stdout=str(dyno_data), stderr="", returncode=0)
             elif response:
                 logger.error(f"Failed to execute command via Heroku API. Response: {response.status_code} - {response.text}")
                 return None

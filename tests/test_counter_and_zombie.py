@@ -33,10 +33,10 @@ class TestIncrementDynoCounter(BaseLockTestCase):
         threshold = getattr(ds, "DYNO_RESTART_THRESHOLD", 15)
         key = f"heroku:dyno_counter:{dyno.dyno_name}"
         cache.set(key, threshold - 1, timeout=3600)
-        with patch.object(dyno, "restart_dyno") as mock_restart:
+        with patch.object(dyno, "restart_dyno", return_value=True) as mock_restart:
             result = dyno.increment_dyno_counter()
         mock_restart.assert_called_once_with(dyno.dyno_name)
-        self.assertEqual(result, "restarted")
+        self.assertEqual(result, 0)
 
     def test_counter_deleted_after_restart(self):
         from django.conf import settings as ds
@@ -44,7 +44,7 @@ class TestIncrementDynoCounter(BaseLockTestCase):
         threshold = getattr(ds, "DYNO_RESTART_THRESHOLD", 15)
         key = f"heroku:dyno_counter:{dyno.dyno_name}"
         cache.set(key, threshold - 1, timeout=3600)
-        with patch.object(dyno, "restart_dyno"):
+        with patch.object(dyno, "restart_dyno", return_value=True):
             dyno.increment_dyno_counter()
         self.assertIsNone(cache.get(key))
 
@@ -54,21 +54,19 @@ class TestIncrementDynoCounter(BaseLockTestCase):
         self.assertEqual(result, 1)
         self.assertEqual(cache.get("heroku:dyno_counter:other_worker.2"), 1)
 
-    def test_inconsistent_return_type_bug(self):
+    def test_restart_returns_zero_int(self):
         """
-        BUG: increment_dyno_counter returns int normally but str('restarted')
-        at threshold. Callers must handle both types.
-        This test documents the inconsistency — fix: always return int (e.g. -1 or 0 on restart).
+        increment_dyno_counter must return int 0 at threshold (not the old 'restarted' string).
         """
         from django.conf import settings as ds
         dyno = make_dyno()
         threshold = getattr(ds, "DYNO_RESTART_THRESHOLD", 15)
         key = f"heroku:dyno_counter:{dyno.dyno_name}"
         cache.set(key, threshold - 1, timeout=3600)
-        with patch.object(dyno, "restart_dyno"):
+        with patch.object(dyno, "restart_dyno", return_value=True):
             result = dyno.increment_dyno_counter()
-        # Documents: returns str not int at threshold — type inconsistency
-        self.assertIsInstance(result, str)
+        self.assertIsInstance(result, int)
+        self.assertEqual(result, 0)
 
 
 class TestCheckForSiblingZombieDynos(BaseLockTestCase):

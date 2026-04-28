@@ -45,7 +45,8 @@ def make_dyno(dyno_name="normal_worker.1", formation_size="standard-2x"):
     dyno.dyno_id = "abc123"
     dyno.formation_name = dyno_name.split(".")[0]
     dyno.heroku_api_key = "fake"
-    dyno._stop_event = MagicMock()
+    dyno._stop_autoscale_event = MagicMock()
+    dyno._stop_file_cleaning_event = MagicMock()
     dyno._autoscale_thread = None
     dyno._file_cleaning_thread = None
     import threading
@@ -64,10 +65,12 @@ class TestDownscaleMemoryThreshold(unittest.TestCase):
         expected = DYNO_SIZES["standard-1x"]["memory"] * django_settings.DOWNSCALE_PERCENTAGE_HIGH_MEM_USE / 100
         self.assertAlmostEqual(dyno._downscale_memory_threshold, expected)
 
-    def test_no_previous_size_returns_zero(self):
-        # standard-1x has no previous → threshold = 0
+    def test_no_previous_or_original_size_blocks_downscale(self):
+        # standard-1x has no previous and no original in cache →
+        # threshold returns float('inf') to block any accidental downscale.
+        import math
         dyno = make_dyno(formation_size="standard-1x")
-        self.assertEqual(dyno._downscale_memory_threshold, 0)
+        self.assertTrue(math.isinf(dyno._downscale_memory_threshold))
 
 
 class TestIsStillHighMemoryUsageForDownscale(unittest.TestCase):
@@ -227,11 +230,12 @@ class TestCheckInDynoPublishesMemory(unittest.TestCase):
         dyno.check_in_dyno()
         self.assertEqual(cache.get("heroku:dyno_memory:normal_worker.3"), 512)
 
-    def test_check_in_dyno_skips_memory_key_when_zero(self):
+    def test_check_in_dyno_stores_zero_memory(self):
+        """P1-7: if mem is not None means 0 is a valid reading and must be stored."""
         dyno = make_dyno("normal_worker.3")
         type(dyno).current_memory_usage = PropertyMock(return_value=0)
         dyno.check_in_dyno()
-        self.assertIsNone(cache.get("heroku:dyno_memory:normal_worker.3"))
+        self.assertEqual(cache.get("heroku:dyno_memory:normal_worker.3"), 0)
 
     def test_check_in_dyno_still_writes_alive_key(self):
         dyno = make_dyno("normal_worker.3")
@@ -515,12 +519,14 @@ class TestBaseFormationEdgeCases(unittest.TestCase):
     def tearDown(self):
         cache.clear()
 
-    def test_threshold_zero_at_base_size(self):
+    def test_threshold_inf_at_base_size_with_no_original(self):
+        """P0-9: no original/previous size → float('inf') threshold (block-safe sentinel)."""
+        import math
         dyno = make_dyno(formation_size="standard-1x")
-        self.assertEqual(dyno._downscale_memory_threshold, 0)
+        self.assertTrue(math.isinf(dyno._downscale_memory_threshold))
 
-    def test_any_positive_memory_blocks_downscale_at_base_size(self):
-        # threshold=0, current_memory=200 → 200 >= 0 → True → downscale blocked
+    def test_any_memory_blocks_downscale_when_threshold_unknown(self):
+        # threshold=inf → math.isinf(threshold) → is_still_high == True → downscale blocked
         dyno = _make_full_dyno(formation_size="standard-1x", own_memory=200)
         self.assertTrue(dyno.is_still_high_memory_usage_for_downscale)
 

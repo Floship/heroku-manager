@@ -162,7 +162,7 @@ class TestThreadManagement(BaseLockTestCase):
         mock_thread.is_alive.return_value = True
         dyno._autoscale_thread = mock_thread
         dyno.stop_continuous_autoscale()
-        self.assertTrue(dyno._stop_event.is_set())
+        self.assertTrue(dyno._stop_autoscale_event.is_set())
 
     def test_stop_continuous_autoscale_no_thread_is_noop(self):
         dyno = make_dyno()
@@ -184,7 +184,7 @@ class TestThreadManagement(BaseLockTestCase):
         mock_thread.is_alive.return_value = True
         dyno._file_cleaning_thread = mock_thread
         dyno.stop_continuous_file_cleaning()
-        self.assertTrue(dyno._stop_event.is_set())
+        self.assertTrue(dyno._stop_file_cleaning_event.is_set())
 
 
 class TestCheckAndCleanOldFiles(BaseLockTestCase):

@@ -24,18 +24,15 @@ class TestAcquireRateLimitToken(BaseLockTestCase):
         result = dyno._acquire_rate_limit_token()
         self.assertTrue(result)
 
-    def test_exhausted_budget_sleeps_and_returns_false_after_3_attempts(self):
+    def test_exhausted_budget_returns_false_without_sleeping(self):
+        """P0-3: rate limiter must skip (non-blocking) instead of sleeping."""
         dyno = make_dyno()
-        from django.conf import settings
         limit = 50
         cache.set(f"heroku:api_rate:{dyno.app_name}", limit, timeout=60)
-        # Patch ttl to return 1 so wait is minimal
-        from django.core.cache.backends.locmem import LocMemCache
-        with patch.object(LocMemCache, "ttl", return_value=1):
-            with patch("heroku_manager.heroku.time.sleep") as mock_sleep:
-                result = dyno._acquire_rate_limit_token()
+        with patch("heroku_manager.heroku.time.sleep") as mock_sleep:
+            result = dyno._acquire_rate_limit_token()
         self.assertFalse(result)
-        self.assertEqual(mock_sleep.call_count, 3)
+        mock_sleep.assert_not_called()
 
     def test_key_expiry_between_get_and_incr_handled(self):
         """ValueError from cache.incr when key expired mid-call must not raise."""
@@ -122,21 +119,16 @@ class TestCallHerokuApi(BaseLockTestCase):
         self.assertEqual(resp.status_code, 404)
         mock_log.error.assert_called()
 
-    def test_mutable_default_custom_headers_bug(self):
+    def test_custom_headers_default_is_none_not_mutable_dict(self):
         """
-        BUG: custom_headers={} is a mutable default argument.
-        Two calls that mutate headers would share state.
-        This test documents the current (broken) behavior so a fix can be verified.
+        P1-11: custom_headers default was mutable dict {}.
+        Fix: default must be None, internally resolved to {} per call.
         """
-        dyno = make_dyno()
         import heroku_manager.heroku as hm
         import inspect
         sig = inspect.signature(hm.HerokuDyno.call_heroku_api)
         default_headers = sig.parameters["custom_headers"].default
-        # The default is a dict instance — mutable default argument is present
-        self.assertIsInstance(default_headers, dict)
-        # Documenting: if caller mutates it, next caller sees mutated state
-        # Fix: should be `custom_headers=None` with `headers.update(custom_headers or {})`
+        self.assertIsNone(default_headers)
 
 
 if __name__ == "__main__":

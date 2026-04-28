@@ -43,7 +43,8 @@ def make_dyno(dyno_name="normal_worker.1", formation_size="standard-2x"):
     dyno.dyno_id = "abc123"
     dyno.formation_name = dyno_name.split(".")[0]
     dyno.heroku_api_key = "fake-key"
-    dyno._stop_event = threading.Event()
+    dyno._stop_autoscale_event = threading.Event()
+    dyno._stop_file_cleaning_event = threading.Event()
     dyno._autoscale_thread = None
     dyno._file_cleaning_thread = None
     dyno._thread_lock = threading.Lock()
