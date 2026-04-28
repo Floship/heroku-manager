@@ -236,16 +236,21 @@ class HerokuDyno:
     def allow_downscale(self):
         return not self.requires_upscale and \
             not self.is_still_high_memory_usage_for_downscale and \
+            not self.any_sibling_still_high_memory and \
             not self.detected_r14 and \
             (self.downscale_on_non_empty_queue or self.no_tasks_in_queue)
             
     @property
     def allow_downscale_on_shutdown(self):
         """
-        Allow downscale on shutdown if the dyno is not in high memory usage state.
+        Allow downscale on shutdown if neither this dyno nor any sibling is in a
+        high-memory state.  Siblings must be checked because a graceful shutdown
+        removes this dyno's memory key before the formation resize, which would
+        otherwise leave hot siblings vulnerable to an unexpected downscale.
         """
         return not self.requires_upscale and \
             not self.is_still_high_memory_usage_for_downscale and \
+            not self.any_sibling_still_high_memory and \
             not self.detected_r14
 
     @property
@@ -261,9 +266,14 @@ class HerokuDyno:
         return self.get_load_1min_avg()
 
     @property
-    def is_still_high_memory_usage_for_downscale(self):
+    def _downscale_memory_threshold(self):
+        """Memory (MB) above which a dyno is considered too hot to downscale."""
         previous_formation_memory = DYNO_SIZES.get(self.previous_formation_size, {}).get("memory", 0)
-        return self.current_memory_usage >= (previous_formation_memory * settings.DOWNSCALE_PERCENTAGE_HIGH_MEM_USE / 100)
+        return previous_formation_memory * settings.DOWNSCALE_PERCENTAGE_HIGH_MEM_USE / 100
+
+    @property
+    def is_still_high_memory_usage_for_downscale(self):
+        return self.current_memory_usage >= self._downscale_memory_threshold
 
     def _acquire_rate_limit_token(self):
         """
@@ -722,11 +732,44 @@ class HerokuDyno:
     # Registers dyno as alive in redis cache table so other workers can check if it's alive and restart it if it doesn't respond for a while
     def check_in_dyno(self):
         now = timezone.now()
-        cache.set(f'heroku:dyno_alive:{self.dyno_name}', now, timeout=24 * 60 * 60)
+        # Use DYNO_ZOMBIE_THRESHOLD as the TTL so crashed dynos auto-expire before
+        # the zombie detector fires — prevents stale memory keys from blocking downscale.
+        ttl = int(getattr(settings, 'DYNO_ZOMBIE_THRESHOLD', 24 * 60 * 60))
+        cache.set(f'heroku:dyno_alive:{self.dyno_name}', now, timeout=ttl)
+        # Publish own memory so siblings can gate formation downscale decisions.
+        mem = self.current_memory_usage
+        if mem:
+            cache.set(f'heroku:dyno_memory:{self.dyno_name}', mem, timeout=ttl)
 
     def remove_dyno_from_alive_cache(self, dyno_name=None):
         dyno_name = dyno_name or self.dyno_name
         cache.delete(f'heroku:dyno_alive:{dyno_name}')
+        cache.delete(f'heroku:dyno_memory:{dyno_name}')
+
+    @property
+    def any_sibling_still_high_memory(self):
+        """
+        Return True if any *other* dyno of the same formation has memory at or above
+        the downscale threshold.  Prevents a low-memory dyno from downscaling the
+        whole formation while a sibling is still running hot.
+        """
+        threshold = self._downscale_memory_threshold
+        if not threshold:
+            return False
+        own_key = f'heroku:dyno_memory:{self.dyno_name}'
+        # Use a literal dot-terminated prefix so 'normal_worker' never matches
+        # keys belonging to 'normal_worker_extra' or other longer formation names.
+        for key in cache.keys(f'heroku:dyno_memory:{self.formation_name}.'):
+            if key == own_key:
+                continue  # already checked via is_still_high_memory_usage_for_downscale
+            sibling_mem = cache.get(key)
+            if sibling_mem and sibling_mem >= threshold:
+                logger.debug(
+                    f"Sibling {key.split(':')[-1]} at {sibling_mem:.0f}MB >= "
+                    f"{threshold:.0f}MB threshold; blocking {self.formation_name} downscale."
+                )
+                return True
+        return False
 
     def check_for_sibling_zombie_dynos(self):
         """

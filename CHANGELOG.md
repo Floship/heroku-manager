@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 - 2026-04-28
+- **Fix: sibling-memory guard prevents premature formation downscale.** A low-memory dyno could trigger a formation downscale while sibling dynos were still running above the downscale threshold. Each dyno now publishes its own memory to Redis (`heroku:dyno_memory:{dyno_name}`) on every check-in; `allow_downscale` and `allow_downscale_on_shutdown` both gate on `any_sibling_still_high_memory` before resizing the formation.
+- **Fix: stale crashed-dyno memory keys.** Memory keys now use `DYNO_ZOMBIE_THRESHOLD` as TTL (instead of a hardcoded 24 h) so a crashed dyno's stale key expires at the same point the zombie detector fires — preventing an indefinite downscale block.
+- **Fix: `allow_downscale_on_shutdown` now checks sibling memory.** A graceful shutdown removes the dying dyno's memory key before the formation resize; the sibling guard prevents that resize from executing while hot siblings are still alive.
+- **Fix: `cache.keys()` formation pattern uses literal dot prefix.** `heroku:dyno_memory:normal_worker.` (dot suffix) instead of `normal_worker.*` (wildcard) prevents `normal_worker_extra.1` from being matched as a sibling of `normal_worker`.
+- **Refactor: extracted `_downscale_memory_threshold` property (DRY).** Both `is_still_high_memory_usage_for_downscale` and `any_sibling_still_high_memory` share one threshold calculation.
+- **Tests: 48 unit tests** covering threshold math, R14/R15 interactions, sibling guard, shutdown guard, TTL correctness, formation name isolation, null-memory safety, base-size edge cases, threshold boundary semantics, and queue gating.
+
 ## 0.2.0 - 2025-02-23
 - **Major: Shared Redis API rate limiter.** All Heroku Platform API calls now go through `call_heroku_api()` with a per-app sliding-window rate limiter (default 50 req/min, configurable via `HEROKU_API_RATE_LIMIT_PER_MINUTE`). Prevents 429 errors when many dynos poll concurrently.
 - **429 back-off.** `call_heroku_api()` now reads the `Retry-After` header on 429 responses and backs off automatically before retrying (up to 5 attempts).
