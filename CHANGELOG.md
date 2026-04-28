@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.3 - 2026-04-28
+- **Security: shell injection fix in `exec_connect`.** Command argument is now quoted via `shlex.quote()` before being passed to `bash -c`, preventing injection via untrusted formation names or commands.
+- **Fix: P0-1 — sibling memory glob wildcard.** `cache.keys()` pattern was `heroku:dyno_memory:{name}.` (no wildcard), so it never matched any keys. Fixed to `{name}.*`.
+- **Fix: P0-2 — split shared `_stop_event`.** A single threading event was shared between the autoscale and file-cleaning threads; stopping one would stop both. Replaced with `_stop_autoscale_event` and `_stop_file_cleaning_event`.
+- **Fix: P0-3 — non-blocking rate limiter.** `_acquire_rate_limit_token()` no longer sleeps 195 s per attempt when the budget is exhausted. It logs a warning and returns `False`, letting the caller skip one cycle instead of blocking the thread.
+- **Fix: P0-5 — `_get_proc_class_by_formation_name` `@cached_property` caches `None`.** Changed to `@property` so a `None` result from a race-condition first call is not permanently cached.
+- **Fix: P0-6 — `stop_continuous_autoscale()` guarded in scale methods.** `upscale_formation_to_next_level` and `downscale_formation_to_original_size` were unconditionally stopping the autoscale thread, killing remote-monitoring-only deployments. Both now guard with `if not self.remote_monitoring:`.
+- **Fix: P0-8 — `increment_dyno_counter` mixed return type.** Now always returns `int` (0 on restart, incremented counter otherwise). Was returning the string `'restarted'` on the restart path.
+- **Fix: P0-9 — zero downscale threshold permits unconditional downscale.** When no original or previous formation size is known, `_downscale_memory_threshold` returns `float('inf')` and `is_still_high_memory_usage_for_downscale` uses `math.isinf()` to block the downscale safely.
+- **Fix: P1-1/P1-2 — `set_upscaling()` TTL extended; `clear_upscaling()` added.** TTL is now `DYNO_TIME_BETWEEN_SCALES + 150` s to cover the full lock window. Error paths in `upscale_formation_to_next_level` now call `clear_upscaling()` instead of leaving a dangling lock.
+- **Fix: P1-3 — TOCTOU in rate limiter.** `cache.incr()` return value is now checked against the rate limit (instead of a separate `cache.get()`), closing a race window where the limit could be exceeded between get and incr.
+- **Fix: P1-4 — `is_on_original_formation_size_or_lower` side effect removed.** Now uses a direct size comparison instead of updating the previous-size cache as a side effect.
+- **Fix: P1-5 — `allow_downscale` checked eagerly in `check_and_downscale`.** Was only checked near TTL expiry; hot-memory dynos could slip through the guard on the initial TTL-not-yet-expired path.
+- **Fix: P1-6 — counter not deleted on failed restart.** `increment_dyno_counter` now only deletes the counter key if `restart_dyno()` returns `True`.
+- **Fix: P1-7 — `check_in_dyno` zero-memory guard.** Changed `if mem:` to `if mem is not None:` so a valid reading of 0 MB is stored, not silently dropped.
+- **Fix: P1-8 — stuck-True R14/R15 detection.** `extract_latest_metric` now always writes cache for `bool` results (both `True` and `False`), preventing a latched `True` when the error condition clears.
+- **Fix: P1-9 — logplex fetch error handling.** `get_heroku_logs` now wraps the logplex URL fetch in `try/except (SSLError, ConnectionError, Timeout)` with `timeout=30`.
+- **Fix: P1-10 — `hasattr` replaced with `getattr(..., default)`.** All settings presence checks now use `getattr` with safe defaults throughout `autoscale()`, `check_and_downscale`, `restart_dyno`, and zombie check.
+- **Fix: P1-11 — mutable default `custom_headers={}`.** Changed to `custom_headers=None`, resolved to `{}` inside the function body.
+- **Fix: P1-12 — extracted `_FORMATION_DEPENDENT_CACHE` + `_invalidate_formation_dependent_cache()`.** Centralises the set of keys that must be cleared after a scale operation (DRY).
+- **Fix: P1-13 — `settings` variable shadowed in `get_dyno_settings` loop.** Loop variable renamed to `size_info`; method now returns `dict(size_info)` copy.
+- **Fix: P1-14 — cache-age guard uses `ttl > 0` sentinel.** Replaced the ambiguous `ttl or 0` pattern which treated a TTL of `0` as missing.
+- **Fix: P2-1 — `formation_size` instance cache TTL.** Changed from `DYNO_AUTOSCALE_INTERVAL * 1` to `* 5` to reduce redundant API calls.
+- **Fix: P2-2 — `check_and_clean_old_files` removed from autoscale loop.** Was duplicated in both `_run_continuous` and `_run_continuous_file_cleaning`; now only in the file-cleaning thread.
+- **Fix: P2-3 — `set_threads_used` cache TTL.** Reduced from 1 hour to `DYNO_AUTOSCALE_INTERVAL * 2` so the value reflects recent thread counts.
+- **Fix: P2-4 — removed unused `import subprocess` / `from subprocess import run`.**
+- **Fix: P2-5 — `_ApiResult` promoted to module level.** Was an inner class inside `exec_connect`; promoted to a module-level dataclass.
+- **Fix: P2-9 — lock key collision in zombie check.** Changed from `heroku:dyno_alive` (conflicts with check-in keys) to `heroku:lock:dyno_alive_check`.
+- **Fix: P2-10 — `get_dyno_settings` returns a copy.** Prevents callers from mutating the live settings dict.
+- **Fix: P2-11 — double-colon typo in `threads_used_cache_key`.**
+- **Fix: P2-B — `timezone.timedelta` → `timedelta`.** Added `from datetime import timedelta` and replaced all `timezone.timedelta(...)` calls.
+
 ## 0.2.2 - 2026-04-28
 - **Fix: block downscale after `upscale_until` expiry when the formation is still hot.** If the keep-upscaled timer had already expired, `check_and_downscale_to_original_formation_size()` could fall through to an unconditional downscale even while `allow_downscale` was still false. The timer is now restored instead of shrinking the formation while memory or R14 pressure is still active.
 - **Fix: downscale threshold now uses the original target size, not the intermediate previous size.** Performance-M workers returning to Standard-1X were previously compared against a Standard-2X threshold, which allowed a premature downscale around ~1 GB usage and immediately triggered R14 on the smaller formation.
