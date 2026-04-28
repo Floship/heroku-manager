@@ -56,6 +56,12 @@ def make_dyno(dyno_name="normal_worker.1", formation_size="standard-2x"):
     return dyno
 
 
+def _isolate_dyno_type(dyno):
+    isolated_type = type(f"IsolatedHerokuDyno_{id(dyno)}", (type(dyno),), {})
+    dyno.__class__ = isolated_type
+    return dyno
+
+
 class TestDownscaleMemoryThreshold(unittest.TestCase):
     """_downscale_memory_threshold returns previous_size_memory * DOWNSCALE_% / 100."""
 
@@ -189,7 +195,7 @@ class TestAllowDownscaleWithSiblingGuard(unittest.TestCase):
 
     def _dyno_allow_downscale_setup(self, own_memory, sibling_memory=None):
         """Helper: dyno with controlled memory, optional sibling in cache."""
-        dyno = make_dyno("normal_worker.1", formation_size="standard-2x")
+        dyno = _isolate_dyno_type(make_dyno("normal_worker.1", formation_size="standard-2x"))
         type(dyno).current_memory_usage = PropertyMock(return_value=own_memory)
         type(dyno).current_memory_usage_percentage = PropertyMock(return_value=own_memory / 1024 * 100)
         type(dyno).detected_r14 = PropertyMock(return_value=False)
@@ -275,7 +281,7 @@ def _make_full_dyno(dyno_name="normal_worker.1", formation_size="standard-2x",
                     own_memory=298, r14=False, r15=False,
                     no_tasks=True, downscale_on_non_empty=False):
     """Fully wired dyno for allow_downscale / allow_downscale_on_shutdown tests."""
-    dyno = make_dyno(dyno_name=dyno_name, formation_size=formation_size)
+    dyno = _isolate_dyno_type(make_dyno(dyno_name=dyno_name, formation_size=formation_size))
     type(dyno).current_memory_usage = PropertyMock(return_value=own_memory)
     type(dyno).current_memory_usage_percentage = PropertyMock(
         return_value=own_memory / DYNO_SIZES[formation_size]["memory"] * 100
@@ -306,25 +312,24 @@ class TestR14R15GuardInteractions(unittest.TestCase):
         cache.clear()
 
     def test_r15_blocks_allow_downscale(self):
-        # R15 → requires_upscale=True → allow_downscale=False
         dyno = _make_full_dyno(own_memory=200, r15=True)
         with _patch_cache_keys({}):
             self.assertFalse(dyno.allow_downscale)
 
-    def test_r14_blocks_allow_downscale(self):
+    def test_r14_does_not_block_allow_downscale_when_memory_is_cool(self):
         dyno = _make_full_dyno(own_memory=200, r14=True)
         with _patch_cache_keys({}):
-            self.assertFalse(dyno.allow_downscale)
+            self.assertTrue(dyno.allow_downscale)
 
     def test_r15_blocks_allow_downscale_on_shutdown(self):
         dyno = _make_full_dyno(own_memory=200, r15=True)
         with _patch_cache_keys({}):
             self.assertFalse(dyno.allow_downscale_on_shutdown)
 
-    def test_r14_blocks_allow_downscale_on_shutdown(self):
+    def test_r14_does_not_block_allow_downscale_on_shutdown_when_memory_is_cool(self):
         dyno = _make_full_dyno(own_memory=200, r14=True)
         with _patch_cache_keys({}):
-            self.assertFalse(dyno.allow_downscale_on_shutdown)
+            self.assertTrue(dyno.allow_downscale_on_shutdown)
 
     def test_r14_and_r15_both_absent_allows_shutdown_downscale_when_cool(self):
         dyno = _make_full_dyno(own_memory=200, r14=False, r15=False)

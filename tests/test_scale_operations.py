@@ -179,8 +179,8 @@ class TestCheckAndDownscale(BaseLockTestCase):
                     dyno.check_and_downscale_to_original_formation_size()
         mock_down.assert_not_called()
 
-    def test_early_downscale_when_safe_even_if_ttl_high(self):
-        """P1-5 fix: downscale should happen as soon as allow_downscale is True, not only near TTL expiry."""
+    def test_no_early_downscale_when_safe_if_ttl_high(self):
+        """Keep the formation upscaled until the final TTL window even if current memory is low."""
         dyno = make_dyno(formation_size="performance-m")
         from django.utils import timezone
         from django.core.cache.backends.locmem import LocMemCache
@@ -192,7 +192,32 @@ class TestCheckAndDownscale(BaseLockTestCase):
                               new_callable=PropertyMock, return_value=True):
                 with patch.object(dyno, "downscale_formation_to_original_size") as mock_down:
                     dyno.check_and_downscale_to_original_formation_size()
-        mock_down.assert_called_once()
+        mock_down.assert_not_called()
+
+    def test_no_downscale_when_r15_present_near_ttl_expiry(self):
+        """R15 must keep the formation upscaled even in the final TTL window."""
+        dyno = make_dyno(formation_size="performance-m")
+        from django.utils import timezone
+        from django.core.cache.backends.locmem import LocMemCache
+        cache.set(dyno.original_size_cache_key, {"size": "standard-2x"}, timeout=None)
+        until = timezone.now() + timezone.timedelta(seconds=60)
+        cache.set(dyno.upscale_until_cache_key, until, timeout=60)
+        with patch.object(LocMemCache, "ttl", return_value=60):
+            with patch.object(type(dyno), "allow_downscale",
+                              new_callable=PropertyMock, return_value=False):
+                with patch.object(type(dyno), "detected_r14",
+                                  new_callable=PropertyMock, return_value=False):
+                    with patch.object(type(dyno), "detected_r15",
+                                      new_callable=PropertyMock, return_value=True):
+                        with patch.object(type(dyno), "is_still_high_memory_usage_for_downscale",
+                                          new_callable=PropertyMock, return_value=False):
+                            with patch.object(type(dyno), "no_tasks_in_queue",
+                                              new_callable=PropertyMock, return_value=True):
+                                with patch.object(dyno, "downscale_formation_to_original_size") as mock_down:
+                                    with patch.object(dyno, "restart_dyno") as mock_restart:
+                                        dyno.check_and_downscale_to_original_formation_size()
+        mock_down.assert_not_called()
+        mock_restart.assert_not_called()
 
     def test_restarts_dyno_when_r14_and_high_memory_and_no_tasks(self):
         dyno = make_dyno(formation_size="performance-m")
@@ -372,9 +397,13 @@ class TestRemoteMonitoringGuard(BaseLockTestCase):
         dyno = make_dyno(formation_size="standard-2x")
         with patch.object(type(dyno), "remote_monitoring",
                           new_callable=PropertyMock, return_value=False):
-            with patch.object(dyno, "call_heroku_api", return_value=_mock_response(200)):
-                with patch.object(dyno, "stop_continuous_autoscale") as mock_stop:
-                    dyno.upscale_formation_to_next_level()
+            with patch.object(type(dyno), "current_memory_usage_percentage",
+                              new_callable=PropertyMock, return_value=90.0):
+                with patch.object(type(dyno), "current_memory_usage",
+                                  new_callable=PropertyMock, return_value=922):
+                    with patch.object(dyno, "call_heroku_api", return_value=_mock_response(200)):
+                        with patch.object(dyno, "stop_continuous_autoscale") as mock_stop:
+                            dyno.upscale_formation_to_next_level()
         mock_stop.assert_called_once()
 
     def test_downscale_does_not_stop_autoscale_for_remote_monitoring(self):

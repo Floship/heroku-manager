@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.5 - 2026-04-28
+- **Fix: phantom upscale_until key trapping formation in infinite extend loop.** When a sibling downscaled the formation back to its original size (standard-1x) between an upscale API call and its `cache.set()`, the `upscale_until` key from the previous phantom cycle survived. Other siblings then kept "Extending the time to stay upscaled" even though the formation was already at its original size — blocking legitimate R15→upscale responses. Production impact: all 6 normal_workers cycling through R14/R15 every ~10 minutes with 1200+ error events/day. Fix adds `is_on_original_formation_size_or_lower` checks in both the `upscale_until` handler and the expired-key guard to detect and clear phantom upscale state.
+- **Tests: 40 regression tests for phantom upscale state.** Covers phantom detection on original size (4 scenarios incl. non-base tier, below-original), phantom clear loop (5 scenarios incl. high-TTL, both-keys-deleted), phantom-clear→R14 restart fallthrough (4 scenarios), legitimate upscale preservation (3 scenarios incl. multi-level perf-m), near-expiry downscale/restart (2), bottom guard (3), startup interaction (3), phantom-clear→R15 upscale (2), multi-sibling clearing (2), full production race sequence (3), `is_on_original_formation_size_or_lower` property (6), and `can_be_upscaled` compound guard (3).
+
+## 0.2.4 - 2026-04-28
+- **Fix: treat `R15` as the hard no-downscale signal.** `requires_upscale` no longer escalates solely on `R14`; only memory above the configured upscale threshold or an active `R15` now forces an upscale decision.
+- **Fix: ignore `R14` in downscale guards when memory is otherwise safe.** `allow_downscale` and `allow_downscale_on_shutdown` no longer block a resize just because an `R14` marker was seen.
+- **Fix: preserve the keep-upscaled window until the final check interval.** When a formation has recently upscaled, low post-restart memory no longer causes an immediate downscale; the formation stays upscaled until the TTL is near expiry, and an active `R15` still prevents downscale in that final window.
+- **Tests: add regression coverage for `R14` being ignored below threshold and for `R15` blocking downscale near TTL expiry.**
+
 ## 0.2.3 - 2026-04-28
 - **Security: shell injection fix in `exec_connect`.** Command argument is now quoted via `shlex.quote()` before being passed to `bash -c`, preventing injection via untrusted formation names or commands.
 - **Fix: P0-1 — sibling memory glob wildcard.** `cache.keys()` pattern was `heroku:dyno_memory:{name}.` (no wildcard), so it never matched any keys. Fixed to `{name}.*`.

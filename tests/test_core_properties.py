@@ -168,13 +168,22 @@ class TestIsMemoryPredicates(BaseLockTestCase):
     def test_requires_upscale_via_percentage(self):
         dyno = make_dyno(formation_size="standard-2x")  # 1024 MB
         type(dyno).current_memory_usage = PropertyMock(return_value=900)
+        type(dyno).detected_r14 = PropertyMock(return_value=False)
         type(dyno).detected_r15 = PropertyMock(return_value=False)
         # 900/1024*100 = 87.9% > 80
         self.assertTrue(dyno.requires_upscale)
 
+    def test_requires_upscale_ignores_r14_when_below_threshold(self):
+        dyno = make_dyno(formation_size="standard-2x")
+        type(dyno).current_memory_usage = PropertyMock(return_value=100)
+        type(dyno).detected_r14 = PropertyMock(return_value=True)
+        type(dyno).detected_r15 = PropertyMock(return_value=False)
+        self.assertFalse(dyno.requires_upscale)
+
     def test_requires_upscale_via_r15(self):
         dyno = make_dyno(formation_size="standard-2x")
         type(dyno).current_memory_usage = PropertyMock(return_value=100)
+        type(dyno).detected_r14 = PropertyMock(return_value=False)
         type(dyno).detected_r15 = PropertyMock(return_value=True)
         self.assertTrue(dyno.requires_upscale)
 

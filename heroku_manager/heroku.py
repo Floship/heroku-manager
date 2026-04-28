@@ -234,14 +234,16 @@ class HerokuDyno:
 
     @property
     def requires_upscale(self):
-        return bool(self.current_memory_usage_percentage > settings.UPSCALE_PERCENTAGE_HIGH_MEM_USE or self.detected_r15)
+        return bool(
+            self.current_memory_usage_percentage > settings.UPSCALE_PERCENTAGE_HIGH_MEM_USE
+            or self.detected_r15
+        )
 
     @property
     def allow_downscale(self):
         return not self.requires_upscale and \
             not self.is_still_high_memory_usage_for_downscale and \
             not self.any_sibling_still_high_memory and \
-            not self.detected_r14 and \
             (self.downscale_on_non_empty_queue or self.no_tasks_in_queue)
             
     @property
@@ -254,8 +256,7 @@ class HerokuDyno:
         """
         return not self.requires_upscale and \
             not self.is_still_high_memory_usage_for_downscale and \
-            not self.any_sibling_still_high_memory and \
-            not self.detected_r14
+            not self.any_sibling_still_high_memory
 
     @property
     def detected_r15(self):
@@ -828,6 +829,16 @@ class HerokuDyno:
             logger.debug(f"Formation {self.formation_name} is already at max size {self.max_dyno_size}.")
             return
 
+        # Once a formation has already been upscaled, keep it at the current size
+        # until the downscale window is reached instead of chaining another upscale
+        # just because R15 is still present after the first resize.
+        if cache.get(self.upscale_until_cache_key):
+            logger.debug(
+                f"Formation {self.formation_name} is already within the keep-upscaled window; "
+                f"skipping repeat upscale."
+            )
+            return
+
         # Ensure upscale is only executed once every settings.DYNO_TIME_BETWEEN_SCALES seconds for this dyno type
         with cache.lock(self.upscaling_cache_key, expire=30):
             if self.is_upscaling:
@@ -842,6 +853,7 @@ class HerokuDyno:
 
         next_level = self.next_formation_size
         if not next_level:
+            self.clear_upscaling()
             logger.debug("Formation is already at the highest level or unrecognized size.")
             return self.formation_size
 
@@ -881,24 +893,40 @@ class HerokuDyno:
         check_interval = getattr(settings, 'DYNO_DOWNSCALE_CHECK_INTERVAL', 300)
         upscaled_until = cache.get(self.upscale_until_cache_key)
         if upscaled_until:
-            current_ttl = cache.ttl(self.upscale_until_cache_key)
-            # Allow early downscale whenever memory is safe, not just near TTL expiry
-            if self.allow_downscale:
-                self.downscale_formation_to_original_size()
-            elif current_ttl < check_interval:
-                # Near expiry — either restart if hot, or extend the timer
-                if ((self.detected_r14 and not self.detected_r15) or self.is_still_high_memory_usage_for_downscale) and self.no_tasks_in_queue:
-                    self.restart_dyno()
-                else:
-                    load_avg = f'{self.avg_load_1min:.2f}' if self.avg_load_1min else 'unknown'
-                    memory_usage = f'{self.current_memory_usage_percentage}% ({self.current_memory_usage:.2f}MB / {self.available_memory}MB)' \
-                        if self.current_memory_usage and self.available_memory and self.current_memory_usage_percentage else 'unknown'
-                    logger.warning(f"Extending the time for {self.formation_name} to stay upscaled by {check_interval} seconds. "
-                                    f"Current Memory Usage: {memory_usage}. Current Load Avg: {load_avg}. Tasks in Queue: {self.tasks_in_queue}.")
-                    new_until = upscaled_until + timedelta(seconds=check_interval)
-                    new_timeout = current_ttl + check_interval
-                    cache.set(self.upscale_until_cache_key, new_until, timeout=new_timeout)
-            return
+            # If the formation is already back at (or below) its original size,
+            # any upscale_until key is a phantom artifact — e.g. from a sibling
+            # that downscaled in the gap between an upscale API call and its
+            # cache.set().  Clear it so the autoscaler can resume normal
+            # R14/R15 detection instead of looping in the "Extending..." path.
+            if self.is_on_original_formation_size_or_lower:
+                logger.info(
+                    f"Cleared phantom upscale state for {self.formation_name}: "
+                    f"formation is already at original size {self.formation_size}."
+                )
+                self.clear_original_formation_size()
+                # Fall through to the R14 restart check below
+            else:
+                current_ttl = cache.ttl(self.upscale_until_cache_key)
+                # Only allow downscale once we are within the final check_interval window.
+                # Before that, keep the formation upscaled regardless of current memory —
+                # this prevents an immediate downscale after an R15 restart clears memory.
+                if current_ttl < check_interval:
+                    if self.allow_downscale:
+                        self.downscale_formation_to_original_size()
+                        return
+                    # Near expiry and not safe to downscale — either restart if hot, or extend the timer
+                    if ((self.detected_r14 and not self.detected_r15) or self.is_still_high_memory_usage_for_downscale) and self.no_tasks_in_queue:
+                        self.restart_dyno()
+                    else:
+                        load_avg = f'{self.avg_load_1min:.2f}' if self.avg_load_1min else 'unknown'
+                        memory_usage = f'{self.current_memory_usage_percentage}% ({self.current_memory_usage:.2f}MB / {self.available_memory}MB)' \
+                            if self.current_memory_usage and self.available_memory and self.current_memory_usage_percentage else 'unknown'
+                        logger.warning(f"Extending the time for {self.formation_name} to stay upscaled by {check_interval} seconds. "
+                                        f"Current Memory Usage: {memory_usage}. Current Load Avg: {load_avg}. Tasks in Queue: {self.tasks_in_queue}.")
+                        new_until = upscaled_until + timedelta(seconds=check_interval)
+                        new_timeout = current_ttl + check_interval
+                        cache.set(self.upscale_until_cache_key, new_until, timeout=new_timeout)
+                return
 
         # if on original formation size and memory usage is high, restart the dyno
         if self.current_memory_usage_percentage > getattr(settings, 'DOWNSCALE_PERCENTAGE_HIGH_MEM_USE', 105) and self.detected_r14 and not self.detected_r15 and self.no_tasks_in_queue:
@@ -910,9 +938,18 @@ class HerokuDyno:
         # would move the formation back to a smaller size that cannot handle the
         # current memory load, causing immediate R14 errors.  Re-check allow_downscale
         # and restore the upscale timer if the formation is not yet safe to shrink.
-        if not self.allow_downscale:
+        # Only do this when the formation is actually upscaled above its original
+        # size — otherwise we'd create a phantom upscale_until key on a formation
+        # that was already downscaled, trapping siblings in an infinite extend loop.
+        # Also skip when at the lowest tier with no original recorded (post-downscale
+        # clear) — there's nothing to downscale from.
+        can_be_upscaled = (
+            not self.is_on_original_formation_size_or_lower
+            and not (self.previous_formation_size is None and not self.original_formation_size)
+        )
+        if can_be_upscaled and not self.allow_downscale:
             delta = getattr(settings, 'DYNO_DOWNSCALE_CHECK_INTERVAL', 300)
-            new_until = timezone.now() + timezone.timedelta(seconds=delta)
+            new_until = timezone.now() + timedelta(seconds=delta)
             cache.set(self.upscale_until_cache_key, new_until, timeout=delta)
             logger.warning(
                 f"upscale_until key expired for {self.formation_name} but allow_downscale "
@@ -954,6 +991,7 @@ class HerokuDyno:
         if response and response.status_code == 200:
             logger.info(f"Downscaled formation {self.formation_name} back to {original_formation_size} with {DYNO_SIZES[original_formation_size]['memory']} MB memory.")
             self._update_formation_size(original_formation_size)
+            self.clear_upscaling()
             self.clear_original_formation_size()
             if not self.remote_monitoring:
                 self.stop_continuous_autoscale()

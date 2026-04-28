@@ -231,13 +231,13 @@ class TestUncoveredProperties(BaseLockTestCase):
 
     def test_detected_r14_uses_get_r14_from_logs(self):
         dyno = make_dyno()
-        with patch.object(dyno, "get_r14_from_logs", return_value=True):
-            self.assertTrue(dyno.detected_r14)
+        with patch.object(type(dyno), "extract_latest_metric", return_value=True):
+            self.assertTrue(dyno.get_r14_from_logs())
 
     def test_detected_r15_uses_get_r15_from_logs(self):
         dyno = make_dyno()
-        with patch.object(dyno, "get_r15_from_logs", return_value=True):
-            self.assertTrue(dyno.detected_r15)
+        with patch.object(type(dyno), "extract_latest_metric", return_value=True):
+            self.assertTrue(dyno.get_r15_from_logs())
 
     def test_get_threads_used_returns_int(self):
         dyno = make_dyno()
