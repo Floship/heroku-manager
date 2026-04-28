@@ -267,9 +267,18 @@ class HerokuDyno:
 
     @property
     def _downscale_memory_threshold(self):
-        """Memory (MB) above which a dyno is considered too hot to downscale."""
-        previous_formation_memory = DYNO_SIZES.get(self.previous_formation_size, {}).get("memory", 0)
-        return previous_formation_memory * settings.DOWNSCALE_PERCENTAGE_HIGH_MEM_USE / 100
+        """Memory (MB) above which a dyno is considered too hot to downscale.
+
+        Uses the *original* (target) formation size so that the guard reflects
+        the quota the formation will actually run on after downscaling.  Using
+        the intermediate ``previous_formation_size`` produced a threshold that
+        was too high (e.g. Standard-2X = 1075 MB instead of Standard-1X = 537 MB
+        when going from Performance-M → Standard-1X), allowing a downscale while
+        memory was still 1034 MB and causing immediate R14 errors.
+        """
+        target_size = self.original_formation_size or self.previous_formation_size
+        target_memory = DYNO_SIZES.get(target_size, {}).get("memory", 0)
+        return target_memory * settings.DOWNSCALE_PERCENTAGE_HIGH_MEM_USE / 100
 
     @property
     def is_still_high_memory_usage_for_downscale(self):
@@ -872,8 +881,23 @@ class HerokuDyno:
             self.restart_dyno()
             return
 
+        # Guard: the upscale_until key may have expired while memory is still
+        # elevated (e.g. R14 storm, slow GC).  Unconditionally downscaling here
+        # would move the formation back to a smaller size that cannot handle the
+        # current memory load, causing immediate R14 errors.  Re-check allow_downscale
+        # and restore the upscale timer if the formation is not yet safe to shrink.
+        if not self.allow_downscale:
+            delta = getattr(settings, 'DYNO_DOWNSCALE_CHECK_INTERVAL', 300)
+            new_until = timezone.now() + timezone.timedelta(seconds=delta)
+            cache.set(self.upscale_until_cache_key, new_until, timeout=delta)
+            logger.warning(
+                f"upscale_until key expired for {self.formation_name} but allow_downscale "
+                f"is False (memory still high or R14 active). Restoring upscale timer for "
+                f"{delta}s. Memory: {self.current_memory_usage:.0f}MB."
+            )
+            return
+
         # Downscale formation to original size as there is no need to keep it upscaled
-        # logger.info(f"Downscaling formation {self.formation_name} back to original size because cache wasn't extended. Current Memory Usage: {self.current_memory_usage_percentage}%")
         self.downscale_formation_to_original_size()
 
     def downscale_formation_to_original_size(self):

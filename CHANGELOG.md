@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2 - 2026-04-28
+- **Fix: block downscale after `upscale_until` expiry when the formation is still hot.** If the keep-upscaled timer had already expired, `check_and_downscale_to_original_formation_size()` could fall through to an unconditional downscale even while `allow_downscale` was still false. The timer is now restored instead of shrinking the formation while memory or R14 pressure is still active.
+- **Fix: downscale threshold now uses the original target size, not the intermediate previous size.** Performance-M workers returning to Standard-1X were previously compared against a Standard-2X threshold, which allowed a premature downscale around ~1 GB usage and immediately triggered R14 on the smaller formation.
+- **Tests: add regression coverage for both failure modes.** New tests reproduce the expired-TTL downscale path and the wrong-threshold calculation so the bug cannot regress silently.
+
 ## 0.2.1 - 2026-04-28
 - **Fix: sibling-memory guard prevents premature formation downscale.** A low-memory dyno could trigger a formation downscale while sibling dynos were still running above the downscale threshold. Each dyno now publishes its own memory to Redis (`heroku:dyno_memory:{dyno_name}`) on every check-in; `allow_downscale` and `allow_downscale_on_shutdown` both gate on `any_sibling_still_high_memory` before resizing the formation.
 - **Fix: stale crashed-dyno memory keys.** Memory keys now use `DYNO_ZOMBIE_THRESHOLD` as TTL (instead of a hardcoded 24 h) so a crashed dyno's stale key expires at the same point the zombie detector fires — preventing an indefinite downscale block.
