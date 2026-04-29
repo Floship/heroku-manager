@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.7 - 2026-04-29
+- **Fix: sibling-triggered chain upscale.** When a hot dyno's autoscale thread stalls under memory pressure, cool siblings now detect the hot sibling via `any_sibling_requires_upscale` (checks sibling memory keys in Redis against the upscale threshold for the current tier) and trigger chain upscale on its behalf. `autoscale()` now checks `requires_upscale or any_sibling_requires_upscale`. The chain guard in `upscale_formation_to_next_level()` also checks sibling memory, so a cool dyno with `upscale_until` set can advocate for a hot sibling.
+- **Tests: 12 new tests** (7 for `any_sibling_requires_upscale` property, 5 for sibling-triggered autoscale + chain guard). 277 total.
+
 ## 0.2.6 - 2026-04-29
 - **Fix: allow chain upscale when memory is genuinely above threshold on current tier.** `upscale_formation_to_next_level()` unconditionally blocked chaining (standard-2x → performance-m) when `upscale_until` key existed — even when a dyno was at 213% memory (2183 MB on 1024 MB quota). The guard now checks `current_memory_usage_percentage > UPSCALE_PERCENTAGE_HIGH_MEM_USE` before blocking; if memory is above threshold, the chain upscale proceeds. Production impact: normal_worker stuck at standard-2x for hours with continuous R14 (230 events/day) instead of scaling to performance-m.
 - **Tests: 6 chain upscale tests** covering threshold boundary, stale R15 guard, R15+hot memory, production scenario, and regression for normal upscale path.

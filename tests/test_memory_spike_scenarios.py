@@ -60,8 +60,10 @@ class TestMemorySpikeScenarios(BaseLockTestCase):
 
         with patch.object(type(dyno), "detected_r15",
                           new_callable=PropertyMock, return_value=True):
-            with patch.object(dyno, "call_heroku_api") as mock_api:
-                dyno.upscale_formation_to_next_level()
+            with patch.object(type(dyno), "any_sibling_requires_upscale",
+                              new_callable=PropertyMock, return_value=False):
+                with patch.object(dyno, "call_heroku_api") as mock_api:
+                    dyno.upscale_formation_to_next_level()
 
         mock_api.assert_not_called()
 

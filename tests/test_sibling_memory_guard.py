@@ -587,6 +587,72 @@ class TestThresholdBoundary(unittest.TestCase):
         self.assertFalse(dyno.requires_upscale)
 
 
+class TestAnySiblingRequiresUpscale(unittest.TestCase):
+    """any_sibling_requires_upscale: True when a sibling's memory exceeds
+    the upscale percentage threshold for the CURRENT tier (not the downscale
+    threshold).  Used to trigger chain upscale on behalf of a stalled sibling."""
+
+    def setUp(self):
+        cache.clear()
+        self._store = {}
+
+    def tearDown(self):
+        cache.clear()
+
+    def _set_mem(self, dyno_name, mb):
+        key = f"heroku:dyno_memory:{dyno_name}"
+        cache.set(key, mb, timeout=60)
+        self._store[key] = mb
+
+    def test_sibling_above_upscale_threshold_returns_true(self):
+        # standard-2x: 1024 MB * 80% = 819.2 MB; sibling at 2183 MB → True
+        dyno = make_dyno("normal_worker.2", formation_size="standard-2x")
+        self._set_mem("normal_worker.1", 2183)
+        with _patch_cache_keys(self._store):
+            self.assertTrue(dyno.any_sibling_requires_upscale)
+
+    def test_sibling_below_upscale_threshold_returns_false(self):
+        # standard-2x: threshold 819.2 MB; sibling at 317 MB → False
+        dyno = make_dyno("normal_worker.2", formation_size="standard-2x")
+        self._set_mem("normal_worker.1", 317)
+        with _patch_cache_keys(self._store):
+            self.assertFalse(dyno.any_sibling_requires_upscale)
+
+    def test_excludes_self(self):
+        dyno = make_dyno("normal_worker.1", formation_size="standard-2x")
+        self._set_mem("normal_worker.1", 2183)
+        with _patch_cache_keys(self._store):
+            self.assertFalse(dyno.any_sibling_requires_upscale)
+
+    def test_no_siblings_returns_false(self):
+        dyno = make_dyno("normal_worker.1", formation_size="standard-2x")
+        with _patch_cache_keys(self._store):
+            self.assertFalse(dyno.any_sibling_requires_upscale)
+
+    def test_formation_name_isolation(self):
+        # normal_worker_extra.1 at 9999 MB must NOT match normal_worker
+        dyno = make_dyno("normal_worker.2", formation_size="standard-2x")
+        self._set_mem("normal_worker_extra.1", 9999)
+        with _patch_cache_keys(self._store):
+            self.assertFalse(dyno.any_sibling_requires_upscale)
+
+    def test_at_exact_threshold_returns_false(self):
+        # Strict > (not >=): threshold = 1024 * 80% = 819.2; sibling at 819.2 → False
+        dyno = make_dyno("normal_worker.2", formation_size="standard-2x")
+        threshold = DYNO_SIZES["standard-2x"]["memory"] * django_settings.UPSCALE_PERCENTAGE_HIGH_MEM_USE / 100
+        self._set_mem("normal_worker.1", threshold)
+        with _patch_cache_keys(self._store):
+            self.assertFalse(dyno.any_sibling_requires_upscale)
+
+    def test_none_memory_treated_as_absent(self):
+        dyno = make_dyno("normal_worker.2", formation_size="standard-2x")
+        key = "heroku:dyno_memory:normal_worker.1"
+        cache.set(key, None, timeout=60)
+        self._store[key] = None
+        with _patch_cache_keys(self._store):
+            self.assertFalse(dyno.any_sibling_requires_upscale)
+
+
 class TestQueueGating(unittest.TestCase):
     """allow_downscale respects downscale_on_non_empty_queue and no_tasks_in_queue."""
 

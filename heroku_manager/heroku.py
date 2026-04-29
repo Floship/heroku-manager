@@ -576,7 +576,7 @@ class HerokuDyno:
             if getattr(settings, 'DYNO_LOG_THREADS_USED', False):
                 self.set_threads_used()
 
-            if self.requires_upscale:
+            if self.requires_upscale or self.any_sibling_requires_upscale:
                 self.upscale_formation_to_next_level()
             else:
                 self.check_and_downscale_to_original_formation_size()
@@ -797,6 +797,27 @@ class HerokuDyno:
                 return True
         return False
 
+    @property
+    def any_sibling_requires_upscale(self):
+        """Return True if any sibling's memory exceeds the upscale threshold
+        for the current tier.  Allows a cool dyno to trigger chain upscale
+        on behalf of a hot sibling whose autoscale thread may have stalled."""
+        upscale_pct = getattr(settings, 'UPSCALE_PERCENTAGE_HIGH_MEM_USE', 80)
+        threshold_mb = self.available_memory * upscale_pct / 100
+        own_key = f'heroku:dyno_memory:{self.dyno_name}'
+        for key in cache.keys(f'heroku:dyno_memory:{self.formation_name}.*'):
+            if key == own_key:
+                continue
+            sibling_mem = cache.get(key)
+            if sibling_mem and sibling_mem > threshold_mb:
+                logger.info(
+                    f"Sibling {key.split(':')[-1]} at {sibling_mem:.0f}MB > "
+                    f"{threshold_mb:.0f}MB upscale threshold; advocating upscale "
+                    f"for {self.formation_name}."
+                )
+                return True
+        return False
+
     def check_for_sibling_zombie_dynos(self):
         """
         Check if any sibling dynos are marked as alive in the cache and restart them if they
@@ -838,7 +859,9 @@ class HerokuDyno:
         # size while workers hit R14/R15.
         if cache.get(self.upscale_until_cache_key):
             upscale_threshold = getattr(settings, 'UPSCALE_PERCENTAGE_HIGH_MEM_USE', 80)
-            if self.current_memory_usage_percentage <= upscale_threshold:
+            self_hot = self.current_memory_usage_percentage > upscale_threshold
+            sibling_hot = self.any_sibling_requires_upscale
+            if not self_hot and not sibling_hot:
                 logger.debug(
                     f"Formation {self.formation_name} is already within the keep-upscaled window; "
                     f"skipping repeat upscale."
@@ -846,8 +869,9 @@ class HerokuDyno:
                 return
             logger.warning(
                 f"Formation {self.formation_name} is within the keep-upscaled window but "
-                f"memory is still at {self.current_memory_usage_percentage:.1f}% "
-                f"(threshold {upscale_threshold}%) — allowing chain upscale to next tier."
+                f"{'self' if self_hot else 'sibling'} memory is still high "
+                f"(self={self.current_memory_usage_percentage:.1f}%) — "
+                f"allowing chain upscale to next tier."
             )
 
         # Ensure upscale is only executed once every settings.DYNO_TIME_BETWEEN_SCALES seconds for this dyno type
