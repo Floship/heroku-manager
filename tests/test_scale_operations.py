@@ -492,5 +492,126 @@ class TestCounterNoDeleteOnFailedRestart(BaseLockTestCase):
         self.assertIsNone(cache.get(key))
 
 
+# ─── Chain upscale: standard-2x → performance-m when still hot ──────────────
+
+class TestChainUpscaleWhenStillHot(BaseLockTestCase):
+    """Production bug: upscale_formation_to_next_level() unconditionally
+    blocks chaining when upscale_until key exists. This prevents
+    standard-2x → performance-m even when memory is at 213% on 2x."""
+
+    def test_chain_upscale_allowed_when_memory_above_threshold(self):
+        """On standard-2x, upscale_until exists, memory at 150% (>110%) →
+        should call Heroku API to upscale to performance-m."""
+        dyno = make_dyno(formation_size="standard-2x")
+        from django.utils import timezone
+        from datetime import timedelta
+        until = timezone.now() + timedelta(seconds=300)
+        cache.set(dyno.upscale_until_cache_key, until, timeout=300)
+
+        with patch.object(type(dyno), "current_memory_usage_percentage",
+                          new_callable=PropertyMock, return_value=150.0):
+            with patch.object(type(dyno), "current_memory_usage",
+                              new_callable=PropertyMock, return_value=1536.0):
+                with patch.object(type(dyno), "remote_monitoring",
+                                  new_callable=PropertyMock, return_value=True):
+                    with patch.object(dyno, "call_heroku_api", return_value=_mock_response(200)) as mock_api:
+                        dyno.upscale_formation_to_next_level()
+        # Should have called PATCH to upscale
+        mock_api.assert_called_once()
+        self.assertEqual(dyno._formation_size_cached[0], "performance-m")
+
+    def test_chain_upscale_blocked_when_memory_below_threshold(self):
+        """On standard-2x, upscale_until exists, memory at 78% (stale R15) →
+        should NOT chain upscale."""
+        dyno = make_dyno(formation_size="standard-2x")
+        from django.utils import timezone
+        from datetime import timedelta
+        until = timezone.now() + timedelta(seconds=300)
+        cache.set(dyno.upscale_until_cache_key, until, timeout=300)
+
+        with patch.object(type(dyno), "current_memory_usage_percentage",
+                          new_callable=PropertyMock, return_value=78.0):
+            with patch.object(dyno, "call_heroku_api") as mock_api:
+                dyno.upscale_formation_to_next_level()
+        mock_api.assert_not_called()
+
+    def test_chain_upscale_at_exact_threshold_not_allowed(self):
+        """Memory exactly at threshold (80% in test settings) should NOT chain."""
+        dyno = make_dyno(formation_size="standard-2x")
+        from django.utils import timezone
+        from datetime import timedelta
+        until = timezone.now() + timedelta(seconds=300)
+        cache.set(dyno.upscale_until_cache_key, until, timeout=300)
+
+        with patch.object(type(dyno), "current_memory_usage_percentage",
+                          new_callable=PropertyMock, return_value=80.0):
+            with patch.object(dyno, "call_heroku_api") as mock_api:
+                dyno.upscale_formation_to_next_level()
+        mock_api.assert_not_called()
+
+    def test_chain_upscale_with_r15_and_high_memory(self):
+        """R15 active + memory above threshold → chain upscale allowed."""
+        dyno = make_dyno(formation_size="standard-2x")
+        from django.utils import timezone
+        from datetime import timedelta
+        until = timezone.now() + timedelta(seconds=300)
+        cache.set(dyno.upscale_until_cache_key, until, timeout=300)
+
+        with patch.object(type(dyno), "current_memory_usage_percentage",
+                          new_callable=PropertyMock, return_value=213.0):
+            with patch.object(type(dyno), "current_memory_usage",
+                              new_callable=PropertyMock, return_value=2183.0):
+                with patch.object(type(dyno), "detected_r15",
+                                  new_callable=PropertyMock, return_value=True):
+                    with patch.object(type(dyno), "remote_monitoring",
+                                      new_callable=PropertyMock, return_value=True):
+                        with patch.object(dyno, "call_heroku_api", return_value=_mock_response(200)) as mock_api:
+                            dyno.upscale_formation_to_next_level()
+        mock_api.assert_called_once()
+        self.assertEqual(dyno._formation_size_cached[0], "performance-m")
+
+    def test_chain_upscale_production_scenario(self):
+        """Full production scenario: standard-1x → standard-2x → memory keeps
+        rising → standard-2x → performance-m."""
+        dyno = make_dyno(formation_size="standard-2x")
+        from django.utils import timezone
+        from datetime import timedelta
+        # Simulate: original was 1x, upscaled to 2x, timer set
+        cache.set(dyno.original_size_cache_key,
+                  {"size": "standard-1x", "time": timezone.now()}, timeout=None)
+        until = timezone.now() + timedelta(seconds=630)
+        cache.set(dyno.upscale_until_cache_key, until, timeout=630)
+
+        # Memory at 213% on 2x (production observation)
+        with patch.object(type(dyno), "current_memory_usage_percentage",
+                          new_callable=PropertyMock, return_value=213.0):
+            with patch.object(type(dyno), "current_memory_usage",
+                              new_callable=PropertyMock, return_value=2183.0):
+                with patch.object(type(dyno), "remote_monitoring",
+                                  new_callable=PropertyMock, return_value=True):
+                    with patch.object(dyno, "call_heroku_api", return_value=_mock_response(200)):
+                        dyno.upscale_formation_to_next_level()
+
+        # Should have chained to performance-m
+        self.assertEqual(dyno._formation_size_cached[0], "performance-m")
+        # upscale_until should be reset for the new tier
+        new_until = cache.get(dyno.upscale_until_cache_key)
+        self.assertIsNotNone(new_until)
+
+    def test_no_chain_upscale_when_no_upscale_until_key(self):
+        """Without upscale_until key, normal upscale should still work
+        (regression check — the guard should only affect chain upscales)."""
+        dyno = make_dyno(formation_size="standard-2x")
+        with patch.object(type(dyno), "current_memory_usage_percentage",
+                          new_callable=PropertyMock, return_value=90.0):
+            with patch.object(type(dyno), "current_memory_usage",
+                              new_callable=PropertyMock, return_value=922.0):
+                with patch.object(type(dyno), "remote_monitoring",
+                                  new_callable=PropertyMock, return_value=True):
+                    with patch.object(dyno, "call_heroku_api", return_value=_mock_response(200)) as mock_api:
+                        dyno.upscale_formation_to_next_level()
+        mock_api.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -832,12 +832,23 @@ class HerokuDyno:
         # Once a formation has already been upscaled, keep it at the current size
         # until the downscale window is reached instead of chaining another upscale
         # just because R15 is still present after the first resize.
+        # However, if memory is genuinely above the upscale threshold on the
+        # CURRENT tier (not stale R15 from the pre-upscale tier), allow chaining
+        # to the next tier — otherwise the formation gets stuck at an intermediate
+        # size while workers hit R14/R15.
         if cache.get(self.upscale_until_cache_key):
-            logger.debug(
-                f"Formation {self.formation_name} is already within the keep-upscaled window; "
-                f"skipping repeat upscale."
+            upscale_threshold = getattr(settings, 'UPSCALE_PERCENTAGE_HIGH_MEM_USE', 80)
+            if self.current_memory_usage_percentage <= upscale_threshold:
+                logger.debug(
+                    f"Formation {self.formation_name} is already within the keep-upscaled window; "
+                    f"skipping repeat upscale."
+                )
+                return
+            logger.warning(
+                f"Formation {self.formation_name} is within the keep-upscaled window but "
+                f"memory is still at {self.current_memory_usage_percentage:.1f}% "
+                f"(threshold {upscale_threshold}%) — allowing chain upscale to next tier."
             )
-            return
 
         # Ensure upscale is only executed once every settings.DYNO_TIME_BETWEEN_SCALES seconds for this dyno type
         with cache.lock(self.upscaling_cache_key, expire=30):
