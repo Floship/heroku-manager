@@ -81,11 +81,13 @@ class TestDownscaleFormationToOriginalSize(BaseLockTestCase):
             dyno.downscale_formation_to_original_size()
         mock_api.assert_not_called()
 
-    def test_skips_when_no_original_formation_size(self):
+    def test_falls_back_to_previous_tier_when_no_original_formation_size(self):
         dyno = make_dyno(formation_size="performance-m")
-        with patch.object(dyno, "call_heroku_api") as mock_api:
+        with patch.object(dyno, "call_heroku_api", return_value=_mock_response(200)) as mock_api:
             dyno.downscale_formation_to_original_size()
-        mock_api.assert_not_called()
+        mock_api.assert_called_once()
+        call_args = mock_api.call_args
+        self.assertEqual(call_args[1]["data"]["size"], "standard-2x")
 
     def test_skips_when_already_at_original_size(self):
         dyno = make_dyno(formation_size="standard-2x")
@@ -368,7 +370,17 @@ class TestCheckFormationOnStartup(BaseLockTestCase):
     def test_sets_original_size_when_not_set(self):
         dyno = make_dyno(formation_size="standard-2x")
         dyno._check_formation_on_startup()
-        self.assertEqual(dyno.original_formation_size, "standard-2x")
+        # Formation is above lowest tier with no original — assumes previous tier
+        self.assertEqual(dyno.original_formation_size, "standard-1x")
+        # Also restores downscale timer
+        self.assertIsNotNone(cache.get(dyno.upscale_until_cache_key))
+
+    def test_sets_current_size_as_baseline_at_lowest_tier(self):
+        dyno = make_dyno(formation_size="standard-1x")
+        dyno._check_formation_on_startup()
+        self.assertEqual(dyno.original_formation_size, "standard-1x")
+        # No downscale timer needed — already at lowest tier
+        self.assertIsNone(cache.get(dyno.upscale_until_cache_key))
 
     def test_restores_downscale_timer_when_stuck_upscaled(self):
         dyno = make_dyno(formation_size="performance-m")
@@ -756,6 +768,126 @@ class TestSiblingTriggeredChainUpscale(BaseLockTestCase):
                                             dyno.autoscale(continuous=False)
 
         self.assertEqual(dyno._formation_size_cached[0], "performance-m")
+
+
+class TestLostBaselineRecovery(BaseLockTestCase):
+    """
+    v0.2.8 — When original_formation_size is lost (Redis eviction, phantom
+    clear, etc.) and the formation is above the lowest tier, the system
+    must still be able to downscale instead of staying stuck forever.
+    """
+
+    # ── startup safety check ────────────────────────────────────────────
+
+    def test_startup_records_previous_tier_when_above_lowest(self):
+        """standard-2x with no original → records standard-1x as original."""
+        dyno = make_dyno(formation_size="standard-2x")
+        dyno._check_formation_on_startup()
+        self.assertEqual(dyno.original_formation_size, "standard-1x")
+
+    def test_startup_sets_downscale_timer_when_above_lowest(self):
+        dyno = make_dyno(formation_size="standard-2x")
+        dyno._check_formation_on_startup()
+        self.assertIsNotNone(cache.get(dyno.upscale_until_cache_key))
+
+    def test_startup_records_current_at_lowest_tier(self):
+        """standard-1x has no previous → records standard-1x as baseline."""
+        dyno = make_dyno(formation_size="standard-1x")
+        dyno._check_formation_on_startup()
+        self.assertEqual(dyno.original_formation_size, "standard-1x")
+        self.assertIsNone(cache.get(dyno.upscale_until_cache_key))
+
+    def test_startup_perf_m_records_standard_2x(self):
+        dyno = make_dyno(formation_size="performance-m")
+        dyno._check_formation_on_startup()
+        self.assertEqual(dyno.original_formation_size, "standard-2x")
+        self.assertIsNotNone(cache.get(dyno.upscale_until_cache_key))
+
+    def test_startup_does_not_overwrite_existing_original(self):
+        dyno = make_dyno(formation_size="performance-m")
+        cache.set(dyno.original_size_cache_key, {"size": "standard-1x"}, timeout=None)
+        dyno._check_formation_on_startup()
+        # Existing original must not be overwritten
+        self.assertEqual(dyno.original_formation_size, "standard-1x")
+
+    # ── downscale fallback to previous tier ──────────────────────────────
+
+    def test_downscale_uses_previous_tier_when_original_lost(self):
+        dyno = make_dyno(formation_size="standard-2x")
+        # No original set — should fall back to previous tier (standard-1x)
+        with patch.object(dyno, "call_heroku_api", return_value=_mock_response(200)) as mock_api:
+            dyno.downscale_formation_to_original_size()
+        mock_api.assert_called_once()
+        self.assertEqual(mock_api.call_args[1]["data"]["size"], "standard-1x")
+
+    def test_downscale_perf_m_falls_back_to_standard_2x(self):
+        dyno = make_dyno(formation_size="performance-m")
+        with patch.object(dyno, "call_heroku_api", return_value=_mock_response(200)) as mock_api:
+            dyno.downscale_formation_to_original_size()
+        self.assertEqual(mock_api.call_args[1]["data"]["size"], "standard-2x")
+
+    def test_downscale_noop_at_lowest_tier_no_original(self):
+        """standard-1x with no original → nothing to downscale."""
+        dyno = make_dyno(formation_size="standard-1x")
+        with patch.object(dyno, "call_heroku_api") as mock_api:
+            dyno.downscale_formation_to_original_size()
+        mock_api.assert_not_called()
+
+    # ── set_original_formation_size with explicit value ──────────────────
+
+    def test_set_original_formation_size_with_string_value(self):
+        dyno = make_dyno(formation_size="standard-2x")
+        dyno.set_original_formation_size(value="standard-1x")
+        self.assertEqual(dyno.original_formation_size, "standard-1x")
+
+    def test_set_original_overwrites_with_string_value(self):
+        dyno = make_dyno(formation_size="performance-m")
+        dyno.set_original_formation_size()  # stores performance-m
+        dyno.set_original_formation_size(value="standard-1x")  # overwrites
+        self.assertEqual(dyno.original_formation_size, "standard-1x")
+
+    # ── end-to-end: phantom clear → recovery ─────────────────────────────
+
+    def test_phantom_clear_then_startup_recovers(self):
+        """Reproduces the NAF bug: formation stuck at 2x after phantom clear."""
+        dyno = make_dyno(formation_size="standard-2x")
+        # Step 1: Startup records wrong baseline (old behavior would record 2x)
+        dyno._check_formation_on_startup()
+        # With fix: original is now standard-1x
+        self.assertEqual(dyno.original_formation_size, "standard-1x")
+        # Phantom detector should NOT fire because 2x > 1x
+        self.assertFalse(dyno.is_on_original_formation_size_or_lower)
+
+    def test_full_recovery_cycle_from_stuck_2x(self):
+        """
+        Simulates: formation at 2x, original lost, startup recovers,
+        allow_downscale lets downscale proceed.
+        """
+        dyno = make_dyno(formation_size="standard-2x")
+        # Step 1: startup sets original to standard-1x + timer
+        dyno._check_formation_on_startup()
+        self.assertEqual(dyno.original_formation_size, "standard-1x")
+
+        # Step 2: Simulate timer expiry + low memory (allow downscale)
+        cache.delete(dyno.upscale_until_cache_key)
+        with patch.object(type(dyno), "current_memory_usage",
+                          new_callable=PropertyMock, return_value=400):
+            with patch.object(type(dyno), "detected_r14",
+                              new_callable=PropertyMock, return_value=False):
+                with patch.object(type(dyno), "detected_r15",
+                                  new_callable=PropertyMock, return_value=False):
+                    with patch.object(type(dyno), "no_tasks_in_queue",
+                                      new_callable=PropertyMock, return_value=True):
+                        with patch.object(type(dyno), "any_sibling_requires_upscale",
+                                          new_callable=PropertyMock, return_value=False):
+                            with patch.object(type(dyno), "any_sibling_still_high_memory",
+                                              new_callable=PropertyMock, return_value=False):
+                                with patch.object(dyno, "call_heroku_api",
+                                                  return_value=_mock_response(200)) as mock_api:
+                                    dyno.check_and_downscale_to_original_formation_size()
+        # Should have downscaled to standard-1x
+        mock_api.assert_called_once()
+        self.assertEqual(mock_api.call_args[1]["data"]["size"], "standard-1x")
 
 
 if __name__ == "__main__":

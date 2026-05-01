@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.8 - 2026-05-01
+- **Fix: formation stuck at upscaled tier when original_formation_size is lost.** When the baseline size is lost (Redis eviction, phantom clear), `_check_formation_on_startup()` was recording the current (already upscaled) size as baseline — e.g. standard-2x as "original". The phantom detector then saw formation=original, cleared everything, and `downscale_formation_to_original_size()` silently exited because `original_formation_size` was None. Formation stayed stuck at standard-2x indefinitely with zero log output. Fix: startup now records the *previous tier* as original when the formation is above the lowest tier (e.g. standard-2x → records standard-1x) and restores the downscale timer. `downscale_formation_to_original_size()` also falls back to `previous_formation_size` when original is missing. `set_original_formation_size(value=)` now correctly stores explicit string values. Production impact: floship-naf normal_worker stuck on standard-2x for 8+ hours at 41% memory (425 MB on 1024 MB quota) instead of downscaling to standard-1x.
+- **Tests: 12 new tests** (5 startup recovery, 3 downscale fallback, 2 set_original_formation_size, 2 end-to-end phantom→recovery). 290 total.
+
 ## 0.2.7 - 2026-04-29
 - **Fix: sibling-triggered chain upscale.** When a hot dyno's autoscale thread stalls under memory pressure, cool siblings now detect the hot sibling via `any_sibling_requires_upscale` (checks sibling memory keys in Redis against the upscale threshold for the current tier) and trigger chain upscale on its behalf. `autoscale()` now checks `requires_upscale or any_sibling_requires_upscale`. The chain guard in `upscale_formation_to_next_level()` also checks sibling memory, so a cool dyno with `upscale_until` set can advocate for a hot sibling.
 - **Tests: 12 new tests** (7 for `any_sibling_requires_upscale` property, 5 for sibling-triggered autoscale + chain guard). 277 total.

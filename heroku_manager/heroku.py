@@ -482,7 +482,8 @@ class HerokuDyno:
 
     def set_original_formation_size(self, value=None):
         if not cache.get(self.original_size_cache_key) or value:
-            cache.set(self.original_size_cache_key, {"size": self.formation_size, "time": timezone.now()}, timeout=None)
+            size = value if isinstance(value, str) else self.formation_size
+            cache.set(self.original_size_cache_key, {"size": size, "time": timezone.now()}, timeout=None)
 
     def clear_original_formation_size(self):
         cache.delete(self.original_size_cache_key)
@@ -613,10 +614,27 @@ class HerokuDyno:
 
             # Always set original formation size on startup if not already set
             if not original_size:
-                self.set_original_formation_size()
-                logger.info(
-                    f"Recorded baseline formation size for {self.formation_name}: {current_size}"
-                )
+                previous = self.previous_formation_size
+                if previous and previous in DYNO_SIZES:
+                    # Formation is above the lowest tier with no recorded original —
+                    # assume it was upscaled and the original was lost (e.g. Redis
+                    # eviction, phantom clear).  Record the previous tier so the
+                    # downscale path can recover instead of staying stuck.
+                    self.set_original_formation_size(value=previous)
+                    logger.warning(
+                        f"Startup safety check: {self.formation_name} is on {current_size} "
+                        f"with no original size recorded. Assuming original was {previous} "
+                        f"and restoring downscale timer."
+                    )
+                    delta = getattr(settings, 'DYNO_DOWNSCALE_CHECK_INTERVAL', 300) + \
+                            getattr(settings, 'DYNO_AUTOSCALE_INTERVAL', 30)
+                    until = timezone.now() + timedelta(seconds=delta)
+                    cache.set(self.upscale_until_cache_key, until, timeout=delta)
+                else:
+                    self.set_original_formation_size()
+                    logger.info(
+                        f"Recorded baseline formation size for {self.formation_name}: {current_size}"
+                    )
         except Exception as e:
             logger.error(f"Startup formation check failed: {e}", exc_info=True)
 
@@ -1002,9 +1020,16 @@ class HerokuDyno:
 
         original_formation_size = self.original_formation_size
 
-        # If original size is not set, no need to downscale
+        # If original size is not set, fall back to previous tier so the
+        # formation can still recover from a lost baseline (e.g. Redis eviction).
         if not original_formation_size:
-            return
+            original_formation_size = self.previous_formation_size
+            if not original_formation_size:
+                return
+            logger.info(
+                f"No original formation size for {self.formation_name}, "
+                f"using previous tier {original_formation_size} as downscale target."
+            )
 
         with cache.lock(self.downscale_cache_key, expire=30):
             # Check if formation is on lower size than original size and skip downscale
