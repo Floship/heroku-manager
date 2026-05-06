@@ -407,7 +407,7 @@ class TestStaleSiblingMemoryKeys(unittest.TestCase):
 
         # Both alive and memory keys must use the same zombie TTL
         memory_calls = [c for c in mock_set.call_args_list
-                        if "dyno_memory" in str(c)]
+                        if "dyno_memory:" in str(c) and "dyno_memory_stable" not in str(c)]
         self.assertEqual(len(memory_calls), 1)
         _, kwargs = memory_calls[0]
         ttl_used = kwargs.get("timeout") or memory_calls[0][0][2]  # positional or keyword

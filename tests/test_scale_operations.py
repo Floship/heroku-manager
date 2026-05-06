@@ -2,6 +2,7 @@
 Tests: upscale, downscale, restart, autoscale orchestration.
 Uses patch context managers throughout to avoid PropertyMock class-level leakage.
 """
+import math
 import unittest
 from unittest.mock import patch, MagicMock, PropertyMock
 from tests.conftest import make_dyno, BaseLockTestCase, patch_cache_keys
@@ -888,6 +889,483 @@ class TestLostBaselineRecovery(BaseLockTestCase):
         # Should have downscaled to standard-1x
         mock_api.assert_called_once()
         self.assertEqual(mock_api.call_args[1]["data"]["size"], "standard-1x")
+
+
+class TestMemoryStabilityDetection(BaseLockTestCase):
+    """Tests for RSS plateau detection and stability-based forced downscale."""
+
+    def _seed_stable_history(self, dyno, base_mem=15000, count=8, tolerance=10):
+        """Seed a flat memory history (readings within ±tolerance of base_mem)."""
+        import time as _time
+        now = _time.time()
+        history = [
+            (now - (count - i) * 30, base_mem + (i % 2) * tolerance)
+            for i in range(count)
+        ]
+        cache.set(dyno.memory_history_cache_key, history, timeout=600)
+
+    def _seed_rising_history(self, dyno, start=10000, step=200, count=8):
+        """Seed a steadily rising memory history."""
+        import time as _time
+        now = _time.time()
+        history = [
+            (now - (count - i) * 30, start + i * step)
+            for i in range(count)
+        ]
+        cache.set(dyno.memory_history_cache_key, history, timeout=600)
+
+    # --- is_memory_stabilized ---
+
+    def test_stabilized_true_when_readings_are_flat(self):
+        dyno = make_dyno(formation_size="performance-l-ram")
+        self._seed_stable_history(dyno, base_mem=15000, count=8, tolerance=10)
+        self.assertTrue(dyno.is_memory_stabilized)
+
+    def test_stabilized_false_when_memory_is_rising(self):
+        dyno = make_dyno(formation_size="performance-l-ram")
+        self._seed_rising_history(dyno, start=10000, step=200, count=8)
+        self.assertFalse(dyno.is_memory_stabilized)
+
+    def test_stabilized_false_when_too_few_readings(self):
+        dyno = make_dyno(formation_size="performance-l-ram")
+        import time as _time
+        now = _time.time()
+        history = [(now - 30, 15000), (now, 15010)]
+        cache.set(dyno.memory_history_cache_key, history, timeout=600)
+        self.assertFalse(dyno.is_memory_stabilized)
+
+    def test_stabilized_false_when_readings_bunched_in_short_burst(self):
+        """Even with enough readings, if they all arrive within a few seconds,
+        that's not a real plateau — reject."""
+        dyno = make_dyno(formation_size="performance-l-ram")
+        import time as _time
+        now = _time.time()
+        # 8 readings all within 10 seconds — well under window/2 (150s)
+        history = [(now - 10 + i, 15000 + i) for i in range(8)]
+        cache.set(dyno.memory_history_cache_key, history, timeout=600)
+        self.assertFalse(dyno.is_memory_stabilized)
+
+    def test_stabilized_uses_proportional_tolerance_for_large_memory(self):
+        """At 15 GB RSS, the 1% proportional tolerance (150 MB) should be used
+        instead of the fixed 50 MB floor, so readings within ±100 MB pass."""
+        dyno = make_dyno(formation_size="performance-l-ram")
+        import time as _time
+        now = _time.time()
+        # Readings swing ±100 MB around 15000 — exceeds 50 MB but within 1% (150 MB)
+        readings_vals = [15000, 15100, 14900, 15050, 14950, 15080, 14920, 15030]
+        history = [
+            (now - (len(readings_vals) - i) * 30, readings_vals[i])
+            for i in range(len(readings_vals))
+        ]
+        cache.set(dyno.memory_history_cache_key, history, timeout=600)
+        self.assertTrue(dyno.is_memory_stabilized)
+
+    def test_stabilized_false_when_no_history(self):
+        dyno = make_dyno(formation_size="performance-l-ram")
+        self.assertFalse(dyno.is_memory_stabilized)
+
+    # --- allow_downscale with stability override ---
+
+    def test_allow_downscale_true_when_memory_stable_above_threshold(self):
+        """Upscaled dyno with flat RSS at 15 GB should be allowed to downscale."""
+        dyno = make_dyno(formation_size="performance-l-ram")
+        cache.set(dyno.original_size_cache_key, {"size": "standard-1x"}, timeout=None)
+        self._seed_stable_history(dyno, base_mem=15000)
+        with patch.object(type(dyno), "current_memory_usage",
+                          new_callable=PropertyMock, return_value=15000):
+            with patch.object(type(dyno), "detected_r14",
+                              new_callable=PropertyMock, return_value=False):
+                with patch.object(type(dyno), "detected_r15",
+                                  new_callable=PropertyMock, return_value=False):
+                    with patch.object(type(dyno), "no_tasks_in_queue",
+                                      new_callable=PropertyMock, return_value=True):
+                        with patch.object(type(dyno), "any_sibling_still_high_memory",
+                                          new_callable=PropertyMock, return_value=False):
+                            with patch.object(type(dyno), "is_formation_idle",
+                                              new_callable=PropertyMock, return_value=True):
+                                self.assertTrue(dyno.allow_downscale)
+
+    def test_allow_downscale_false_when_memory_stable_but_r15(self):
+        """Stable memory with active R15 means the dyno is still OOM — don't downscale."""
+        dyno = make_dyno(formation_size="performance-l-ram")
+        cache.set(dyno.original_size_cache_key, {"size": "standard-1x"}, timeout=None)
+        self._seed_stable_history(dyno, base_mem=30000)
+        with patch.object(type(dyno), "current_memory_usage",
+                          new_callable=PropertyMock, return_value=30000):
+            with patch.object(type(dyno), "current_memory_usage_percentage",
+                              new_callable=PropertyMock, return_value=98.0):
+                with patch.object(type(dyno), "detected_r14",
+                                  new_callable=PropertyMock, return_value=False):
+                    with patch.object(type(dyno), "detected_r15",
+                                      new_callable=PropertyMock, return_value=True):
+                        with patch.object(type(dyno), "no_tasks_in_queue",
+                                          new_callable=PropertyMock, return_value=True):
+                            with patch.object(type(dyno), "any_sibling_still_high_memory",
+                                              new_callable=PropertyMock, return_value=False):
+                                self.assertFalse(dyno.allow_downscale)
+
+    def test_allow_downscale_false_when_memory_still_rising(self):
+        """Rising memory means heavy work is still happening — don't downscale."""
+        dyno = make_dyno(formation_size="performance-l-ram")
+        cache.set(dyno.original_size_cache_key, {"size": "standard-1x"}, timeout=None)
+        self._seed_rising_history(dyno, start=10000, step=200)
+        with patch.object(type(dyno), "current_memory_usage",
+                          new_callable=PropertyMock, return_value=11400):
+            with patch.object(type(dyno), "detected_r14",
+                              new_callable=PropertyMock, return_value=False):
+                with patch.object(type(dyno), "detected_r15",
+                                  new_callable=PropertyMock, return_value=False):
+                    with patch.object(type(dyno), "no_tasks_in_queue",
+                                      new_callable=PropertyMock, return_value=True):
+                        with patch.object(type(dyno), "any_sibling_still_high_memory",
+                                          new_callable=PropertyMock, return_value=False):
+                            self.assertFalse(dyno.allow_downscale)
+
+    def test_allow_downscale_false_when_already_at_original_size(self):
+        """Stability override should not fire when already at original size."""
+        dyno = make_dyno(formation_size="standard-1x")
+        cache.set(dyno.original_size_cache_key, {"size": "standard-1x"}, timeout=None)
+        self._seed_stable_history(dyno, base_mem=300)
+        with patch.object(type(dyno), "current_memory_usage",
+                          new_callable=PropertyMock, return_value=300):
+            with patch.object(type(dyno), "detected_r14",
+                              new_callable=PropertyMock, return_value=False):
+                with patch.object(type(dyno), "detected_r15",
+                                  new_callable=PropertyMock, return_value=False):
+                    with patch.object(type(dyno), "no_tasks_in_queue",
+                                      new_callable=PropertyMock, return_value=True):
+                        with patch.object(type(dyno), "any_sibling_still_high_memory",
+                                          new_callable=PropertyMock, return_value=False):
+                            # Normal path should handle this (memory IS below threshold)
+                            result = dyno.allow_downscale
+                            # Should be True via normal path, not stability override
+                            self.assertTrue(result)
+
+    # --- Sibling stability ---
+
+    def test_sibling_high_but_stable_does_not_block_downscale(self):
+        """Sibling with high RSS but stabilized memory should not block downscale."""
+        dyno = make_dyno(formation_size="performance-l-ram")
+        cache.set(dyno.original_size_cache_key, {"size": "standard-1x"}, timeout=None)
+        # Set up sibling memory + stability
+        cache.set("heroku:dyno_memory:normal_worker.2", 15000, timeout=300)
+        cache.set("heroku:dyno_memory_stable:normal_worker.2", True, timeout=300)
+        memory_store = {
+            f"heroku:dyno_memory:{dyno.dyno_name}": 15000,
+            "heroku:dyno_memory:normal_worker.2": 15000,
+        }
+        with patch_cache_keys(memory_store):
+            self.assertFalse(dyno.any_sibling_still_high_memory)
+
+    def test_sibling_high_and_unstable_blocks_downscale(self):
+        """Sibling with high and still-rising memory MUST block downscale."""
+        dyno = make_dyno(formation_size="performance-l-ram")
+        cache.set(dyno.original_size_cache_key, {"size": "standard-1x"}, timeout=None)
+        # Sibling is high and NOT stable
+        cache.set("heroku:dyno_memory:normal_worker.2", 15000, timeout=300)
+        cache.set("heroku:dyno_memory_stable:normal_worker.2", False, timeout=300)
+        memory_store = {
+            f"heroku:dyno_memory:{dyno.dyno_name}": 15000,
+            "heroku:dyno_memory:normal_worker.2": 15000,
+        }
+        with patch_cache_keys(memory_store):
+            self.assertTrue(dyno.any_sibling_still_high_memory)
+
+    def test_sibling_high_with_no_stability_key_blocks_downscale(self):
+        """If sibling has no stability key published, assume unstable — block."""
+        dyno = make_dyno(formation_size="performance-l-ram")
+        cache.set(dyno.original_size_cache_key, {"size": "standard-1x"}, timeout=None)
+        cache.set("heroku:dyno_memory:normal_worker.2", 15000, timeout=300)
+        # No dyno_memory_stable key for sibling
+        memory_store = {
+            f"heroku:dyno_memory:{dyno.dyno_name}": 15000,
+            "heroku:dyno_memory:normal_worker.2": 15000,
+        }
+        with patch_cache_keys(memory_store):
+            self.assertTrue(dyno.any_sibling_still_high_memory)
+
+    # --- record_memory_reading ---
+
+    def test_record_memory_reading_appends_to_history(self):
+        dyno = make_dyno(formation_size="performance-l-ram")
+        dyno.record_memory_reading(15000)
+        dyno.record_memory_reading(15020)
+        history = cache.get(dyno.memory_history_cache_key)
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0][1], 15000)
+        self.assertEqual(history[1][1], 15020)
+
+    def test_record_memory_reading_prunes_old_entries(self):
+        import time as _time
+        dyno = make_dyno(formation_size="performance-l-ram")
+        # Seed a reading that's outside the window
+        old_time = _time.time() - 600
+        history = [(old_time, 10000)]
+        cache.set(dyno.memory_history_cache_key, history, timeout=600)
+        dyno.record_memory_reading(15000)
+        history = cache.get(dyno.memory_history_cache_key)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0][1], 15000)
+
+    # --- Downscale clears memory history ---
+
+    def test_downscale_clears_memory_history(self):
+        dyno = make_dyno(formation_size="performance-m")
+        cache.set(dyno.original_size_cache_key, {"size": "standard-2x"}, timeout=None)
+        self._seed_stable_history(dyno, base_mem=2000)
+        with patch.object(dyno, "call_heroku_api", return_value=_mock_response(200)):
+            with patch.object(dyno, "stop_continuous_autoscale"):
+                dyno.downscale_formation_to_original_size()
+        self.assertIsNone(cache.get(dyno.memory_history_cache_key))
+
+    def test_upscale_clears_memory_history(self):
+        """Upscale triggers a restart, so stale pre-upscale readings must be cleared."""
+        dyno = make_dyno(formation_size="standard-2x")
+        self._seed_stable_history(dyno, base_mem=900)
+        with patch.object(type(dyno), "current_memory_usage_percentage",
+                          new_callable=PropertyMock, return_value=90.0):
+            with patch.object(type(dyno), "current_memory_usage",
+                               new_callable=PropertyMock, return_value=922):
+                with patch.object(type(dyno), "remote_monitoring",
+                                   new_callable=PropertyMock, return_value=True):
+                    with patch.object(dyno, "call_heroku_api", return_value=_mock_response(200)):
+                        with patch.object(dyno, "stop_continuous_autoscale"):
+                            dyno.upscale_formation_to_next_level()
+        self.assertIsNone(cache.get(dyno.memory_history_cache_key))
+
+    # --- allow_downscale_on_shutdown with stability override ---
+
+    def test_allow_downscale_on_shutdown_true_when_stable(self):
+        dyno = make_dyno(formation_size="performance-l-ram")
+        cache.set(dyno.original_size_cache_key, {"size": "standard-1x"}, timeout=None)
+        self._seed_stable_history(dyno, base_mem=15000)
+        with patch.object(type(dyno), "current_memory_usage",
+                          new_callable=PropertyMock, return_value=15000):
+            with patch.object(type(dyno), "detected_r14",
+                              new_callable=PropertyMock, return_value=False):
+                with patch.object(type(dyno), "detected_r15",
+                                  new_callable=PropertyMock, return_value=False):
+                    with patch.object(type(dyno), "any_sibling_still_high_memory",
+                                      new_callable=PropertyMock, return_value=False):
+                        with patch.object(type(dyno), "is_formation_idle",
+                                          new_callable=PropertyMock, return_value=True):
+                            self.assertTrue(dyno.allow_downscale_on_shutdown)
+
+    # --- Near-expiry forced downscale on stability ---
+
+    def test_near_expiry_forces_downscale_when_stable_and_queue_not_empty(self):
+        """When memory is stabilized and queue has tasks (so allow_downscale is False
+        due to downscale_on_non_empty_queue=False), the near-expiry path should
+        force a downscale instead of a pointless restart."""
+        dyno = make_dyno(formation_size="performance-l-ram")
+        dyno.__dict__["downscale_on_non_empty_queue"] = False
+        cache.set(dyno.original_size_cache_key, {"size": "standard-1x"}, timeout=None)
+        self._seed_stable_history(dyno, base_mem=15000)
+        from django.utils import timezone as tz
+        from django.core.cache.backends.locmem import LocMemCache
+        until = tz.now() + tz.timedelta(seconds=60)
+        cache.set(dyno.upscale_until_cache_key, until, timeout=60)
+        with patch.object(LocMemCache, "ttl", return_value=59):
+            with patch.object(type(dyno), "current_memory_usage",
+                              new_callable=PropertyMock, return_value=15000):
+                with patch.object(type(dyno), "current_memory_usage_percentage",
+                                  new_callable=PropertyMock, return_value=49.0):
+                    with patch.object(type(dyno), "detected_r14",
+                                      new_callable=PropertyMock, return_value=False):
+                        with patch.object(type(dyno), "detected_r15",
+                                          new_callable=PropertyMock, return_value=False):
+                            with patch.object(type(dyno), "no_tasks_in_queue",
+                                              new_callable=PropertyMock, return_value=False):
+                                with patch.object(type(dyno), "any_sibling_still_high_memory",
+                                                  new_callable=PropertyMock, return_value=False):
+                                    with patch.object(type(dyno), "is_formation_idle",
+                                                      new_callable=PropertyMock, return_value=True):
+                                        with patch.object(dyno, "downscale_formation_to_original_size") as mock_down:
+                                            with patch.object(dyno, "restart_dyno") as mock_restart:
+                                                dyno.check_and_downscale_to_original_formation_size()
+        mock_down.assert_called_once()
+        mock_restart.assert_not_called()
+
+    def test_near_expiry_does_not_force_downscale_when_r15_active(self):
+        """Even with stable memory, if R15 is active we must NOT force downscale."""
+        dyno = make_dyno(formation_size="performance-l-ram")
+        cache.set(dyno.original_size_cache_key, {"size": "standard-1x"}, timeout=None)
+        self._seed_stable_history(dyno, base_mem=30000)
+        from django.utils import timezone as tz
+        from django.core.cache.backends.locmem import LocMemCache
+        until = tz.now() + tz.timedelta(seconds=60)
+        cache.set(dyno.upscale_until_cache_key, until, timeout=60)
+        with patch.object(LocMemCache, "ttl", return_value=59):
+            with patch.object(type(dyno), "current_memory_usage",
+                              new_callable=PropertyMock, return_value=30000):
+                with patch.object(type(dyno), "current_memory_usage_percentage",
+                                  new_callable=PropertyMock, return_value=98.0):
+                    with patch.object(type(dyno), "detected_r14",
+                                      new_callable=PropertyMock, return_value=False):
+                        with patch.object(type(dyno), "detected_r15",
+                                          new_callable=PropertyMock, return_value=True):
+                            with patch.object(type(dyno), "no_tasks_in_queue",
+                                              new_callable=PropertyMock, return_value=True):
+                                with patch.object(type(dyno), "any_sibling_still_high_memory",
+                                                  new_callable=PropertyMock, return_value=False):
+                                    with patch.object(type(dyno), "is_formation_idle",
+                                                      new_callable=PropertyMock, return_value=True):
+                                        with patch.object(dyno, "downscale_formation_to_original_size") as mock_down:
+                                            with patch.object(dyno, "restart_dyno") as mock_restart:
+                                                dyno.check_and_downscale_to_original_formation_size()
+        mock_down.assert_not_called()
+
+    # --- remove_dyno_from_alive_cache cleans stable key ---
+
+    def test_remove_dyno_cleans_stable_key(self):
+        dyno = make_dyno("normal_worker.1")
+        cache.set(f"heroku:dyno_memory_stable:{dyno.dyno_name}", True, timeout=300)
+        cache.set(f"heroku:dyno_memory:{dyno.dyno_name}", 15000, timeout=300)
+        cache.set(f"heroku:dyno_alive:{dyno.dyno_name}", "now", timeout=300)
+        cache.set(f"heroku:dyno_load:{dyno.dyno_name}", 0.5, timeout=300)
+        dyno.remove_dyno_from_alive_cache()
+        self.assertIsNone(cache.get(f"heroku:dyno_memory_stable:{dyno.dyno_name}"))
+        self.assertIsNone(cache.get(f"heroku:dyno_memory:{dyno.dyno_name}"))
+        self.assertIsNone(cache.get(f"heroku:dyno_alive:{dyno.dyno_name}"))
+        self.assertIsNone(cache.get(f"heroku:dyno_load:{dyno.dyno_name}"))
+
+    # --- _downscale_memory_threshold edge case ---
+
+    def test_downscale_threshold_blocks_when_target_memory_is_zero(self):
+        """If target size somehow has 0 memory, threshold must be inf (block downscale)."""
+        dyno = make_dyno(formation_size="performance-m")
+        cache.set(dyno.original_size_cache_key, {"size": "standard-1x"}, timeout=None)
+        with patch.dict("heroku_manager.heroku.DYNO_SIZES",
+                        {"standard-1x": {"memory": 0, "next": "standard-2x", "previous": None,
+                                          "threads_available": 1, "price_per_hour": 0}},
+                        clear=False):
+            self.assertTrue(math.isinf(dyno._downscale_memory_threshold))
+
+
+class TestFormationIdleGate(BaseLockTestCase):
+    """Tests for is_formation_idle and its role in gating stability-based downscale."""
+
+    def test_idle_true_when_own_load_below_threshold(self):
+        dyno = make_dyno(formation_size="performance-l-ram")
+        with patch.object(type(dyno), "avg_load_1min",
+                          new_callable=PropertyMock, return_value=0.3):
+            with patch_cache_keys({}):
+                self.assertTrue(dyno.is_formation_idle)
+
+    def test_idle_false_when_own_load_above_threshold(self):
+        dyno = make_dyno(formation_size="performance-l-ram")
+        with patch.object(type(dyno), "avg_load_1min",
+                          new_callable=PropertyMock, return_value=1.5):
+            self.assertFalse(dyno.is_formation_idle)
+
+    def test_idle_false_when_sibling_load_above_threshold(self):
+        dyno = make_dyno(formation_size="performance-l-ram")
+        cache.set("heroku:dyno_load:normal_worker.2", 2.3, timeout=300)
+        load_store = {
+            f"heroku:dyno_load:{dyno.dyno_name}": 0.3,
+            "heroku:dyno_load:normal_worker.2": 2.3,
+        }
+        with patch.object(type(dyno), "avg_load_1min",
+                          new_callable=PropertyMock, return_value=0.3):
+            with patch_cache_keys(load_store):
+                self.assertFalse(dyno.is_formation_idle)
+
+    def test_idle_true_when_all_siblings_below_threshold(self):
+        dyno = make_dyno(formation_size="performance-l-ram")
+        cache.set("heroku:dyno_load:normal_worker.2", 0.4, timeout=300)
+        load_store = {
+            f"heroku:dyno_load:{dyno.dyno_name}": 0.3,
+            "heroku:dyno_load:normal_worker.2": 0.4,
+        }
+        with patch.object(type(dyno), "avg_load_1min",
+                          new_callable=PropertyMock, return_value=0.3):
+            with patch_cache_keys(load_store):
+                self.assertTrue(dyno.is_formation_idle)
+
+    def test_idle_at_exact_threshold_is_not_idle(self):
+        """Load at exactly 1.0 should be considered NOT idle (>= threshold)."""
+        dyno = make_dyno(formation_size="performance-l-ram")
+        with patch.object(type(dyno), "avg_load_1min",
+                          new_callable=PropertyMock, return_value=1.0):
+            self.assertFalse(dyno.is_formation_idle)
+
+    def test_allow_downscale_false_when_stable_but_load_high(self):
+        """Memory stabilized + high load = heavy task still running. Don't downscale."""
+        dyno = make_dyno(formation_size="performance-l-ram")
+        cache.set(dyno.original_size_cache_key, {"size": "standard-1x"}, timeout=None)
+        from tests.test_scale_operations import TestMemoryStabilityDetection
+        # Reuse the seeding helper via a fresh instance
+        helper = TestMemoryStabilityDetection()
+        helper._seed_stable_history(dyno, base_mem=15000)
+        with patch.object(type(dyno), "current_memory_usage",
+                          new_callable=PropertyMock, return_value=15000):
+            with patch.object(type(dyno), "detected_r14",
+                              new_callable=PropertyMock, return_value=False):
+                with patch.object(type(dyno), "detected_r15",
+                                  new_callable=PropertyMock, return_value=False):
+                    with patch.object(type(dyno), "no_tasks_in_queue",
+                                      new_callable=PropertyMock, return_value=True):
+                        with patch.object(type(dyno), "any_sibling_still_high_memory",
+                                          new_callable=PropertyMock, return_value=False):
+                            with patch.object(type(dyno), "is_formation_idle",
+                                              new_callable=PropertyMock, return_value=False):
+                                self.assertFalse(dyno.allow_downscale)
+
+    def test_allow_downscale_true_when_stable_and_load_settled(self):
+        """Memory stabilized + low load = work finished. Allow downscale."""
+        dyno = make_dyno(formation_size="performance-l-ram")
+        cache.set(dyno.original_size_cache_key, {"size": "standard-1x"}, timeout=None)
+        from tests.test_scale_operations import TestMemoryStabilityDetection
+        helper = TestMemoryStabilityDetection()
+        helper._seed_stable_history(dyno, base_mem=15000)
+        with patch.object(type(dyno), "current_memory_usage",
+                          new_callable=PropertyMock, return_value=15000):
+            with patch.object(type(dyno), "detected_r14",
+                              new_callable=PropertyMock, return_value=False):
+                with patch.object(type(dyno), "detected_r15",
+                                  new_callable=PropertyMock, return_value=False):
+                    with patch.object(type(dyno), "no_tasks_in_queue",
+                                      new_callable=PropertyMock, return_value=True):
+                        with patch.object(type(dyno), "any_sibling_still_high_memory",
+                                          new_callable=PropertyMock, return_value=False):
+                            with patch.object(type(dyno), "is_formation_idle",
+                                              new_callable=PropertyMock, return_value=True):
+                                self.assertTrue(dyno.allow_downscale)
+
+    def test_near_expiry_blocks_downscale_when_stable_but_load_high(self):
+        """Near timer expiry: stable memory but high load — don't force downscale.
+        The normal restart-if-hot path may still fire, but the formation must NOT
+        be downsized while a heavy task is running."""
+        dyno = make_dyno(formation_size="performance-l-ram")
+        dyno.__dict__["downscale_on_non_empty_queue"] = True
+        cache.set(dyno.original_size_cache_key, {"size": "standard-1x"}, timeout=None)
+        from tests.test_scale_operations import TestMemoryStabilityDetection
+        helper = TestMemoryStabilityDetection()
+        helper._seed_stable_history(dyno, base_mem=15000)
+        from django.utils import timezone as tz
+        from django.core.cache.backends.locmem import LocMemCache
+        until = tz.now() + tz.timedelta(seconds=60)
+        cache.set(dyno.upscale_until_cache_key, until, timeout=60)
+        with patch.object(LocMemCache, "ttl", return_value=59):
+            with patch.object(type(dyno), "current_memory_usage",
+                              new_callable=PropertyMock, return_value=15000):
+                with patch.object(type(dyno), "current_memory_usage_percentage",
+                                  new_callable=PropertyMock, return_value=49.0):
+                    with patch.object(type(dyno), "detected_r14",
+                                      new_callable=PropertyMock, return_value=False):
+                        with patch.object(type(dyno), "detected_r15",
+                                          new_callable=PropertyMock, return_value=False):
+                            with patch.object(type(dyno), "no_tasks_in_queue",
+                                              new_callable=PropertyMock, return_value=True):
+                                with patch.object(type(dyno), "any_sibling_still_high_memory",
+                                                  new_callable=PropertyMock, return_value=False):
+                                    with patch.object(type(dyno), "is_formation_idle",
+                                                      new_callable=PropertyMock, return_value=False):
+                                        with patch.object(dyno, "downscale_formation_to_original_size") as mock_down:
+                                            with patch.object(dyno, "restart_dyno"):
+                                                dyno.check_and_downscale_to_original_formation_size()
+        # Key assertion: formation must NOT be downsized during active work
+        mock_down.assert_not_called()
 
 
 if __name__ == "__main__":

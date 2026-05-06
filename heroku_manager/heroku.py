@@ -127,6 +127,11 @@ class HerokuDyno:
         self._last_file_cleaning = None
         self._formation_size_cached = None  # (size, timestamp) tuple for instance-level caching
 
+    # Per-dyno cache key prefixes — published in check_in_dyno, cleaned in
+    # remove_dyno_from_alive_cache.  Add new metrics here to publish/clean
+    # them automatically.
+    _DYNO_CACHE_PREFIXES = ('alive', 'memory', 'memory_stable', 'load')
+
     @property
     def _get_proc_class_by_formation_name(self):
         """
@@ -241,10 +246,26 @@ class HerokuDyno:
 
     @property
     def allow_downscale(self):
-        return not self.requires_upscale and \
-            not self.is_still_high_memory_usage_for_downscale and \
-            not self.any_sibling_still_high_memory and \
-            (self.downscale_on_non_empty_queue or self.no_tasks_in_queue)
+        queue_ok = self.downscale_on_non_empty_queue or self.no_tasks_in_queue
+
+        # Normal path: memory is below the downscale threshold for all dynos.
+        if not self.requires_upscale and \
+                not self.is_still_high_memory_usage_for_downscale and \
+                not self.any_sibling_still_high_memory and \
+                queue_ok:
+            return True
+
+        # Stability override: RSS plateau + idle formation = work is done,
+        # only a restart will reclaim memory.
+        if self._is_stability_eligible and queue_ok:
+            logger.info(
+                f"[{self.formation_name}] Memory stabilized at "
+                f"{self.current_memory_usage:.0f}MB and load settled — allowing downscale "
+                f"(RSS plateau detected; restart will reclaim memory)."
+            )
+            return True
+
+        return False
             
     @property
     def allow_downscale_on_shutdown(self):
@@ -254,9 +275,16 @@ class HerokuDyno:
         removes this dyno's memory key before the formation resize, which would
         otherwise leave hot siblings vulnerable to an unexpected downscale.
         """
-        return not self.requires_upscale and \
-            not self.is_still_high_memory_usage_for_downscale and \
-            not self.any_sibling_still_high_memory
+        if not self.requires_upscale and \
+                not self.is_still_high_memory_usage_for_downscale and \
+                not self.any_sibling_still_high_memory:
+            return True
+
+        # Stability override.
+        if self._is_stability_eligible:
+            return True
+
+        return False
 
     @property
     def detected_r15(self):
@@ -289,12 +317,84 @@ class HerokuDyno:
             )
             return float('inf')
         target_memory = DYNO_SIZES.get(target_size, {}).get("memory", 0)
+        if not target_memory:
+            logger.warning(
+                f"[{self.formation_name}] Target size {target_size} has 0 memory. "
+                f"Blocking downscale."
+            )
+            return float('inf')
         return target_memory * settings.DOWNSCALE_PERCENTAGE_HIGH_MEM_USE / 100
 
     @property
     def is_still_high_memory_usage_for_downscale(self):
         threshold = self._downscale_memory_threshold
         return math.isinf(threshold) or self.current_memory_usage >= threshold
+
+    @property
+    def _is_stability_eligible(self):
+        """True when the formation qualifies for stability-based forced downscale.
+
+        Combines all preconditions that must hold before the RSS-plateau override
+        can bypass the normal memory-threshold check:
+        - Not actively under memory pressure (no R15, memory % < upscale threshold)
+        - Actually upscaled above the original tier
+        - Memory has plateaued (±tolerance over the stability window)
+        - All dynos in the formation are idle (load avg < threshold)
+        - No sibling is still actively hot (unless also stabilized)
+        """
+        return (
+            not self.requires_upscale
+            and not self.is_on_original_formation_size_or_lower
+            and self.is_memory_stabilized
+            and self.is_formation_idle
+            and not self.any_sibling_still_high_memory
+        )
+
+    def record_memory_reading(self, mem=None):
+        """Record current memory usage for RSS plateau detection."""
+        if mem is None:
+            mem = self.current_memory_usage
+        if not mem:
+            return
+        now = time.time()
+        window = getattr(settings, 'DYNO_MEMORY_STABILITY_WINDOW', 300)
+        history = cache.get(self.memory_history_cache_key) or []
+        history = [(t, m) for t, m in history if now - t <= window]
+        history.append((now, mem))
+        cache.set(self.memory_history_cache_key, history, timeout=window + 120)
+
+    @property
+    def is_memory_stabilized(self):
+        """True when memory has flattened out (±tolerance over the stability window).
+
+        Python's allocator holds RSS without releasing it back to the OS.  Once
+        heavy tasks finish, memory plateaus.  Detecting this plateau lets the
+        autoscaler force a downscale + restart to reclaim memory.
+
+        Tolerance is the greater of a fixed floor (``DYNO_MEMORY_STABILITY_TOLERANCE_MB``,
+        default 50 MB) and a percentage of the average reading
+        (``DYNO_MEMORY_STABILITY_TOLERANCE_PCT``, default 1%).  This scales
+        gracefully: at 15 GB RSS the effective tolerance is ~150 MB (normal GC
+        jitter won't prevent detection), while at 500 MB it stays at 50 MB.
+
+        Readings must also span at least half the stability window to prevent
+        a burst of readings in a few seconds from being mistaken for a plateau.
+        """
+        history = cache.get(self.memory_history_cache_key) or []
+        min_readings = getattr(settings, 'DYNO_MEMORY_STABILITY_MIN_READINGS', 6)
+        if len(history) < min_readings:
+            return False
+        # Ensure readings span a meaningful period, not just a short burst
+        window = getattr(settings, 'DYNO_MEMORY_STABILITY_WINDOW', 300)
+        time_span = history[-1][0] - history[0][0]
+        if time_span < window / 2:
+            return False
+        readings = [m for _, m in history]
+        avg = sum(readings) / len(readings)
+        tolerance_mb = getattr(settings, 'DYNO_MEMORY_STABILITY_TOLERANCE_MB', 50)
+        tolerance_pct = getattr(settings, 'DYNO_MEMORY_STABILITY_TOLERANCE_PCT', 1)
+        tolerance = max(tolerance_mb, avg * tolerance_pct / 100)
+        return all(abs(m - avg) <= tolerance for m in readings)
 
     def _acquire_rate_limit_token(self):
         """
@@ -520,6 +620,10 @@ class HerokuDyno:
 
     def clear_upscaling(self):
         cache.delete(self.upscaling_cache_key)
+
+    @cached_property
+    def memory_history_cache_key(self):
+        return f'heroku:memory_history:{self.app_name}:{self.dyno_name}'
 
     @cached_property
     def downscale_cache_key(self):
@@ -780,15 +884,38 @@ class HerokuDyno:
         # the zombie detector fires — prevents stale memory keys from blocking downscale.
         ttl = int(getattr(settings, 'DYNO_ZOMBIE_THRESHOLD', 24 * 60 * 60))
         cache.set(f'heroku:dyno_alive:{self.dyno_name}', now, timeout=ttl)
-        # Publish own memory so siblings can gate formation downscale decisions.
+
+        # Publish per-dyno metrics so siblings can gate formation-wide decisions.
         mem = self.current_memory_usage
         if mem is not None:
             cache.set(f'heroku:dyno_memory:{self.dyno_name}', mem, timeout=ttl)
+            self.record_memory_reading(mem)
+            cache.set(
+                f'heroku:dyno_memory_stable:{self.dyno_name}',
+                self.is_memory_stabilized, timeout=ttl,
+            )
+        load = self.avg_load_1min
+        if load is not None:
+            cache.set(f'heroku:dyno_load:{self.dyno_name}', load, timeout=ttl)
 
     def remove_dyno_from_alive_cache(self, dyno_name=None):
         dyno_name = dyno_name or self.dyno_name
-        cache.delete(f'heroku:dyno_alive:{dyno_name}')
-        cache.delete(f'heroku:dyno_memory:{dyno_name}')
+        for prefix in self._DYNO_CACHE_PREFIXES:
+            cache.delete(f'heroku:dyno_{prefix}:{dyno_name}')
+
+    def _iter_sibling_values(self, metric):
+        """Yield ``(dyno_name, value)`` for each sibling's published metric.
+
+        ``metric`` is the cache key infix, e.g. ``'memory'`` or ``'load'``.
+        Only siblings of the same formation are returned (own dyno is skipped).
+        """
+        own_key = f'heroku:dyno_{metric}:{self.dyno_name}'
+        for key in cache.keys(f'heroku:dyno_{metric}:{self.formation_name}.*'):
+            if key == own_key:
+                continue
+            value = cache.get(key)
+            if value is not None:
+                yield key.split(':')[-1], value
 
     @property
     def any_sibling_still_high_memory(self):
@@ -800,16 +927,20 @@ class HerokuDyno:
         threshold = self._downscale_memory_threshold
         if not threshold:
             return False
-        own_key = f'heroku:dyno_memory:{self.dyno_name}'
-        # Use a literal dot-terminated prefix so 'normal_worker' never matches
-        # keys belonging to 'normal_worker_extra' or other longer formation names.
-        for key in cache.keys(f'heroku:dyno_memory:{self.formation_name}.*'):
-            if key == own_key:
-                continue  # already checked via is_still_high_memory_usage_for_downscale
-            sibling_mem = cache.get(key)
-            if sibling_mem and sibling_mem >= threshold:
+        for sibling_name, sibling_mem in self._iter_sibling_values('memory'):
+            if sibling_mem >= threshold:
+                # If the sibling's memory has also stabilized (RSS plateau),
+                # it won't drop further — only a restart will reclaim it.
+                # Don't block formation downscale in that case.
+                sibling_stable = cache.get(f'heroku:dyno_memory_stable:{sibling_name}')
+                if sibling_stable:
+                    logger.debug(
+                        f"Sibling {sibling_name} at {sibling_mem:.0f}MB >= "
+                        f"{threshold:.0f}MB but memory stabilized; not blocking downscale."
+                    )
+                    continue
                 logger.debug(
-                    f"Sibling {key.split(':')[-1]} at {sibling_mem:.0f}MB >= "
+                    f"Sibling {sibling_name} at {sibling_mem:.0f}MB >= "
                     f"{threshold:.0f}MB threshold; blocking {self.formation_name} downscale."
                 )
                 return True
@@ -822,19 +953,44 @@ class HerokuDyno:
         on behalf of a hot sibling whose autoscale thread may have stalled."""
         upscale_pct = getattr(settings, 'UPSCALE_PERCENTAGE_HIGH_MEM_USE', 80)
         threshold_mb = self.available_memory * upscale_pct / 100
-        own_key = f'heroku:dyno_memory:{self.dyno_name}'
-        for key in cache.keys(f'heroku:dyno_memory:{self.formation_name}.*'):
-            if key == own_key:
-                continue
-            sibling_mem = cache.get(key)
-            if sibling_mem and sibling_mem > threshold_mb:
+        for sibling_name, sibling_mem in self._iter_sibling_values('memory'):
+            if sibling_mem > threshold_mb:
                 logger.info(
-                    f"Sibling {key.split(':')[-1]} at {sibling_mem:.0f}MB > "
+                    f"Sibling {sibling_name} at {sibling_mem:.0f}MB > "
                     f"{threshold_mb:.0f}MB upscale threshold; advocating upscale "
                     f"for {self.formation_name}."
                 )
                 return True
         return False
+
+    @property
+    def is_formation_idle(self):
+        """True when *all* dynos in the formation (self + siblings) have a load
+        average below ``DYNO_STABILITY_LOAD_THRESHOLD`` (default 1.0).
+
+        A high load average indicates a CPU-bound task is still executing.  Even
+        if RSS has plateaued, downscaling during active work would kill that task
+        (formation resize restarts all dynos).  Gate the stability-based
+        downscale on this check to let heavy tasks finish first.
+        """
+        threshold = getattr(settings, 'DYNO_STABILITY_LOAD_THRESHOLD', 1.0)
+        # Check own load
+        own_load = self.avg_load_1min
+        if own_load is not None and own_load >= threshold:
+            logger.debug(
+                f"[{self.formation_name}] Own load {own_load:.2f} >= "
+                f"{threshold:.1f}; formation not idle."
+            )
+            return False
+        # Check sibling loads
+        for sibling_name, sibling_load in self._iter_sibling_values('load'):
+            if sibling_load >= threshold:
+                logger.debug(
+                    f"[{self.formation_name}] Sibling {sibling_name} load "
+                    f"{sibling_load:.2f} >= {threshold:.1f}; formation not idle."
+                )
+                return False
+        return True
 
     def check_for_sibling_zombie_dynos(self):
         """
@@ -919,6 +1075,7 @@ class HerokuDyno:
         if response and response.status_code == 200:
             logger.info(f"Upscaled formation {self.formation_name} from {self.formation_size} to {next_level} with {DYNO_SIZES[next_level]['memory']} MB memory.")
             self._update_formation_size(next_level)
+            cache.delete(self.memory_history_cache_key)
 
             # Set cache key that expires after min upscale duration to gate downscale checks
             delta = (
@@ -967,15 +1124,31 @@ class HerokuDyno:
                     if self.allow_downscale:
                         self.downscale_formation_to_original_size()
                         return
-                    # Near expiry and not safe to downscale — either restart if hot, or extend the timer
+                    # Near expiry and not safe to downscale.
+                    # If stability-eligible, downscale directly — a restart alone
+                    # won't free RSS; the formation resize triggers a fresh
+                    # restart on the smaller tier.
+                    if self._is_stability_eligible:
+                        logger.info(
+                            f"[{self.formation_name}] Memory stabilized at "
+                            f"{self.current_memory_usage:.0f}MB near timer expiry — "
+                            f"forcing downscale (restart alone won't reclaim RSS)."
+                        )
+                        self.downscale_formation_to_original_size()
+                        return
+                    # Otherwise restart if hot, or extend the timer
                     if ((self.detected_r14 and not self.detected_r15) or self.is_still_high_memory_usage_for_downscale) and self.no_tasks_in_queue:
                         self.restart_dyno()
                     else:
                         load_avg = f'{self.avg_load_1min:.2f}' if self.avg_load_1min else 'unknown'
                         memory_usage = f'{self.current_memory_usage_percentage}% ({self.current_memory_usage:.2f}MB / {self.available_memory}MB)' \
                             if self.current_memory_usage and self.available_memory and self.current_memory_usage_percentage else 'unknown'
+                        stable = self.is_memory_stabilized
+                        history = cache.get(self.memory_history_cache_key) or []
                         logger.warning(f"Extending the time for {self.formation_name} to stay upscaled by {check_interval} seconds. "
-                                        f"Current Memory Usage: {memory_usage}. Current Load Avg: {load_avg}. Tasks in Queue: {self.tasks_in_queue}.")
+                                        f"Current Memory Usage: {memory_usage}. Current Load Avg: {load_avg}. "
+                                        f"Tasks in Queue: {self.tasks_in_queue}. "
+                                        f"Memory Stabilized: {stable} ({len(history)} readings).")
                         new_until = upscaled_until + timedelta(seconds=check_interval)
                         new_timeout = current_ttl + check_interval
                         cache.set(self.upscale_until_cache_key, new_until, timeout=new_timeout)
@@ -1053,6 +1226,7 @@ class HerokuDyno:
             self._update_formation_size(original_formation_size)
             self.clear_upscaling()
             self.clear_original_formation_size()
+            cache.delete(self.memory_history_cache_key)
             if not self.remote_monitoring:
                 self.stop_continuous_autoscale()
         elif response:
