@@ -1060,15 +1060,18 @@ class HerokuDyno:
             )
 
         # Ensure upscale is only executed once every settings.DYNO_TIME_BETWEEN_SCALES seconds for this dyno type
+        _lock_proceed = True
         try:
             with cache.lock(self.upscaling_cache_key, expire=30):
                 if self.is_upscaling:
                     logger.debug(f"Upscaling formation {self.formation_name} is already in progress.")
-                    return
-
-                self.set_upscaling()
+                    _lock_proceed = False
+                else:
+                    self.set_upscaling()
         except _NotAcquired:
             logger.warning(f"Lock '{self.upscaling_cache_key}' expired before release.")
+        if not _lock_proceed:
+            return
 
         if not self.remote_monitoring:
             logger.warning(f"Memory usage is greater than {self.current_memory_usage_percentage:.2f}% of available RAM ({self.available_memory}MB). "
@@ -1218,22 +1221,23 @@ class HerokuDyno:
                 f"using previous tier {original_formation_size} as downscale target."
             )
 
+        _lock_proceed = True
         try:
             with cache.lock(self.downscale_cache_key, expire=30):
                 # Check if formation is on lower size than original size and skip downscale
                 if self.is_on_original_formation_size_or_lower:
                     logger.debug(f"Formation {self.formation_name} is already at original or lower size than the original size.")
                     self.clear_original_formation_size()
-                    return
-
-                # Ensure downscale is only executed once every settings.DYNO_TIME_BETWEEN_SCALES seconds for this formation type
-                if self.is_downscaling:
+                    _lock_proceed = False
+                elif self.is_downscaling:
                     # logger.info(f"Downscaling formation {self.formation_name} is already in progress.")
-                    return
-
-                self.set_downscaling()
+                    _lock_proceed = False
+                else:
+                    self.set_downscaling()
         except _NotAcquired:
             logger.warning(f"Lock '{self.downscale_cache_key}' expired before release.")
+        if not _lock_proceed:
+            return
 
         # Scale formation back to original size (routed through call_heroku_api for rate limiting)
         url = f'https://api.heroku.com/apps/{self.app_name}/formation/{self.formation_name}'
@@ -1259,14 +1263,18 @@ class HerokuDyno:
 
         # Ensure restart is only executed once every DYNO_TIME_BETWEEN_RESTARTS seconds for this dyno
         restart_cache_key = f'heroku:restart_dyno:{dyno_name}'
+        _lock_proceed = True
         try:
             with cache.lock(restart_cache_key, expire=30):
                 if cache.get(restart_cache_key):
                     logger.debug(f"Restarting dyno {dyno_name} is already in progress.")
-                    return False
-                cache.set(restart_cache_key, True, timeout=getattr(settings, 'DYNO_TIME_BETWEEN_RESTARTS', 300))
+                    _lock_proceed = False
+                else:
+                    cache.set(restart_cache_key, True, timeout=getattr(settings, 'DYNO_TIME_BETWEEN_RESTARTS', 300))
         except _NotAcquired:
             logger.warning(f"Lock '{restart_cache_key}' expired before release.")
+        if not _lock_proceed:
+            return False
 
         # Restart the dyno via Heroku API (routed through call_heroku_api for rate limiting)
         url = f'https://api.heroku.com/apps/{self.app_name}/dynos/{dyno_name}'
@@ -1379,6 +1387,9 @@ class HerokuDyno:
                         cache.set(cache_key, logs, timeout=log_cache_ttl)
             except _NotAcquired:
                 logger.warning(f"Lock '{cache_key}' expired before release. Logs may already be cached.")
+
+        if not logs:
+            return None
 
         logs_parsed = []
 

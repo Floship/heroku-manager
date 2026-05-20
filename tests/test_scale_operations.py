@@ -1430,6 +1430,44 @@ class TestLockExpiryHandling(BaseLockTestCase):
                 # Should not raise
                 dyno.check_for_sibling_zombie_dynos()
 
+    def test_upscale_skips_api_when_already_upscaling_and_lock_expires(self):
+        """If is_upscaling is True inside the lock body and __exit__ raises
+        NotAcquired, the upscale must NOT proceed to the API call."""
+        dyno = make_dyno(formation_size="standard-2x")
+        dyno.__dict__["max_dyno_size"] = "performance-l"
+        with patch.object(cache, "lock", return_value=self._expired_lock()):
+            with patch.object(type(dyno), "is_upscaling",
+                              new_callable=PropertyMock, return_value=True):
+                with patch.object(dyno, "call_heroku_api") as mock_api:
+                    dyno.upscale_formation_to_next_level()
+        mock_api.assert_not_called()
+
+    def test_downscale_skips_api_when_already_at_original_and_lock_expires(self):
+        """If is_on_original_formation_size_or_lower is True inside the lock
+        body and __exit__ raises, the downscale must NOT proceed."""
+        dyno = make_dyno(formation_size="standard-2x")
+        with patch.object(type(dyno), "original_formation_size",
+                          new_callable=PropertyMock, return_value="standard-1x"):
+            with patch.object(type(dyno), "is_on_original_formation_size_or_lower",
+                              new_callable=PropertyMock, return_value=True):
+                with patch.object(dyno, "clear_original_formation_size"):
+                    with patch.object(cache, "lock", return_value=self._expired_lock()):
+                        with patch.object(dyno, "call_heroku_api") as mock_api:
+                            dyno.downscale_formation_to_original_size()
+        mock_api.assert_not_called()
+
+    def test_restart_skips_api_when_already_in_progress_and_lock_expires(self):
+        """If restart is already in progress and __exit__ raises, the restart
+        must NOT proceed to the API call."""
+        dyno = make_dyno()
+        restart_key = f'heroku:restart_dyno:{dyno.dyno_name}'
+        cache.set(restart_key, True, timeout=300)
+        with patch.object(cache, "lock", return_value=self._expired_lock()):
+            with patch.object(dyno, "call_heroku_api") as mock_api:
+                result = dyno.restart_dyno()
+        mock_api.assert_not_called()
+        self.assertFalse(result)
+
 
 if __name__ == "__main__":
     unittest.main()

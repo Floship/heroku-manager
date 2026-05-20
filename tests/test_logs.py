@@ -150,6 +150,25 @@ class TestGetHerokuLogs(BaseLockTestCase):
         self.assertIsInstance(logs, list)
         self.assertGreater(len(logs), 0)
 
+    def test_returns_none_when_api_fails_and_lock_expires(self):
+        """If call_heroku_api returns None inside the lock body and __exit__
+        raises NotAcquired, the abandoned 'return None' must not crash on
+        logs.split() — should return None gracefully."""
+        from heroku_manager.heroku import _NotAcquired
+
+        dyno = make_dyno()
+
+        lock_cm = MagicMock()
+        lock_cm.__enter__ = MagicMock(return_value=None)
+        lock_cm.__exit__ = MagicMock(side_effect=_NotAcquired("Lock expired"))
+
+        with patch.object(cache, "lock", return_value=lock_cm):
+            with patch.object(dyno, "call_heroku_api", return_value=None):
+                result = dyno.get_heroku_logs()
+
+        # Should return None, not crash with AttributeError
+        self.assertIsNone(result)
+
 
 class TestExtractLatestMetric(BaseLockTestCase):
 
