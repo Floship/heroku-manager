@@ -127,6 +127,29 @@ class TestGetHerokuLogs(BaseLockTestCase):
         # Bad timestamp skipped; empty list
         self.assertEqual(logs, [])
 
+    def test_handles_expired_lock_gracefully(self):
+        """Lock expires before release -> NotAcquired from __exit__.
+        Should log warning and return parsed logs, not crash."""
+        from heroku_manager.heroku import _NotAcquired
+
+        dyno = make_dyno()
+
+        # Mock lock whose __exit__ raises NotAcquired (simulating expired lock)
+        lock_cm = MagicMock()
+        lock_cm.__enter__ = MagicMock(return_value=None)
+        lock_cm.__exit__ = MagicMock(side_effect=_NotAcquired("Lock expired"))
+
+        with patch.object(cache, "lock", return_value=lock_cm):
+            with patch.object(dyno, "call_heroku_api",
+                              return_value=_make_log_response(LOG_SAMPLE)):
+                with patch("heroku_manager.heroku.requests.get",
+                           return_value=_make_logplex_response(LOG_SAMPLE)):
+                    logs = dyno.get_heroku_logs()
+
+        # Should return parsed logs despite lock expiry
+        self.assertIsInstance(logs, list)
+        self.assertGreater(len(logs), 0)
+
 
 class TestExtractLatestMetric(BaseLockTestCase):
 

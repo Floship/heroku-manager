@@ -19,6 +19,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Gracefully handle lock expiry — redis_lock is a transitive dep via django-redis,
+# not a direct dep of heroku-manager.
+try:
+    from redis_lock import NotAcquired as _NotAcquired
+except ImportError:
+    class _NotAcquired(Exception):
+        pass
+
 
 # Dyno size hierarchy with memory mapping
 DYNO_SIZES = {
@@ -465,7 +473,7 @@ class HerokuDyno:
                 return None
 
             try:
-                response = requests.request(method, url, headers=headers, json=data)
+                response = requests.request(method, url, headers=headers, json=data, timeout=30)
             except (SSLError, ConnectionError, Timeout) as exc:
                 if attempt < max_attempts:
                     wait = min(4 * (2 ** (attempt - 1)), 30)
@@ -999,17 +1007,20 @@ class HerokuDyno:
         """
         # Make sure only one dyno is checking for zombie dynos at a time
         zombie_threshold = getattr(settings, 'DYNO_ZOMBIE_THRESHOLD', 24 * 60 * 60)
-        with cache.lock('heroku:lock:dyno_alive_check', expire=30):
-            siblings = [dyno for dyno in cache.keys('heroku:dyno_alive:*')]
-            for sibling in siblings:
-                last_checkin = cache.get(sibling)
-                if last_checkin:
-                    last_checkin_seconds_ago = (timezone.now() - last_checkin).total_seconds()
-                    if last_checkin_seconds_ago > zombie_threshold:
-                        last_checkin_minutes_ago = last_checkin_seconds_ago // 60
-                        dyno_name = sibling.split(':')[-1]
-                        logger.error(f"Zombie dyno detected: {dyno_name}. Last check-in: {last_checkin_minutes_ago:.0f} minutes ago. Restarting...")
-                        self.restart_zombie_dyno(dyno_name)
+        try:
+            with cache.lock('heroku:lock:dyno_alive_check', expire=30):
+                siblings = [dyno for dyno in cache.keys('heroku:dyno_alive:*')]
+                for sibling in siblings:
+                    last_checkin = cache.get(sibling)
+                    if last_checkin:
+                        last_checkin_seconds_ago = (timezone.now() - last_checkin).total_seconds()
+                        if last_checkin_seconds_ago > zombie_threshold:
+                            last_checkin_minutes_ago = last_checkin_seconds_ago // 60
+                            dyno_name = sibling.split(':')[-1]
+                            logger.error(f"Zombie dyno detected: {dyno_name}. Last check-in: {last_checkin_minutes_ago:.0f} minutes ago. Restarting...")
+                            self.restart_zombie_dyno(dyno_name)
+        except _NotAcquired:
+            logger.warning("Lock 'heroku:lock:dyno_alive_check' expired before release.")
 
     def restart_zombie_dyno(self, dyno_name):
         self.restart_dyno(dyno_name)
@@ -1049,12 +1060,15 @@ class HerokuDyno:
             )
 
         # Ensure upscale is only executed once every settings.DYNO_TIME_BETWEEN_SCALES seconds for this dyno type
-        with cache.lock(self.upscaling_cache_key, expire=30):
-            if self.is_upscaling:
-                logger.debug(f"Upscaling formation {self.formation_name} is already in progress.")
-                return
+        try:
+            with cache.lock(self.upscaling_cache_key, expire=30):
+                if self.is_upscaling:
+                    logger.debug(f"Upscaling formation {self.formation_name} is already in progress.")
+                    return
 
-            self.set_upscaling()
+                self.set_upscaling()
+        except _NotAcquired:
+            logger.warning(f"Lock '{self.upscaling_cache_key}' expired before release.")
 
         if not self.remote_monitoring:
             logger.warning(f"Memory usage is greater than {self.current_memory_usage_percentage:.2f}% of available RAM ({self.available_memory}MB). "
@@ -1204,19 +1218,22 @@ class HerokuDyno:
                 f"using previous tier {original_formation_size} as downscale target."
             )
 
-        with cache.lock(self.downscale_cache_key, expire=30):
-            # Check if formation is on lower size than original size and skip downscale
-            if self.is_on_original_formation_size_or_lower:
-                logger.debug(f"Formation {self.formation_name} is already at original or lower size than the original size.")
-                self.clear_original_formation_size()
-                return
+        try:
+            with cache.lock(self.downscale_cache_key, expire=30):
+                # Check if formation is on lower size than original size and skip downscale
+                if self.is_on_original_formation_size_or_lower:
+                    logger.debug(f"Formation {self.formation_name} is already at original or lower size than the original size.")
+                    self.clear_original_formation_size()
+                    return
 
-            # Ensure downscale is only executed once every settings.DYNO_TIME_BETWEEN_SCALES seconds for this formation type
-            if self.is_downscaling:
-                # logger.info(f"Downscaling formation {self.formation_name} is already in progress.")
-                return
+                # Ensure downscale is only executed once every settings.DYNO_TIME_BETWEEN_SCALES seconds for this formation type
+                if self.is_downscaling:
+                    # logger.info(f"Downscaling formation {self.formation_name} is already in progress.")
+                    return
 
-            self.set_downscaling()
+                self.set_downscaling()
+        except _NotAcquired:
+            logger.warning(f"Lock '{self.downscale_cache_key}' expired before release.")
 
         # Scale formation back to original size (routed through call_heroku_api for rate limiting)
         url = f'https://api.heroku.com/apps/{self.app_name}/formation/{self.formation_name}'
@@ -1242,11 +1259,14 @@ class HerokuDyno:
 
         # Ensure restart is only executed once every DYNO_TIME_BETWEEN_RESTARTS seconds for this dyno
         restart_cache_key = f'heroku:restart_dyno:{dyno_name}'
-        with cache.lock(restart_cache_key, expire=30):
-            if cache.get(restart_cache_key):
-                logger.debug(f"Restarting dyno {dyno_name} is already in progress.")
-                return False
-            cache.set(restart_cache_key, True, timeout=getattr(settings, 'DYNO_TIME_BETWEEN_RESTARTS', 300))
+        try:
+            with cache.lock(restart_cache_key, expire=30):
+                if cache.get(restart_cache_key):
+                    logger.debug(f"Restarting dyno {dyno_name} is already in progress.")
+                    return False
+                cache.set(restart_cache_key, True, timeout=getattr(settings, 'DYNO_TIME_BETWEEN_RESTARTS', 300))
+        except _NotAcquired:
+            logger.warning(f"Lock '{restart_cache_key}' expired before release.")
 
         # Restart the dyno via Heroku API (routed through call_heroku_api for rate limiting)
         url = f'https://api.heroku.com/apps/{self.app_name}/dynos/{dyno_name}'
@@ -1318,44 +1338,47 @@ class HerokuDyno:
         cache_key = f'heroku:logs:{self.app_name}:{self.dyno_name}'
         logs = cache.get(cache_key)
         if not logs:
-            with cache.lock(cache_key, expire=30):
-                logs = cache.get(cache_key)
-                if not logs:
-                    # Step 1: Set up API request to retrieve logs
-                    url = f"https://api.heroku.com/apps/{self.app_name}/log-sessions"
-                    payload = {
-                        "dyno": self.dyno_name,
-                        "tail": False,
-                        "source": source,
-                        "lines": 200  # Adjusting this almost does nothing
-                    }
+            try:
+                with cache.lock(cache_key, expire=90):
+                    logs = cache.get(cache_key)
+                    if not logs:
+                        # Step 1: Set up API request to retrieve logs
+                        url = f"https://api.heroku.com/apps/{self.app_name}/log-sessions"
+                        payload = {
+                            "dyno": self.dyno_name,
+                            "tail": False,
+                            "source": source,
+                            "lines": 200  # Adjusting this almost does nothing
+                        }
 
-                    # Step 2: Start a log session via call_heroku_api (rate-limited + retry)
-                    response = self.call_heroku_api("POST", url, data=payload)
-                    if not response:
-                        logger.warning("Failed to retrieve log session (rate-limited or network error).")
-                        return None
-                    if response.status_code >= 400:
-                        logger.warning(f"Failed to retrieve log session. Status code: {response.status_code} - {response.text}")
-                        return None
+                        # Step 2: Start a log session via call_heroku_api (rate-limited + retry)
+                        response = self.call_heroku_api("POST", url, data=payload)
+                        if not response:
+                            logger.warning("Failed to retrieve log session (rate-limited or network error).")
+                            return None
+                        if response.status_code >= 400:
+                            logger.warning(f"Failed to retrieve log session. Status code: {response.status_code} - {response.text}")
+                            return None
 
-                    log_url = response.json().get("logplex_url")
-                    if not log_url:
-                        logger.info("Log URL not found in the response.")
-                        return None
+                        log_url = response.json().get("logplex_url")
+                        if not log_url:
+                            logger.info("Log URL not found in the response.")
+                            return None
 
-                    try:
-                        log_response = requests.get(log_url, timeout=30)
-                    except (SSLError, ConnectionError, Timeout) as exc:
-                        logger.warning(f"Failed to fetch logplex URL: {exc}")
-                        return None
-                    if log_response.status_code != 200:
-                        logger.info(f"Failed to retrieve logs. Status code: {log_response.status_code} - {log_response.text}")
-                        return None
+                        try:
+                            log_response = requests.get(log_url, timeout=30)
+                        except (SSLError, ConnectionError, Timeout) as exc:
+                            logger.warning(f"Failed to fetch logplex URL: {exc}")
+                            return None
+                        if log_response.status_code != 200:
+                            logger.info(f"Failed to retrieve logs. Status code: {log_response.status_code} - {log_response.text}")
+                            return None
 
-                    logs = log_response.text or "\n" # Ensure logs is not empty to not overload API
-                    log_cache_ttl = getattr(settings, 'DYNO_LOGS_CACHE_DURATION', 90)
-                    cache.set(cache_key, logs, timeout=log_cache_ttl)
+                        logs = log_response.text or "\n" # Ensure logs is not empty to not overload API
+                        log_cache_ttl = getattr(settings, 'DYNO_LOGS_CACHE_DURATION', 90)
+                        cache.set(cache_key, logs, timeout=log_cache_ttl)
+            except _NotAcquired:
+                logger.warning(f"Lock '{cache_key}' expired before release. Logs may already be cached.")
 
         logs_parsed = []
 
