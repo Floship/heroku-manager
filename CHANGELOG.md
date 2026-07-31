@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.12 - 2026-07-31
+- **Improvement: Phase A indexed dyno registry dual writer (FP-17968).** Every dyno check-in adds the full dyno name to the app-scoped `heroku:dynos:v1:{app}` Redis sorted set with the aware check-in timestamp as its score; graceful cleanup removes the member. The logical key is transformed with the configured cache backend's `make_key()` before raw Redis commands run.
+- **Compatibility: existing metric keys and readers are unchanged.** Registry write failures are logged without breaking the established check-in or cleanup lifecycle, allowing this writer release to reach the whole fleet before indexed readers are enabled.
+- **Tests: 5 new registry tests** cover physical-key handling, add/remove commands, missing identity/backend failure, and both lifecycle seams. 334 total.
+
 ## 0.2.11 - 2026-05-20
 - **Fix: `NotAcquired` crash on lock expiry (FLOSHIP-SHIPPING-1FE).** `get_heroku_logs()` held a Redis lock with `expire=30` but made 2 HTTP calls inside (`call_heroku_api` with no timeout + `requests.get(timeout=30)`). Lock expired before `__exit__` released it, crashing the autoscaler thread with `NotAcquired`.
 - **Fix: `timeout=30` added to `requests.request()` in `call_heroku_api`.** Was missing entirely, could hang indefinitely.

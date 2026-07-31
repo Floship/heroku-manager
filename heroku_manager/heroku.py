@@ -19,6 +19,26 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _update_dyno_registry(app_name, dyno_name, score=None):
+    if not app_name or not dyno_name:
+        return False
+
+    try:
+        client = cache.client.get_client(write=True)
+        key = cache.make_key(f'heroku:dynos:v1:{app_name}')
+        if score is None:
+            client.zrem(key, dyno_name)
+        else:
+            client.zadd(key, {dyno_name: score})
+        return True
+    except Exception:
+        logger.warning(
+            "Failed to update indexed dyno registry for app %s, dyno %s.",
+            app_name, dyno_name, exc_info=True,
+        )
+        return False
+
 # Gracefully handle lock expiry — redis_lock is a transitive dep via django-redis,
 # not a direct dep of heroku-manager.
 try:
@@ -892,6 +912,7 @@ class HerokuDyno:
         # the zombie detector fires — prevents stale memory keys from blocking downscale.
         ttl = int(getattr(settings, 'DYNO_ZOMBIE_THRESHOLD', 24 * 60 * 60))
         cache.set(f'heroku:dyno_alive:{self.dyno_name}', now, timeout=ttl)
+        _update_dyno_registry(self.app_name, self.dyno_name, now.timestamp())
 
         # Publish per-dyno metrics so siblings can gate formation-wide decisions.
         mem = self.current_memory_usage
@@ -910,6 +931,7 @@ class HerokuDyno:
         dyno_name = dyno_name or self.dyno_name
         for prefix in self._DYNO_CACHE_PREFIXES:
             cache.delete(f'heroku:dyno_{prefix}:{dyno_name}')
+        _update_dyno_registry(self.app_name, dyno_name)
 
     def _iter_sibling_values(self, metric):
         """Yield ``(dyno_name, value)`` for each sibling's published metric.

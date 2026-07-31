@@ -13,7 +13,7 @@ Covers:
 """
 import time
 import unittest
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import ANY, MagicMock, patch, PropertyMock
 import django
 from django.conf import settings as django_settings
 
@@ -34,7 +34,7 @@ if not django_settings.configured:
     django.setup()
 
 from django.core.cache import cache
-from heroku_manager.heroku import HerokuDyno, DYNO_SIZES
+from heroku_manager.heroku import HerokuDyno, DYNO_SIZES, _update_dyno_registry
 
 
 def make_dyno(dyno_name="normal_worker.1", formation_size="standard-2x"):
@@ -60,6 +60,49 @@ def _isolate_dyno_type(dyno):
     isolated_type = type(f"IsolatedHerokuDyno_{id(dyno)}", (type(dyno),), {})
     dyno.__class__ = isolated_type
     return dyno
+
+
+class TestDynoRegistryWrites(unittest.TestCase):
+
+    def test_add_uses_physical_cache_key_and_full_dyno_name(self):
+        backend = MagicMock()
+        client = backend.client.get_client.return_value
+        backend.make_key.return_value = "prefix:1:heroku:dynos:v1:floship"
+
+        with patch("heroku_manager.heroku.cache", backend):
+            result = _update_dyno_registry("floship", "normal_worker.3", 123.5)
+
+        self.assertTrue(result)
+        backend.client.get_client.assert_called_once_with(write=True)
+        backend.make_key.assert_called_once_with("heroku:dynos:v1:floship")
+        client.zadd.assert_called_once_with(
+            "prefix:1:heroku:dynos:v1:floship",
+            {"normal_worker.3": 123.5},
+        )
+
+    def test_remove_uses_physical_cache_key_and_full_dyno_name(self):
+        backend = MagicMock()
+        client = backend.client.get_client.return_value
+        backend.make_key.return_value = "prefix:1:heroku:dynos:v1:floship"
+
+        with patch("heroku_manager.heroku.cache", backend):
+            result = _update_dyno_registry("floship", "normal_worker.3")
+
+        self.assertTrue(result)
+        client.zrem.assert_called_once_with(
+            "prefix:1:heroku:dynos:v1:floship",
+            "normal_worker.3",
+        )
+
+    def test_missing_identity_or_backend_error_does_not_raise(self):
+        backend = MagicMock()
+        with patch("heroku_manager.heroku.cache", backend):
+            self.assertFalse(_update_dyno_registry(None, "normal_worker.3", 123.5))
+            self.assertFalse(_update_dyno_registry("floship", None, 123.5))
+        backend.client.get_client.assert_not_called()
+
+        with patch("heroku_manager.heroku.cache", object()):
+            self.assertFalse(_update_dyno_registry("floship", "normal_worker.3", 123.5))
 
 
 class TestDownscaleMemoryThreshold(unittest.TestCase):
@@ -249,6 +292,15 @@ class TestCheckInDynoPublishesMemory(unittest.TestCase):
         dyno.check_in_dyno()
         self.assertIsNotNone(cache.get("heroku:dyno_alive:normal_worker.3"))
 
+    @patch("heroku_manager.heroku._update_dyno_registry")
+    def test_check_in_dyno_adds_registry_member(self, update_registry):
+        dyno = make_dyno("normal_worker.3")
+        type(dyno).current_memory_usage = PropertyMock(return_value=0)
+
+        dyno.check_in_dyno()
+
+        update_registry.assert_called_once_with("floship", "normal_worker.3", ANY)
+
 
 class TestRemoveDynoFromAliveCache(unittest.TestCase):
 
@@ -273,6 +325,14 @@ class TestRemoveDynoFromAliveCache(unittest.TestCase):
         dyno.remove_dyno_from_alive_cache("normal_worker.5")
         self.assertIsNone(cache.get("heroku:dyno_alive:normal_worker.5"))
         self.assertIsNone(cache.get("heroku:dyno_memory:normal_worker.5"))
+
+    @patch("heroku_manager.heroku._update_dyno_registry")
+    def test_removes_named_dyno_from_registry(self, update_registry):
+        dyno = make_dyno("normal_worker.1")
+
+        dyno.remove_dyno_from_alive_cache("normal_worker.5")
+
+        update_registry.assert_called_once_with("floship", "normal_worker.5")
 
 
 # ── Helpers shared by new test classes ───────────────────────────────────────
