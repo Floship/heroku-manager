@@ -1369,16 +1369,23 @@ class TestFormationIdleGate(BaseLockTestCase):
 
 
 class TestLockExpiryHandling(BaseLockTestCase):
-    """All cache.lock sites should handle NotAcquired gracefully when the lock
-    expires before release, instead of crashing the autoscaler thread."""
+    """All cache.lock sites handle known lock-expiry exceptions without crashing."""
 
     def _expired_lock(self):
-        """Mock lock whose __exit__ raises NotAcquired (simulating expired lock)."""
+        """Mock lock whose __exit__ raises NotAcquired."""
         from heroku_manager.heroku import _NotAcquired
         lock_cm = MagicMock()
         lock_cm.__enter__ = MagicMock(return_value=None)
         lock_cm.__exit__ = MagicMock(side_effect=_NotAcquired("Lock expired"))
         return lock_cm
+    def _expired_lock_lno(self):
+        """Mock lock whose __exit__ raises LockNotOwnedError."""
+        from heroku_manager.heroku import LockNotOwnedError
+        lock_cm = MagicMock()
+        lock_cm.__enter__ = MagicMock(return_value=None)
+        lock_cm.__exit__ = MagicMock(side_effect=LockNotOwnedError("Lock expired"))
+        return lock_cm
+
 
     def test_restart_dyno_handles_expired_lock(self):
         dyno = make_dyno()
@@ -1387,6 +1394,14 @@ class TestLockExpiryHandling(BaseLockTestCase):
                 with patch.object(dyno, "stop_continuous_autoscale"):
                     result = dyno.restart_dyno()
         # Should proceed to API call and succeed despite lock expiry
+        self.assertTrue(result)
+
+    def test_restart_handles_lock_not_owned_error(self):
+        dyno = make_dyno()
+        with patch.object(cache, "lock", return_value=self._expired_lock_lno()):
+            with patch.object(dyno, "call_heroku_api", return_value=_mock_response(202)):
+                with patch.object(dyno, "stop_continuous_autoscale"):
+                    result = dyno.restart_dyno()
         self.assertTrue(result)
 
     def test_upscale_handles_expired_lock(self):

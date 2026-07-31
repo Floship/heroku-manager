@@ -39,13 +39,24 @@ def _update_dyno_registry(app_name, dyno_name, score=None):
         )
         return False
 
-# Gracefully handle lock expiry — redis_lock is a transitive dep via django-redis,
+# Gracefully handle lock expiry.  Consumers may configure different lock backends —
+# redis_lock.django_cache.RedisCache raises redis_lock.NotAcquired, while
+# plain django-redis raises redis.exceptions.LockNotOwnedError.
 # not a direct dep of heroku-manager.
 try:
     from redis_lock import NotAcquired as _NotAcquired
+    _LockExpiryErrors = (_NotAcquired,)
 except ImportError:
     class _NotAcquired(Exception):
         pass
+    _LockExpiryErrors = (_NotAcquired,)
+
+try:
+    from redis.exceptions import LockNotOwnedError
+except ImportError:
+    class LockNotOwnedError(Exception):
+        pass
+_LockExpiryErrors += (LockNotOwnedError,)
 
 
 # Dyno size hierarchy with memory mapping
@@ -1041,7 +1052,7 @@ class HerokuDyno:
                             dyno_name = sibling.split(':')[-1]
                             logger.error(f"Zombie dyno detected: {dyno_name}. Last check-in: {last_checkin_minutes_ago:.0f} minutes ago. Restarting...")
                             self.restart_zombie_dyno(dyno_name)
-        except _NotAcquired:
+        except _LockExpiryErrors:
             logger.warning("Lock 'heroku:lock:dyno_alive_check' expired before release.")
 
     def restart_zombie_dyno(self, dyno_name):
@@ -1090,7 +1101,7 @@ class HerokuDyno:
                     _lock_proceed = False
                 else:
                     self.set_upscaling()
-        except _NotAcquired:
+        except _LockExpiryErrors:
             logger.warning(f"Lock '{self.upscaling_cache_key}' expired before release.")
         if not _lock_proceed:
             return
@@ -1256,7 +1267,7 @@ class HerokuDyno:
                     _lock_proceed = False
                 else:
                     self.set_downscaling()
-        except _NotAcquired:
+        except _LockExpiryErrors:
             logger.warning(f"Lock '{self.downscale_cache_key}' expired before release.")
         if not _lock_proceed:
             return
@@ -1293,7 +1304,7 @@ class HerokuDyno:
                     _lock_proceed = False
                 else:
                     cache.set(restart_cache_key, True, timeout=getattr(settings, 'DYNO_TIME_BETWEEN_RESTARTS', 300))
-        except _NotAcquired:
+        except _LockExpiryErrors:
             logger.warning(f"Lock '{restart_cache_key}' expired before release.")
         if not _lock_proceed:
             return False
@@ -1407,7 +1418,7 @@ class HerokuDyno:
                         logs = log_response.text or "\n" # Ensure logs is not empty to not overload API
                         log_cache_ttl = getattr(settings, 'DYNO_LOGS_CACHE_DURATION', 90)
                         cache.set(cache_key, logs, timeout=log_cache_ttl)
-            except _NotAcquired:
+            except _LockExpiryErrors:
                 logger.warning(f"Lock '{cache_key}' expired before release. Logs may already be cached.")
 
         if not logs:
