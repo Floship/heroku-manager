@@ -112,6 +112,20 @@ Operational notes:
 - Enable Heroku runtime metrics (see Installation) so memory/load signals are available.
 - Autoscaling and cleaning rely on Django cache; ensure your cache backend is configured and shared across dynos.
 
+### Indexed Dyno Registry Rollout
+
+Version 0.2.12 starts the staged registry rollout by dual-writing each dyno's
+full name and latest check-in timestamp to the app-scoped Redis sorted set
+`heroku:dynos:v1:{HEROKU_APP_NAME}`. Graceful dyno removal also removes that
+member. The key is passed through the configured cache backend's `make_key()`
+before raw Redis commands are used.
+
+This release does not change existing metric keys or readers, including their
+compatibility scans. Registry write failures are logged but do not interrupt
+the existing check-in or cleanup path. Deploy this writer across every app and
+wait two full `DYNO_ZOMBIE_THRESHOLD` cycles before a later release enables
+indexed readers or marks the registry ready.
+
 ## Django Settings
 
 When used with Django, the following settings are available:
