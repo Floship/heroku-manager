@@ -131,12 +131,12 @@ class _IndexAdapter:
             )
             return None
 
-    def fresh_members(self, cutoff):
-        """Bounded ZRANGEBYSCORE(cutoff, +inf); fresh members only."""
+    def _zrange(self, min_score, max_score):
+        """Bounded ZRANGEBYSCORE, normalized to dyno-name strings."""
         client = self._connect()
         if client is None:
             return None
-        members = client.zrangebyscore(self._index_key, f'({cutoff}', '+inf')
+        members = client.zrangebyscore(self._index_key, min_score, max_score)
         if members is None:
             return None
         # redis-py returns ZSET members as bytes; normalize to dyno-name str.
@@ -144,6 +144,14 @@ class _IndexAdapter:
             m.decode('utf-8', errors='replace') if isinstance(m, bytes) else m
             for m in members
         ]
+
+    def fresh_members(self, cutoff):
+        """Bounded ZRANGEBYSCORE(cutoff, +inf); fresh members only."""
+        return self._zrange(f'({cutoff}', '+inf')
+
+    def stale_members(self, cutoff):
+        """Bounded ZRANGEBYSCORE(-inf, cutoff); stale members (score <= cutoff)."""
+        return self._zrange('-inf', cutoff)
 
     def mget(self, keys):
         """Batched metric reads via physical keys; never one round trip per dyno."""
@@ -201,8 +209,12 @@ class _IndexAdapter:
         ]
 
     def zremrangebyscore(self, min_score, max_score):
-        client = self._connect()
-        if client is None:
+        """Prune through a write client; never write via a read replica."""
+        if self._index_key is None:
+            self._index_key = cache.make_key(f'heroku:dynos:v1:{self.app_name}')
+        try:
+            client = cache.client.get_client(write=True)
+        except AttributeError:
             return None
         return client.zremrangebyscore(self._index_key, min_score, max_score)
 
@@ -1280,58 +1292,71 @@ class HerokuDyno:
         Check if any sibling dynos are marked as alive in the cache and restart them if they
         have not checked in within the DYNO_ZOMBIE_THRESHOLD seconds.
 
-        Phase B: the indexed registry (when ready) provides the authoritative
-        member list and batched alive timestamps.  Stale index members are
-        pruned once per cycle with one bounded ZREMRANGEBYSCORE under this
-        lock.  Zombie restart is only authorized when the index is ready;
-        uncertainty (flag false/absent, incomplete reconciliation) blocks
-        restarts and the destructive reader returns immediately after the
-        prune.  The bounded compatibility SCAN remains available only to
-        non-destructive sibling readers.
+        Phase B: the indexed registry (when ready) is the authoritative member
+        list.  Stale members are evaluated for zombie restart BEFORE the one
+        bounded ZREMRANGEBYSCORE prune, which runs via try/finally on every
+        path.  One cutoff is computed and shared by the stale evaluation and
+        the prune, so no member at the boundary is pruned unevaluated.
+        Gracefully removed dynos stay absent (ZREM); missing alive values are
+        skipped.  Destructive restart requires readiness; otherwise the check
+        returns immediately after the prune.
         """
         # Make sure only one dyno is checking for zombie dynos at a time
         zombie_threshold = getattr(settings, 'DYNO_ZOMBIE_THRESHOLD', 24 * 60 * 60)
         try:
             with cache.lock('heroku:lock:dyno_alive_check', expire=30):
-                self.prune_stale_index_members()
+                cutoff = _stale_cutoff()
+                try:
+                    if self.index_ready:
+                        adapter = self._zombie_adapter()
+                        self._evaluate_zombies(
+                            adapter, adapter.stale_members(cutoff), zombie_threshold,
+                        )
+                finally:
+                    self.prune_stale_index_members(cutoff)
                 if not self.index_ready:
                     # Destructive restart requires readiness; without it the
                     # compatibility SCAN stays unavailable to this destructive
                     # reader and the check returns immediately after pruning.
                     return
-                cutoff = _stale_cutoff()
-                adapter = _IndexAdapter(self.app_name)
-                members = adapter.fresh_members(cutoff)
-                if members is None:
-                    return
-                keys = [f'heroku:dyno_alive:{m}' for m in members]
-                values = adapter.mget(keys) if keys else []
-                if values is None:
-                    return
-                siblings = [
-                    (member, value)
-                    for member, value in zip(members, values)
-                    if member != self.dyno_name
-                ]
-                for sibling, last_checkin in siblings:
-                    if last_checkin:
-                        last_checkin_seconds_ago = (timezone.now() - last_checkin).total_seconds()
-                        if last_checkin_seconds_ago > zombie_threshold:
-                            last_checkin_minutes_ago = last_checkin_seconds_ago // 60
-                            logger.error(f"Zombie dyno detected: {sibling}. Last check-in: {last_checkin_minutes_ago:.0f} minutes ago. Restarting...")
-                            self.restart_zombie_dyno(sibling)
+                self._evaluate_zombies(adapter, adapter.fresh_members(cutoff), zombie_threshold)
         except _LockExpiryErrors:
             logger.warning("Lock 'heroku:lock:dyno_alive_check' expired before release.")
 
-    def prune_stale_index_members(self):
+    def _zombie_adapter(self):
+        """Single adapter for the zombie-check read (stale + fresh members)."""
+        return _IndexAdapter(self.app_name)
+
+    def _evaluate_zombies(self, adapter, members, zombie_threshold):
+        """Restart sibling zombies from batched alive timestamps; missing skipped."""
+        if not members:
+            return
+        values = adapter.mget([f'heroku:dyno_alive:{m}' for m in members])
+        if values is None:
+            return
+        for member, last_checkin in zip(members, values):
+            if member == self.dyno_name or not last_checkin:
+                continue
+            last_checkin_seconds_ago = (timezone.now() - last_checkin).total_seconds()
+            if last_checkin_seconds_ago > zombie_threshold:
+                logger.error(
+                    f"Zombie dyno detected: {member}. Last check-in: "
+                    f"{last_checkin_seconds_ago // 60:.0f} minutes ago. Restarting..."
+                )
+                self.restart_zombie_dyno(member)
+
+    def prune_stale_index_members(self, cutoff=None):
         """Prune stale index members with one bounded ZREMRANGEBYSCORE.
 
         Must run under the zombie-check lock (callers hold it).  Never prunes
         member-by-member; a single range removal keeps cleanup O(log N).
+        ``cutoff`` defaults to a fresh ``_stale_cutoff()`` when not supplied,
+        preserving all other callers; the zombie check passes the same cutoff
+        used for stale-member evaluation so boundary members are never pruned
+        unevaluated.
         """
         try:
-            adapter = _IndexAdapter(self.app_name)
-            adapter.zremrangebyscore('-inf', _stale_cutoff())
+            _IndexAdapter(self.app_name).zremrangebyscore('-inf', cutoff if cutoff is not None else _stale_cutoff())
         except Exception:
             logger.warning(
                 "Failed to prune stale indexed dyno registry members for app %s.",

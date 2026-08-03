@@ -6,7 +6,7 @@ import os
 import time
 import unittest
 from unittest.mock import patch, MagicMock
-from tests.conftest import make_dyno, BaseLockTestCase, patch_scan_backend
+from tests.conftest import make_dyno, BaseLockTestCase
 from django.core.cache import cache
 from django.conf import settings as django_settings
 from django.utils import timezone
@@ -75,63 +75,106 @@ class TestIncrementDynoCounter(BaseLockTestCase):
 
 class TestCheckForSiblingZombieDynos(BaseLockTestCase):
 
-    def _set_alive(self, dyno_name, seconds_ago):
-        t = timezone.now() - timezone.timedelta(seconds=seconds_ago)
-        cache.set(f"heroku:dyno_alive:{dyno_name}", t, timeout=3600)
-
-    def _patch_alive_keys(self, names):
-        keys = [f"heroku:dyno_alive:{n}" for n in names]
-        return patch_scan_backend(keys)
-
-    def test_no_zombies_no_restart(self):
-        # Ready indexed path: fresh members, decoded fresh timestamps, no restart.
-        dyno = make_dyno()
-        self._set_alive("normal_worker.2", 10)  # recent
+    def _ready_backend(self, stale, fresh, alive_values):
+        """django-redis-shaped backend with distinct stale/fresh member sets."""
         backend = MagicMock()
         client = MagicMock()
         client.zscore.return_value = time.time()
-        client.zrangebyscore.return_value = ["normal_worker.1", "normal_worker.2"]
-        client.mget.return_value = [pickle.dumps(timezone.now()), pickle.dumps(timezone.now())]
-        client.scan.return_value = (
-            0,
-            ["heroku:dyno_alive:normal_worker.1", "heroku:dyno_alive:normal_worker.2"],
-        )
+        client.zrangebyscore.side_effect = lambda key, mn, mx: stale if mn == "-inf" else fresh
+        client.mget.return_value = alive_values
+        client.scan.return_value = (0, [])
         backend.client.get_client.return_value = client
         backend.client.decode = pickle.loads
         backend.make_key.side_effect = lambda key: key
         backend.get.return_value = None
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            with patch("heroku_manager.heroku.cache", backend):
-                with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                    dyno.check_for_sibling_zombie_dynos()
+        return backend, client
+
+    def test_no_zombies_no_restart(self):
+        # Ready indexed path: fresh members, fresh alive timestamps, no restart.
+        dyno = make_dyno()
+        now = pickle.dumps(timezone.now())
+        backend, _ = self._ready_backend(
+            stale=[],
+            fresh=["normal_worker.1", "normal_worker.2"],
+            alive_values=[now, now],
+        )
+        with patch("heroku_manager.heroku.cache", backend):
+            with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
+                dyno.check_for_sibling_zombie_dynos()
         mock_restart.assert_not_called()
 
     def test_zombie_detected_and_restarted(self):
-        # Ready indexed path: stale decoded timestamp triggers one restart.
+        # Ready indexed path: fresh member whose alive timestamp is stale.
         from django.conf import settings as ds
-        dyno = make_dyno()
         threshold = ds.DYNO_ZOMBIE_THRESHOLD
-        self._set_alive("normal_worker.2", threshold + 10)  # stale
+        dyno = make_dyno()
+        old = pickle.dumps(timezone.now() - timezone.timedelta(seconds=threshold + 10))
+        backend, _ = self._ready_backend(
+            stale=[],
+            fresh=["normal_worker.1", "normal_worker.2"],
+            alive_values=[pickle.dumps(timezone.now()), old],
+        )
+        with patch("heroku_manager.heroku.cache", backend):
+            with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
+                dyno.check_for_sibling_zombie_dynos()
+        mock_restart.assert_called_once_with("normal_worker.2")
+
+    def test_stale_index_member_evaluated_and_restarted_before_prune(self):
+        # Stale member restarted from its alive timestamp BEFORE the prune
+        # removes it; the fresh set is empty, so only stale evaluation can
+        # produce this restart.
+        dyno = make_dyno()
+        threshold = django_settings.DYNO_ZOMBIE_THRESHOLD
+        backend, client = self._ready_backend(
+            stale=["normal_worker.2"], fresh=[],
+            alive_values=[pickle.dumps(timezone.now() - timezone.timedelta(seconds=threshold + 10))],
+        )
+        with patch("heroku_manager.heroku.cache", backend):
+            with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
+                dyno.check_for_sibling_zombie_dynos()
+        mock_restart.assert_called_once_with("normal_worker.2")
+        client.zremrangebyscore.assert_called_once()
+
+    def test_stale_member_missing_alive_not_restarted_but_pruned(self):
+        # Missing alive value: never restart, but the member is still pruned.
+        dyno = make_dyno()
+        backend, client = self._ready_backend(
+            stale=["normal_worker.2"], fresh=[], alive_values=[None],
+        )
+        with patch("heroku_manager.heroku.cache", backend):
+            with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
+                dyno.check_for_sibling_zombie_dynos()
+        mock_restart.assert_not_called()
+        client.zremrangebyscore.assert_called_once()
+
+    def test_alive_evaluation_ordered_before_prune(self):
+        # Alive reads must precede the single ZREMRANGEBYSCORE prune.
+        dyno = make_dyno()
+        backend, client = self._ready_backend(
+            stale=["normal_worker.2"], fresh=[],
+            alive_values=[pickle.dumps(timezone.now())],
+        )
+        with patch("heroku_manager.heroku.cache", backend):
+            dyno.check_for_sibling_zombie_dynos()
+        calls = [name for name, args, kwargs in client.method_calls]
+        self.assertLess(calls.index("mget"), calls.index("zremrangebyscore"))
+
+    def test_prune_uses_write_client_not_read_replica(self):
+        # Not-ready path: the one prune comes from get_client(write=True) and
+        # no read/replica client is acquired at all.
+        dyno = make_dyno(index_ready_seed=False)
         backend = MagicMock()
         client = MagicMock()
-        client.zscore.return_value = time.time()
-        client.zrangebyscore.return_value = ["normal_worker.1", "normal_worker.2"]
-        client.mget.return_value = [pickle.dumps(timezone.now()), pickle.dumps(
-            timezone.now() - timezone.timedelta(seconds=threshold + 10)
-        )]
-        client.scan.return_value = (
-            0,
-            ["heroku:dyno_alive:normal_worker.1", "heroku:dyno_alive:normal_worker.2"],
-        )
+        client.zremrangebyscore.return_value = 1
         backend.client.get_client.return_value = client
-        backend.client.decode = pickle.loads
         backend.make_key.side_effect = lambda key: key
         backend.get.return_value = None
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HEROKU_DYNO_INDEX_V1_READY", None)
             with patch("heroku_manager.heroku.cache", backend):
-                with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                    dyno.check_for_sibling_zombie_dynos()
-        mock_restart.assert_called_once_with("normal_worker.2")
+                dyno.check_for_sibling_zombie_dynos()
+        backend.client.get_client.assert_called_once_with(write=True)
+        client.zremrangebyscore.assert_called_once()
 
     def test_prune_runs_once_before_readiness_check_then_returns_immediately(self):
         # The zombie check prunes once under the lock; when not ready it must

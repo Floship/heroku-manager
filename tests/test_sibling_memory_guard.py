@@ -1137,7 +1137,9 @@ class TestIndexedFailClosed(unittest.TestCase):
         with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
             backend, client = self._patch_backend(client_attrs={
                 "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=["normal_worker.2"]),
+                # Fresh index members only: the stale read returns nothing so
+                # this zombie restart comes from the fresh-member evaluation.
+                "zrangebyscore": MagicMock(side_effect=lambda key, mn, mx: [] if mn == "-inf" else ["normal_worker.2"]),
                 "mget": MagicMock(return_value=[pickle.dumps(stale)]),
                 "scan": MagicMock(return_value=(0, ["heroku:dyno_alive:normal_worker.2"])),
             })
