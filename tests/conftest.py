@@ -36,11 +36,12 @@ if not django_settings.configured:
     )
     django.setup()
 
-from unittest.mock import MagicMock, PropertyMock
+from unittest.mock import MagicMock, PropertyMock, patch
 from heroku_manager.heroku import HerokuDyno, DYNO_SIZES
 
 
-def make_dyno(dyno_name="normal_worker.1", formation_size="standard-2x"):
+def make_dyno(dyno_name="normal_worker.1", formation_size="standard-2x",
+              index_ready_seed=True):
     """Minimal HerokuDyno with formation size pinned via instance cache."""
     dyno = HerokuDyno.__new__(HerokuDyno)
     dyno.app_name = "floship"
@@ -55,19 +56,179 @@ def make_dyno(dyno_name="normal_worker.1", formation_size="standard-2x"):
     dyno._thread_lock = threading.Lock()
     dyno._last_file_cleaning = None
     dyno._formation_size_cached = (formation_size, time.time())
+    if index_ready_seed:
+        # Legacy unit fixtures exercise sibling/queue/stability logic and opt
+        # into a seeded ready state so destructive-gate tests are not
+        # weakened.  Dedicated readiness tests pass index_ready_seed=False and
+        # drive the real predicate.  This is a test fixture, never a runtime
+        # branch.  Seeding is per-instance (via instance dict) so the shared
+        # production class descriptor is never mutated.
+        dyno.__dict__["index_ready"] = True
     return dyno
 
 
+def seed_index_ready(dyno, members=None):
+    """Unit-fixture helper: make the dyno report index_ready=True WITHOUT
+    touching production code (no runtime test-only branch).
+
+    The Phase B contract is: destructive actions require index readiness.
+    Legacy unit fixtures that only exercise sibling/queue/stability logic
+    therefore opt into a seeded ready state, while the dedicated readiness
+    tests still drive the real ``_index_ready`` predicate against a fake
+    django-redis client.
+    """
+    members = members or [dyno.dyno_name]
+    dyno.__dict__["index_ready"] = True
+    return dyno
+
+
+def seeded_index_ready(dyno, members=None):
+    """Context-manager form of :func:`seed_index_ready` for use in tests that
+    build the dyno before patching the cache backend."""
+    return patch.object(
+        dyno, "index_ready",
+        new_callable=PropertyMock, return_value=True,
+    )
+
+
 def patch_cache_keys(memory_store):
-    """Patch cache.keys() (locmem has none) to return from a dict."""
-    from unittest.mock import patch
-    from django.core.cache import cache
+    """Patch the raw client so SCAN serves keys from ``memory_store``.
 
-    def _keys(pattern):
-        prefix = pattern.replace(".*", ".") if ".*" in pattern else pattern
-        return [k for k in memory_store if k.startswith(prefix)]
+    LocMem has no raw client; the Phase B adapter requires one.  This helper
+    installs a django-redis-style backend proxy on top of the real LocMemCache
+    (delegating get/set/delete/lock) with ``make_key`` identity and a SCAN that
+    returns the provided logical keys — the same shape tests previously served
+    through ``cache.keys()`` mocks.
+    """
+    from django.core.cache import cache as real_cache
 
-    return patch.object(cache, "keys", side_effect=_keys, create=True)
+    class _FakeClient:
+        """Raw redis-py client with a real decode for the adapter."""
+
+        def __init__(self, backend):
+            self._backend = backend
+
+        def scan(self, cursor=0, match=None, count=None):
+            return self._backend._scan(cursor=cursor, match=match, count=count)
+
+        def zremrangebyscore(self, key, min_score, max_score):
+            return 0
+
+        def zrangebyscore(self, key, min_score, max_score):
+            # Derive fresh index members from the fixture store's metric keys
+            # so legacy ready-path fixtures (seeded index_ready) actually see
+            # their siblings through the index.
+            dynos = set()
+            for k in self._backend._store:
+                parts = k.split(":")
+                if len(parts) == 3 and parts[0] == "heroku":
+                    dynos.add(parts[2])
+            return sorted(dynos)
+
+        def zscore(self, key, member):
+            # No index ZSET in the fixture store: readiness is not derivable,
+            # so the real predicate fails closed.  Legacy destructive-gate
+            # tests seed index_ready directly and never hit this.
+            return None
+
+        def mget(self, keys):
+            import pickle
+            # Dict fixtures carry Python values (mirroring cache.set); list
+            # fixtures only name keys, so their values live in the real locmem
+            # backend behind ``_ScanBackend.get``.  Either way raw MGET results
+            # are serialized bytes, which the adapter must decode back into
+            # Python numbers/datetimes before callers compare them.
+            raw = []
+            for key in keys:
+                value = self._backend._store.get(key, None)
+                if value is None:
+                    value = self._backend.get(key)
+                raw.append(pickle.dumps(value) if value is not None else None)
+            return raw
+
+        def decode(self, value):
+            import pickle
+            return pickle.loads(value)
+
+        def zadd(self, *args, **kwargs):
+            return 1
+
+        def zrem(self, *args, **kwargs):
+            return 1
+
+    class _ScanBackend:
+        """Proxy: raw-client seam for the index adapter, LocMem for the rest."""
+
+        def __init__(self, store):
+            if isinstance(store, list):
+                # List fixtures (raw SCAN key lists) mirror the locmem cache:
+                # values live in the real backend, reachable via get().
+                self._store = {key: None for key in store}
+            else:
+                self._store = dict(store)
+            self._client = _FakeClient(self)
+            self._raw = MagicMock()
+            self._raw.get_client.return_value = self._client
+            # The production adapter captures the decoder from cache.client
+            # (the django-redis DefaultClient), so the fake backend must expose
+            # the real decode there too.
+            self._raw.decode = self._client.decode
+
+        def make_key(self, key, version=None):
+            return key
+
+        @property
+        def client(self):
+            return self._raw
+
+        def _scan(self, cursor=0, match=None, count=None):
+            pattern = match or "*"
+            if pattern.endswith("*"):
+                prefix = pattern[:-1]
+            else:
+                prefix = pattern
+            keys = [
+                key for key in self._store
+                if key.startswith(prefix)
+            ]
+            return (0, keys)
+
+        def __getattr__(self, name):
+            return getattr(real_cache, name)
+
+    return patch("heroku_manager.heroku.cache", _ScanBackend(memory_store))
+
+
+patch_scan_backend = patch_cache_keys
+
+
+def real_decoder():
+    """Real django-redis DefaultClient.decode callable for wire-format tests.
+
+    pickle.dumps(300) is not int()-parseable, so DefaultClient.decode falls
+    through to the serializer and returns 300 — proving raw MGET bytes are
+    decoded into Python values before callers compare them.  Construct inside
+    a ``patch.object(DefaultClient, 'decode', wraps=DefaultClient.decode)``
+    block to observe the decode path through the django-redis class method.
+    """
+    import pickle
+    from django_redis.client.default import DefaultClient
+    decoder = DefaultClient.__new__(DefaultClient)
+    decoder._serializer = type(
+        "S", (),
+        {"loads": staticmethod(pickle.loads), "dumps": staticmethod(pickle.dumps)},
+    )()
+    decoder._compressor = type(
+        "C", (),
+        {"decompress": staticmethod(lambda v: v), "compress": staticmethod(lambda v: v)},
+    )()
+    # Return a callable that always routes through DefaultClient.decode with a
+    # REAL instance as self.  When the class method is wrapped (patch.object
+    # with wraps=), the wrap still sees the real instance and the real
+    # serializer/compressor, so the decode path is observable and functional.
+    def _decode(raw):
+        return DefaultClient.decode(decoder, raw)
+    return _decode
 
 
 import unittest
