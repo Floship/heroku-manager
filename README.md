@@ -15,8 +15,9 @@ Redis `KEYS` command at runtime.
 Set `HEROKU_DYNO_INDEX_V1_READY=true` in an app's environment only after the
 staged rollout proof passes for that app:
 
-1. Deploy 0.2.13 with the flag unset (writers are unchanged; the compatibility
-   reader uses a bounded `SCAN` with exact-prefix filtering).
+1. Tag-pin before flag: pin the portal to this package's v0.2.13 tag (created
+   at merge time) and deploy with the flag unset (writers are unchanged; the
+   compatibility reader uses a bounded `SCAN` with exact-prefix filtering).
 2. Let at least two autoscaler check-in cycles run, obtain the expected active
    autoscaled dyno names from the Heroku Platform API/`heroku ps`, and confirm
    the fresh v1 index members contain every expected dyno in both cycles.
@@ -32,6 +33,20 @@ restart. Check-ins and safe local/sibling upscales remain allowed, and the
 bounded compatibility SCAN stays available only to those non-destructive
 readers. Clearing the flag is the immediate rollback; the compatibility scan
 remains until a later Phase C release removes it.
+
+`HEROKU_DYNO_INDEX_SCAN_CAP` (default 500) bounds the compatibility SCAN per
+reader call. When a scan exceeds the cap, the reader logs a per-app warning
+and returns no results: readiness fails closed (no destructive actions) and
+sibling-upscale evidence degrades to empty for that cycle — never a `KEYS`
+fallback. Leave the default unless the fleet legitimately exceeds 500 dynos.
+
+After enabling the flag, verify per app:
+- no `KEYS` entries in the Redis slowlog for heroku-manager readers;
+- fresh v1 index members match the `heroku ps` expected dyno names (parity);
+- a cool formation still downscales and a stale sibling is restarted once
+  (downscale/zombie behavior unchanged from the compatibility window);
+- rollback stays immediate: clearing `HEROKU_DYNO_INDEX_V1_READY` restores the
+  compatibility window.
 
 ## Features
 

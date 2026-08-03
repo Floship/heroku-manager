@@ -36,7 +36,7 @@ if not django_settings.configured:
     )
     django.setup()
 
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import MagicMock, patch
 from heroku_manager.heroku import HerokuDyno, DYNO_SIZES
 
 
@@ -65,30 +65,6 @@ def make_dyno(dyno_name="normal_worker.1", formation_size="standard-2x",
         # production class descriptor is never mutated.
         dyno.__dict__["index_ready"] = True
     return dyno
-
-
-def seed_index_ready(dyno, members=None):
-    """Unit-fixture helper: make the dyno report index_ready=True WITHOUT
-    touching production code (no runtime test-only branch).
-
-    The Phase B contract is: destructive actions require index readiness.
-    Legacy unit fixtures that only exercise sibling/queue/stability logic
-    therefore opt into a seeded ready state, while the dedicated readiness
-    tests still drive the real ``_index_ready`` predicate against a fake
-    django-redis client.
-    """
-    members = members or [dyno.dyno_name]
-    dyno.__dict__["index_ready"] = True
-    return dyno
-
-
-def seeded_index_ready(dyno, members=None):
-    """Context-manager form of :func:`seed_index_ready` for use in tests that
-    build the dyno before patching the cache backend."""
-    return patch.object(
-        dyno, "index_ready",
-        new_callable=PropertyMock, return_value=True,
-    )
 
 
 def patch_cache_keys(memory_store):

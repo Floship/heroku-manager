@@ -183,6 +183,12 @@ class _IndexAdapter:
                     continue
                 results.append(key)
             if len(results) > self.scan_cap:
+                logger.warning(
+                    "Compatibility scan for app %s exceeded cap %s (%s keys); "
+                    "readiness fails closed and sibling-upscale evidence "
+                    "degrades for this cycle (no KEYS fallback).",
+                    self.app_name, self.scan_cap, len(results),
+                )
                 return None
             if not cursor:
                 break

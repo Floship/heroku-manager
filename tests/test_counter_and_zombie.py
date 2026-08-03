@@ -6,11 +6,10 @@ import os
 import time
 import unittest
 from unittest.mock import patch, MagicMock
-from tests.conftest import make_dyno, BaseLockTestCase, patch_scan_backend, real_decoder, seed_index_ready
+from tests.conftest import make_dyno, BaseLockTestCase, patch_scan_backend
 from django.core.cache import cache
 from django.conf import settings as django_settings
 from django.utils import timezone
-from django_redis.client.default import DefaultClient
 
 
 class TestIncrementDynoCounter(BaseLockTestCase):
@@ -107,24 +106,6 @@ class TestCheckForSiblingZombieDynos(BaseLockTestCase):
                     dyno.check_for_sibling_zombie_dynos()
         mock_restart.assert_not_called()
 
-    def test_no_zombies_no_restart_legacy_fixture(self):
-        # Not-ready (flag absent): prune once, return immediately, never SCAN-restart.
-        dyno = make_dyno()
-        self._set_alive("normal_worker.2", 10)  # recent
-        backend = MagicMock()
-        client = MagicMock()
-        client.zremrangebyscore.return_value = 0
-        client.scan.side_effect = AssertionError("not-ready must not scan for zombies")
-        backend.client.get_client.return_value = client
-        backend.make_key.side_effect = lambda key: key
-        backend.get.return_value = None
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("HEROKU_DYNO_INDEX_V1_READY", None)
-            with patch("heroku_manager.heroku.cache", backend):
-                with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                    dyno.check_for_sibling_zombie_dynos()
-        mock_restart.assert_not_called()
-
     def test_zombie_detected_and_restarted(self):
         # Ready indexed path: stale decoded timestamp triggers one restart.
         from django.conf import settings as ds
@@ -151,84 +132,6 @@ class TestCheckForSiblingZombieDynos(BaseLockTestCase):
                 with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
                     dyno.check_for_sibling_zombie_dynos()
         mock_restart.assert_called_once_with("normal_worker.2")
-
-    def test_zombie_detected_and_restarted_legacy_fixture(self):
-        # Same ready indexed path; kept as a named legacy-fixture regression so
-        # the conftest-seeded ready state is exercised end to end.
-        dyno = make_dyno()
-        threshold = django_settings.DYNO_ZOMBIE_THRESHOLD
-        self._set_alive("normal_worker.2", threshold + 10)
-        backend = MagicMock()
-        client = MagicMock()
-        client.zscore.return_value = time.time()
-        client.zrangebyscore.return_value = ["normal_worker.1", "normal_worker.2"]
-        client.mget.return_value = [
-            pickle.dumps(timezone.now()),
-            pickle.dumps(timezone.now() - timezone.timedelta(seconds=threshold + 10)),
-        ]
-        client.scan.return_value = (
-            0,
-            ["heroku:dyno_alive:normal_worker.1", "heroku:dyno_alive:normal_worker.2"],
-        )
-        backend.client.get_client.return_value = client
-        backend.client.decode = pickle.loads
-        backend.make_key.side_effect = lambda key: key
-        backend.get.return_value = None
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            with patch("heroku_manager.heroku.cache", backend):
-                with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                    dyno.check_for_sibling_zombie_dynos()
-        mock_restart.assert_called_once_with("normal_worker.2")
-
-    def test_ready_indexed_zombie_restart(self):
-        # Phase B: with readiness, the zombie check reads fresh index members,
-        # MGETs serialized alive timestamps, decodes them through
-        # django-redis, and restarts a stale sibling.
-        from django.conf import settings as ds
-        dyno = make_dyno()
-        threshold = ds.DYNO_ZOMBIE_THRESHOLD
-        stale = timezone.now() - timezone.timedelta(seconds=threshold + 10)
-        backend = MagicMock()
-        client = MagicMock()
-        client.zscore.return_value = time.time()
-        client.zrangebyscore.return_value = ["normal_worker.1", "normal_worker.2"]
-        client.mget.return_value = [pickle.dumps(timezone.now()), pickle.dumps(stale)]
-        client.scan.return_value = (
-            0,
-            ["heroku:dyno_alive:normal_worker.1", "heroku:dyno_alive:normal_worker.2"],
-        )
-        backend.client.get_client.return_value = client
-        backend.make_key.side_effect = lambda key: key
-        backend.get.return_value = None
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            with patch("heroku_manager.heroku.cache", backend):
-                with patch.object(DefaultClient, "decode", wraps=DefaultClient.decode) as decode:
-                    backend.client.decode = real_decoder()
-                    with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                        dyno.check_for_sibling_zombie_dynos()
-        mock_restart.assert_called_once_with("normal_worker.2")
-        self.assertGreaterEqual(decode.call_count, 1)
-
-    def test_ready_indexed_no_zombies_no_restart(self):
-        dyno = make_dyno()
-        backend = MagicMock()
-        client = MagicMock()
-        client.zscore.return_value = time.time()
-        client.zrangebyscore.return_value = ["normal_worker.1", "normal_worker.2"]
-        client.mget.return_value = [pickle.dumps(timezone.now()), pickle.dumps(timezone.now())]
-        client.scan.return_value = (
-            0,
-            ["heroku:dyno_alive:normal_worker.1", "heroku:dyno_alive:normal_worker.2"],
-        )
-        backend.client.get_client.return_value = client
-        backend.client.decode = pickle.loads
-        backend.make_key.side_effect = lambda key: key
-        backend.get.return_value = None
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            with patch("heroku_manager.heroku.cache", backend):
-                with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                    dyno.check_for_sibling_zombie_dynos()
-        mock_restart.assert_not_called()
 
     def test_prune_runs_once_before_readiness_check_then_returns_immediately(self):
         # The zombie check prunes once under the lock; when not ready it must

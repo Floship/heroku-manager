@@ -37,7 +37,7 @@ if not django_settings.configured:
     django.setup()
 
 from django.core.cache import cache
-from tests.conftest import patch_scan_backend, real_decoder, seed_index_ready
+from tests.conftest import patch_scan_backend, real_decoder
 from heroku_manager.heroku import HerokuDyno, DYNO_SIZES, _update_dyno_registry
 
 
@@ -1039,19 +1039,23 @@ class TestIndexedFailClosed(unittest.TestCase):
         # never authorize a downscale even when memory is cool.
         dyno = self._cool_full_dyno()
         with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "false"}, clear=False):
-            backend, _ = self._patch_backend(client_attrs={
+            backend, client = self._patch_backend(client_attrs={
                 "scan": MagicMock(return_value=(0, [])),
             })
             backend.get.return_value = None
             self.assertFalse(dyno.allow_downscale)
+        client.zscore.assert_not_called()
+        client.scan.assert_not_called()
 
     def test_flag_false_blocks_shutdown_downscale(self):
         dyno = self._cool_full_dyno()
         with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "false"}, clear=False):
-            self._patch_backend(client_attrs={
+            _, client = self._patch_backend(client_attrs={
                 "scan": MagicMock(return_value=(0, [])),
             })
             self.assertFalse(dyno.allow_downscale_on_shutdown)
+        client.zscore.assert_not_called()
+        client.scan.assert_not_called()
 
     def test_flag_absent_blocks_formation_idle(self):
         dyno = self._cool_full_dyno()
@@ -1098,7 +1102,7 @@ class TestIndexedFailClosed(unittest.TestCase):
         dyno = self._dyno("normal_worker.1")
         stale = timezone.now() - timezone.timedelta(seconds=django_settings.DYNO_ZOMBIE_THRESHOLD + 10)
         with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "false"}, clear=False):
-            backend, _ = self._patch_backend(client_attrs={
+            backend, client = self._patch_backend(client_attrs={
                 "scan": MagicMock(return_value=(0, ["heroku:dyno_alive:normal_worker.2"])),
                 "zremrangebyscore": MagicMock(return_value=1),
             })
@@ -1106,6 +1110,8 @@ class TestIndexedFailClosed(unittest.TestCase):
             with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
                 dyno.check_for_sibling_zombie_dynos()
         mock_restart.assert_not_called()
+        client.zscore.assert_not_called()
+        client.scan.assert_not_called()
 
     def test_flag_false_still_prunes_stale_index_members_once(self):
         # Prune is a non-destructive cleanup: it must run once under the lock
@@ -1121,6 +1127,8 @@ class TestIndexedFailClosed(unittest.TestCase):
                 dyno.check_for_sibling_zombie_dynos()
         client.zremrangebyscore.assert_called_once()
         mock_restart.assert_not_called()
+        client.zscore.assert_not_called()
+        client.scan.assert_not_called()
 
     def test_flag_true_zombie_restart_uses_index_members(self):
         import pickle
@@ -1494,6 +1502,7 @@ class TestIndexedPhysicalKeyContract(unittest.TestCase):
             "prefix:1:heroku:dyno_memory:normal_worker.*",
         )
 
+
     def test_not_ready_compat_scan_still_detects_hot_sibling_for_upscale(self):
         # Non-destructive sibling upscale evidence must remain available in the
         # not-ready compatibility-SCAN window.
@@ -1510,6 +1519,65 @@ class TestIndexedPhysicalKeyContract(unittest.TestCase):
                 2183 if key == "heroku:dyno_memory:normal_worker.2" else None
             )
             self.assertTrue(dyno.any_sibling_requires_upscale)
+
+
+class TestScanCapExceeded(unittest.TestCase):
+    """HEROKU_DYNO_INDEX_SCAN_CAP: cap+1 keys -> None + per-app warning; no KEYS."""
+
+    def test_cap_plus_one_returns_none_and_logs_warning(self):
+        from heroku_manager.heroku import _IndexAdapter
+        backend = MagicMock()
+        client = MagicMock()
+        client.scan.return_value = (0, [
+            f"p:heroku:dyno_alive:normal_worker.{i}" for i in range(1, 4)
+        ])
+        backend.client.get_client.return_value = client
+        backend.make_key.side_effect = lambda key: f"p:{key}"
+        backend.keys = MagicMock(side_effect=AssertionError("KEYS forbidden"))
+        with patch("heroku_manager.heroku.cache", backend):
+            adapter = _IndexAdapter("floship")
+            adapter.scan_cap = 2
+            with self.assertLogs("heroku_manager.heroku", level="WARNING") as logs:
+                result = adapter.scan_keys("heroku:dyno_alive:")
+        self.assertIsNone(result)
+        self.assertTrue(any("floship" in line and "2" in line for line in logs.output))
+        backend.keys.assert_not_called()
+
+
+class TestIndexAppIsolation(unittest.TestCase):
+    """Two apps sharing one raw client must use distinct physical ZSET keys.
+
+    Legacy metric keys (``heroku:dyno_memory:{dyno}``, ...) remain unscoped
+    by app, so apps still require separate Redis endpoints even though the
+    v1 index keys are app-scoped.
+    """
+
+    def test_apps_never_share_index_members(self):
+        from heroku_manager.heroku import _IndexAdapter
+        backend = MagicMock()
+        client = MagicMock()
+        zsets = {
+            "p:heroku:dynos:v1:app-a": ["a_worker.1", "a_worker.2"],
+            "p:heroku:dynos:v1:app-b": ["b_worker.1"],
+        }
+        client.zrangebyscore.side_effect = lambda key, lo, hi: zsets[key]
+        backend.client.get_client.return_value = client
+        backend.make_key.side_effect = lambda key: f"p:{key}"
+        with patch("heroku_manager.heroku.cache", backend):
+            members_a = _IndexAdapter("app-a").fresh_members(0)
+            members_b = _IndexAdapter("app-b").fresh_members(0)
+        self.assertEqual(members_a, ["a_worker.1", "a_worker.2"])
+        self.assertEqual(members_b, ["b_worker.1"])
+        self.assertEqual(
+            client.zrangebyscore.call_args_list[0][0][0],
+            "p:heroku:dynos:v1:app-a",
+        )
+        self.assertEqual(
+            client.zrangebyscore.call_args_list[1][0][0],
+            "p:heroku:dynos:v1:app-b",
+        )
+        self.assertNotIn("b_worker.1", members_a)
+        self.assertNotIn("a_worker.1", members_b)
 
 
 if __name__ == "__main__":
