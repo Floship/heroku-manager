@@ -1302,8 +1302,12 @@ class HerokuDyno:
                 cutoff = _stale_cutoff()
                 adapter = _IndexAdapter(self.app_name)
                 members = adapter.fresh_members(cutoff)
+                if members is None:
+                    return
                 keys = [f'heroku:dyno_alive:{m}' for m in members]
                 values = adapter.mget(keys) if keys else []
+                if values is None:
+                    return
                 siblings = [
                     (member, value)
                     for member, value in zip(members, values)

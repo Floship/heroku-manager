@@ -136,11 +136,12 @@ class TestCheckForSiblingZombieDynos(BaseLockTestCase):
     def test_prune_runs_once_before_readiness_check_then_returns_immediately(self):
         # The zombie check prunes once under the lock; when not ready it must
         # return immediately (no SCAN-based restart evaluation).
-        dyno = make_dyno()
+        dyno = make_dyno(index_ready_seed=False)
         backend = MagicMock()
         client = MagicMock()
         client.zremrangebyscore.return_value = 2
         client.scan.side_effect = AssertionError("not-ready must not scan for zombies")
+        client.zscore.side_effect = AssertionError("not-ready must not zscore")
         backend.client.get_client.return_value = client
         backend.make_key.side_effect = lambda key: key
         backend.get.return_value = None
@@ -150,7 +151,28 @@ class TestCheckForSiblingZombieDynos(BaseLockTestCase):
                 with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
                     dyno.check_for_sibling_zombie_dynos()
         client.zremrangebyscore.assert_called_once()
+        client.scan.assert_not_called()
+        client.zscore.assert_not_called()
         mock_restart.assert_not_called()
+
+    def test_cached_ready_none_fresh_members_or_mget_fails_closed(self):
+        # Cached-ready dyno, but a transient adapter read returns None: the
+        # check must return immediately (no restart, no raise).
+        for members, mget_values in ((None, None), (["normal_worker.2"], None)):
+            with self.subTest(members=members):
+                dyno = make_dyno()  # cached-ready seed
+                backend = MagicMock()
+                client = MagicMock()
+                client.zremrangebyscore.return_value = 0
+                client.zrangebyscore.return_value = members
+                client.mget.return_value = mget_values
+                backend.client.get_client.return_value = client
+                backend.make_key.side_effect = lambda key: key
+                backend.get.return_value = None
+                with patch("heroku_manager.heroku.cache", backend):
+                    with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
+                        dyno.check_for_sibling_zombie_dynos()
+                mock_restart.assert_not_called()
 
     def test_restart_zombie_dyno_delegates_to_restart_dyno(self):
         dyno = make_dyno()

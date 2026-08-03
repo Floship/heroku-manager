@@ -1232,52 +1232,65 @@ class TestIndexedPrune(unittest.TestCase):
 
     def test_cap_failure_blocks_destructive_actions(self):
         # Cap exceeded: 501 keys > 500 cap → readers must fail closed (no
-        # downscale, no zombie restart) with no KEYS fallback.
+        # downscale, no zombie restart) with no KEYS fallback.  Flag true and
+        # a fresh own index score force the readiness predicate to evaluate
+        # the SCAN, which returns None at cap+1.
         dyno = self._dyno("normal_worker.1")
         many_keys = [f"heroku:dyno_alive:normal_worker.{i}" for i in range(1, 502)]
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "false"}):
-            backend, _ = self._patch_backend(client_attrs={
+        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
+            backend, client = self._patch_backend(client_attrs={
+                "zscore": MagicMock(return_value=time.time()),
+                "zrangebyscore": MagicMock(return_value=["normal_worker.1"]),
                 "scan": MagicMock(return_value=(0, many_keys)),
                 "zremrangebyscore": MagicMock(return_value=0),
             })
             backend.keys = MagicMock(side_effect=AssertionError("KEYS forbidden"))
             with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
                 dyno.check_for_sibling_zombie_dynos()
+        client.scan.assert_called_once()
         mock_restart.assert_not_called()
         backend.keys.assert_not_called()
 
     def test_no_keys_route_when_raw_client_missing(self):
         # Missing raw client → readers return uncertain, never fall back to
-        # Django cache.keys() (dynamic or lexical).
+        # Django cache.keys() (dynamic or lexical).  Flag true: the predicate
+        # must actually attempt the connection (get_client called) and fail
+        # closed.
         dyno = self._dyno("normal_worker.1")
         backend = MagicMock()
         backend.client.get_client.side_effect = AttributeError("no raw client")
         backend.make_key.side_effect = lambda key: key
         backend.get.return_value = None
         backend.keys = MagicMock(side_effect=AssertionError("KEYS forbidden"))
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "false"}):
+        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
             with patch("heroku_manager.heroku.cache", backend):
                 with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
                     dyno.check_for_sibling_zombie_dynos()
+        backend.client.get_client.assert_called()
         mock_restart.assert_not_called()
         backend.keys.assert_not_called()
 
     def test_no_keys_route_when_scan_cap_exceeded(self):
-        # Cap exceeded → uncertain, never KEYS fallback.
+        # Cap exceeded → uncertain, never KEYS fallback.  Flag true + fresh
+        # own index score: the predicate's SCAN actually exceeds the cap, so
+        # the readiness gate is proven rather than skipped by the flag.
         dyno = self._dyno("normal_worker.1")
         many_keys = [f"heroku:dyno_alive:normal_worker.{i}" for i in range(1, 502)]
         backend = MagicMock()
         client = MagicMock()
+        client.zscore.return_value = time.time()
+        client.zrangebyscore.return_value = ["normal_worker.1"]
         client.scan.return_value = (0, many_keys)
         client.zremrangebyscore.return_value = 0
         backend.client.get_client.return_value = client
         backend.make_key.side_effect = lambda key: key
         backend.get.return_value = None
         backend.keys = MagicMock(side_effect=AssertionError("KEYS forbidden"))
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "false"}):
+        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
             with patch("heroku_manager.heroku.cache", backend):
                 with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
                     dyno.check_for_sibling_zombie_dynos()
+        client.scan.assert_called_once()
         mock_restart.assert_not_called()
         backend.keys.assert_not_called()
 
