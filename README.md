@@ -2,6 +2,52 @@
 
 A Python package for managing Heroku dynos with autoscaling capabilities.
 
+## Indexed dyno registry (FP-17968)
+
+Since 0.2.12 every dyno check-in writes the full dyno name into the app-scoped
+Redis sorted set `heroku:dynos:v1:{app}` (score = check-in epoch) and graceful
+cleanup removes it. Since 0.2.13 the sibling-memory, formation-idle, and zombie
+readers consume that index instead of Redis `KEYS`. The package never issues a
+Redis `KEYS` command at runtime.
+
+### Readiness flag (default false)
+
+Set `HEROKU_DYNO_INDEX_V1_READY=true` in an app's environment only after the
+staged rollout proof passes for that app:
+
+1. Tag-pin before flag: pin the portal to this package's v0.2.13 tag (created
+   at merge time) and deploy with the flag unset (writers are unchanged; the
+   compatibility reader uses a bounded `SCAN` with exact-prefix filtering).
+2. Let at least two autoscaler check-in cycles run, obtain the expected active
+   autoscaled dyno names from the Heroku Platform API/`heroku ps`, and confirm
+   the fresh v1 index members contain every expected dyno in both cycles.
+3. Set the flag. Runtime readiness additionally requires the current dyno to
+   have a fresh v1 score and every compatibility-SCAN member to be represented
+   in the index.
+
+The flag defaults to false, and destructive actions are never authorized
+without runtime readiness. When the flag is false/absent, or when it is set
+but readiness is uncertain, incomplete, or errored, the package fails closed:
+no downscale, no formation-idle downscale authorization, and no zombie
+restart. Check-ins and safe local/sibling upscales remain allowed, and the
+bounded compatibility SCAN stays available only to those non-destructive
+readers. Clearing the flag is the immediate rollback; the compatibility scan
+remains until a later Phase C release removes it.
+
+`HEROKU_DYNO_INDEX_SCAN_CAP` (default 500) bounds the compatibility SCAN per
+reader call. When a scan exceeds the cap, the reader logs a per-app warning
+and returns no results: readiness fails closed (no destructive actions) and
+sibling-upscale evidence degrades to empty for that cycle — never a `KEYS`
+fallback. Leave the default unless the fleet legitimately exceeds 500 dynos.
+
+After enabling the flag, verify per app:
+- no `KEYS` entries in the Redis slowlog for heroku-manager readers;
+- fresh v1 index members match the `heroku ps` expected dyno names (parity);
+- a cool formation still downscales and a stale sibling is restarted once
+  (downscale/zombie behavior unchanged from the compatibility window);
+- rollback stays immediate: clearing `HEROKU_DYNO_INDEX_V1_READY` restores the
+  compatibility window.
+
 ## Features
 
 - Automatic scaling of Heroku dynos based on memory usage and load
