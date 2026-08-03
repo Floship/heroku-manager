@@ -1294,31 +1294,28 @@ class HerokuDyno:
 
         Phase B: the indexed registry (when ready) is the authoritative member
         list.  Stale members are evaluated for zombie restart BEFORE the one
-        bounded ZREMRANGEBYSCORE prune, which runs via try/finally on every
-        path.  One cutoff is computed and shared by the stale evaluation and
-        the prune, so no member at the boundary is pruned unevaluated.
+        bounded ZREMRANGEBYSCORE prune, which runs only when that evaluation
+        completes; uncertain stale reads skip the prune.  One cutoff is shared
+        by the stale evaluation and the prune, so no member at the boundary is
+        pruned unevaluated.
         Gracefully removed dynos stay absent (ZREM); missing alive values are
         skipped.  Destructive restart requires readiness; otherwise the check
-        returns immediately after the prune.
+        prunes once and returns.
         """
         # Make sure only one dyno is checking for zombie dynos at a time
         zombie_threshold = getattr(settings, 'DYNO_ZOMBIE_THRESHOLD', 24 * 60 * 60)
         try:
             with cache.lock('heroku:lock:dyno_alive_check', expire=30):
                 cutoff = _stale_cutoff()
-                try:
-                    if self.index_ready:
-                        adapter = self._zombie_adapter()
-                        self._evaluate_zombies(
-                            adapter, adapter.stale_members(cutoff), zombie_threshold,
-                        )
-                finally:
-                    self.prune_stale_index_members(cutoff)
                 if not self.index_ready:
-                    # Destructive restart requires readiness; without it the
-                    # compatibility SCAN stays unavailable to this destructive
-                    # reader and the check returns immediately after pruning.
+                    self.prune_stale_index_members(cutoff)
                     return
+                adapter = self._zombie_adapter()
+                if not self._evaluate_zombies(
+                    adapter, adapter.stale_members(cutoff), zombie_threshold,
+                ):
+                    return  # uncertain stale read: no restart, no prune
+                self.prune_stale_index_members(cutoff)
                 self._evaluate_zombies(adapter, adapter.fresh_members(cutoff), zombie_threshold)
         except _LockExpiryErrors:
             logger.warning("Lock 'heroku:lock:dyno_alive_check' expired before release.")
@@ -1328,12 +1325,19 @@ class HerokuDyno:
         return _IndexAdapter(self.app_name)
 
     def _evaluate_zombies(self, adapter, members, zombie_threshold):
-        """Restart sibling zombies from batched alive timestamps; missing skipped."""
+        """Restart sibling zombies from batched alive timestamps; missing skipped.
+
+        False only on uncertain reads (members or alive-value batch is None);
+        True when evaluation completed, including empty members and missing
+        individual alive values.
+        """
+        if members is None:
+            return False
         if not members:
-            return
+            return True
         values = adapter.mget([f'heroku:dyno_alive:{m}' for m in members])
         if values is None:
-            return
+            return False
         for member, last_checkin in zip(members, values):
             if member == self.dyno_name or not last_checkin:
                 continue
@@ -1344,6 +1348,7 @@ class HerokuDyno:
                     f"{last_checkin_seconds_ago // 60:.0f} minutes ago. Restarting..."
                 )
                 self.restart_zombie_dyno(member)
+        return True
 
     def prune_stale_index_members(self, cutoff=None):
         """Prune stale index members with one bounded ZREMRANGEBYSCORE.

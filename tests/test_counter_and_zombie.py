@@ -199,8 +199,9 @@ class TestCheckForSiblingZombieDynos(BaseLockTestCase):
         mock_restart.assert_not_called()
 
     def test_cached_ready_none_fresh_members_or_mget_fails_closed(self):
-        # Cached-ready dyno, but a transient adapter read returns None: the
-        # check must return immediately (no restart, no raise).
+        # Cached-ready dyno, but a transient stale-member or alive-value read
+        # returns None: evaluation is incomplete, so the check must return
+        # immediately (no restart, no prune, no raise).
         for members, mget_values in ((None, None), (["normal_worker.2"], None)):
             with self.subTest(members=members):
                 dyno = make_dyno()  # cached-ready seed
@@ -216,6 +217,23 @@ class TestCheckForSiblingZombieDynos(BaseLockTestCase):
                     with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
                         dyno.check_for_sibling_zombie_dynos()
                 mock_restart.assert_not_called()
+                client.zremrangebyscore.assert_not_called()
+
+    def test_stale_members_use_same_cutoff_as_prune(self):
+        # Ready path: stale-member evaluation and the prune must share one max
+        # cutoff so no boundary member is pruned unevaluated.
+        dyno = make_dyno()
+        cutoff = 12345.0
+        backend, client = self._ready_backend(
+            stale=["normal_worker.2"], fresh=[],
+            alive_values=[pickle.dumps(timezone.now())],
+        )
+        with patch("heroku_manager.heroku._stale_cutoff", return_value=cutoff):
+            with patch("heroku_manager.heroku.cache", backend):
+                dyno.check_for_sibling_zombie_dynos()
+        stale_call = [c for c in client.zrangebyscore.call_args_list if c.args[1] == "-inf"][0]
+        self.assertEqual(stale_call.args[2], cutoff)
+        self.assertEqual(client.zremrangebyscore.call_args.args[2], cutoff)
 
     def test_restart_zombie_dyno_delegates_to_restart_dyno(self):
         dyno = make_dyno()
