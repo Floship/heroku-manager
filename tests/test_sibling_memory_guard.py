@@ -1386,8 +1386,8 @@ class TestNoScanLeftInModule(unittest.TestCase):
 
 
 class TestRegistryDegradedLedger(unittest.TestCase):
-    """Phase C: a failed index write keeps the app's destructive gates closed
-    for as long as the missing writer is alive."""
+    """Phase C: a failed index write, or a re-created member list, keeps the
+    app's destructive gates closed while a live dyno can be invisible."""
 
     def setUp(self):
         cache.clear()
@@ -1415,6 +1415,10 @@ class TestRegistryDegradedLedger(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return backend, client
 
+    @staticmethod
+    def _alive_only(key):
+        return b"checked in" if "dyno_alive" in str(key) else None
+
     def test_failed_registry_write_records_the_dyno_in_the_ledger(self):
         from heroku_manager.heroku import _registry_degraded_key, _registry_degraded_ttl
         _, client = self._patch_backend()
@@ -1427,9 +1431,21 @@ class TestRegistryDegradedLedger(unittest.TestCase):
     def test_ledger_entry_of_a_live_missing_writer_is_degraded(self):
         from heroku_manager.heroku import _registry_degraded
         _, client = self._patch_backend({
-            "zrange": MagicMock(return_value=[b"web.1"]),
+            "zrange": MagicMock(return_value=[(b"web.1", 1000.0)]),
             "zscore": MagicMock(return_value=None),
-            "get": MagicMock(return_value=b"checked in"),
+            "get": MagicMock(side_effect=self._alive_only),
+        })
+        self.assertTrue(_registry_degraded(self._dyno()))
+        client.zrem.assert_not_called()
+
+    def test_ledger_keeps_an_older_score_degraded(self):
+        from heroku_manager.heroku import _registry_degraded
+        # The score predates the failed write, so it does not prove recovery;
+        # the dyno is alive and must keep the gate closed.
+        _, client = self._patch_backend({
+            "zrange": MagicMock(return_value=[(b"web.1", 2000.0)]),
+            "zscore": MagicMock(return_value=1000.0),
+            "get": MagicMock(side_effect=self._alive_only),
         })
         self.assertTrue(_registry_degraded(self._dyno()))
         client.zrem.assert_not_called()
@@ -1437,8 +1453,8 @@ class TestRegistryDegradedLedger(unittest.TestCase):
     def test_ledger_drops_a_writer_that_registered_again(self):
         from heroku_manager.heroku import _registry_degraded, _registry_degraded_key
         _, client = self._patch_backend({
-            "zrange": MagicMock(return_value=["web.1"]),
-            "zscore": MagicMock(return_value=time.time()),
+            "zrange": MagicMock(return_value=[(b"web.1", 1000.0)]),
+            "zscore": MagicMock(return_value=2000.0),
         })
         self.assertFalse(_registry_degraded(self._dyno()))
         client.zrem.assert_called_once_with(_registry_degraded_key("floship"), "web.1")
@@ -1446,17 +1462,46 @@ class TestRegistryDegradedLedger(unittest.TestCase):
     def test_ledger_drops_a_dyno_that_is_gone(self):
         from heroku_manager.heroku import _registry_degraded
         _, client = self._patch_backend({
-            "zrange": MagicMock(return_value=["web.1"]),
+            "zrange": MagicMock(return_value=[(b"web.1", 1000.0)]),
             "zscore": MagicMock(return_value=None),
             "get": MagicMock(return_value=None),
         })
         self.assertFalse(_registry_degraded(self._dyno()))
         client.zrem.assert_called_once()
 
+    def test_full_ledger_batch_fails_closed(self):
+        from heroku_manager.heroku import _registry_degraded, _DEGRADED_LEDGER_LIMIT
+        entries = [(b"web.%d" % i, 1000.0) for i in range(_DEGRADED_LEDGER_LIMIT)]
+        _, client = self._patch_backend({
+            "zrange": MagicMock(return_value=entries),
+            "zscore": MagicMock(return_value=2000.0),
+        })
+        # Every inspected entry recovered, but a full batch cannot prove that
+        # no later entry names a live missing writer.
+        self.assertTrue(_registry_degraded(self._dyno()))
+        self.assertEqual(client.zrem.call_count, _DEGRADED_LEDGER_LIMIT)
+
     def test_ledger_read_failure_is_degraded(self):
         from heroku_manager.heroku import _registry_degraded
         self._patch_backend({"zrange": MagicMock(side_effect=RuntimeError("redis down"))})
         self.assertTrue(_registry_degraded(self._dyno()))
+
+    def test_recreated_member_list_publishes_the_reconvergence_marker(self):
+        from heroku_manager.heroku import _registry_reconverging_key
+        backend, client = self._patch_backend({"exists": MagicMock(return_value=0)})
+        self.assertTrue(_update_dyno_registry("floship", "web.1", score=123))
+        backend.set.assert_called_once_with(_registry_reconverging_key("floship"), True, timeout=60)
+        client.zadd.assert_called_once()
+
+    def test_reconvergence_marker_blocks_destructive_actions(self):
+        dyno = self._dyno(seeded_ready=True)
+        self._patch_backend({
+            "get": MagicMock(side_effect=lambda key: b"1" if "reconverging" in str(key) else None),
+        })
+        self.assertTrue(dyno.index_ready)  # cached before the fleet re-registered
+        self.assertFalse(dyno.allow_downscale)
+        self.assertFalse(dyno.allow_downscale_on_shutdown)
+        self.assertFalse(dyno.is_formation_idle)
 
     def test_ledger_published_after_readiness_was_cached_still_blocks(self):
         # The fixture seeds index_ready=True, which stands for a readiness
@@ -1464,9 +1509,9 @@ class TestRegistryDegradedLedger(unittest.TestCase):
         # still stop the resize at the decision point.
         dyno = self._dyno(seeded_ready=True)
         self._patch_backend({
-            "zrange": MagicMock(return_value=[b"web.1"]),
+            "zrange": MagicMock(return_value=[(b"web.1", 1000.0)]),
             "zscore": MagicMock(return_value=None),
-            "get": MagicMock(return_value=b"checked in"),
+            "get": MagicMock(side_effect=self._alive_only),
         })
         self.assertTrue(dyno.index_ready)  # cached before the failure landed
         self.assertFalse(dyno.allow_downscale)

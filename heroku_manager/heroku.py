@@ -189,6 +189,29 @@ def _registry_degraded_key(app_name):
     return f'heroku:dynos:v1:{app_name}:degraded'
 
 
+def _registry_reconverging_key(app_name):
+    """Marker for a re-created member list whose fleet is still re-registering."""
+    return f'heroku:dynos:v1:{app_name}:reconverging'
+
+
+def _mark_registry_reconverging(app_name):
+    """Give a re-created member list one check-in interval to fill in.
+
+    A missing app ZSET means a first deploy or an eviction, and the fleet only
+    re-registers over the next autoscale interval.  Until then a one-member
+    list must not authorize a resize, so the writer publishes this marker for
+    two intervals (best effort).
+    """
+    timeout = max(60, int(getattr(settings, 'DYNO_AUTOSCALE_INTERVAL', 30)) * 2)
+    try:
+        cache.set(_registry_reconverging_key(app_name), True, timeout=timeout)
+    except Exception:
+        logger.warning(
+            "Failed to publish the dyno registry reconvergence marker for app %s.",
+            app_name, exc_info=True,
+        )
+
+
 def _registry_degraded_ttl():
     """Ledger lifetime: two zombie windows after the last recorded failure."""
     return 2 * int(getattr(settings, 'DYNO_ZOMBIE_THRESHOLD', 24 * 60 * 60))
@@ -215,15 +238,16 @@ def _mark_registry_degraded(app_name, dyno_name):
 
 
 def _registry_degraded(instance):
-    """Uncached read of the app's failed-writer ledger (primary read).
+    """Uncached read of the app's failure ledger and reconvergence marker.
 
-    True when the ledger names a dyno that is alive but absent from the only
-    member list, which means a sibling workload can be invisible to every
-    destructive gate.  Entries clear themselves: a dyno that registers again
-    (fresh index score) or that is gone (its liveness key expired) drops out
-    of the ledger.  Any read failure counts as degraded, because the callers
-    authorize a resize; a missing raw client is left to ``index_ready``, which
-    already fails closed for it.
+    True when the ledger names a dyno that is alive but not registered since
+    its failed write, or when the member list was re-created and the fleet is
+    still re-registering; either way a sibling workload can be invisible to
+    every destructive gate.  A ledger entry clears only on proof: a score
+    newer than the recorded failure means that dyno registered again, and a
+    gone liveness key means the dyno is no longer live.  Any read failure
+    counts as degraded, because the callers authorize a resize; a missing raw
+    client is left to ``index_ready``, which already fails closed for it.
     """
     if not instance.app_name:
         return True
@@ -232,20 +256,24 @@ def _registry_degraded(instance):
         client = adapter._connect()
         if client is None:
             return False
+        if client.get(cache.make_key(_registry_reconverging_key(instance.app_name))) is not None:
+            return True  # re-created member list: the fleet is re-registering
         ledger = cache.make_key(_registry_degraded_key(instance.app_name))
-        members = client.zrange(ledger, 0, _DEGRADED_LEDGER_LIMIT - 1) or []
-        if not members:
+        entries = client.zrange(ledger, 0, _DEGRADED_LEDGER_LIMIT - 1, withscores=True) or []
+        if not entries:
             return False
-        cutoff = _stale_cutoff()
-        for raw in members:
-            member = raw.decode('utf-8', errors='replace') if isinstance(raw, bytes) else raw
+        for raw_member, failure_time in entries:
+            member = raw_member.decode('utf-8', errors='replace') if isinstance(raw_member, bytes) else raw_member
             score = client.zscore(adapter._index_key, member)
-            if score is not None and score > cutoff:
-                client.zrem(ledger, member)  # registered again
+            if score is not None and score > failure_time:
+                client.zrem(ledger, member)  # registered again after the failure
                 continue
             if client.get(cache.make_key(f'heroku:dyno_alive:{member}')) is not None:
-                return True  # alive, but missing from the member list
+                return True  # alive, but not registered since that failure
             client.zrem(ledger, member)  # gone: its liveness key expired
+        if len(entries) >= _DEGRADED_LEDGER_LIMIT:
+            # A full batch cannot prove that no later entry names a live writer.
+            return True
         return False
     except Exception:
         logger.warning(
@@ -265,6 +293,9 @@ def _update_dyno_registry(app_name, dyno_name, score=None):
         if score is None:
             client.zrem(key, dyno_name)
         else:
+            if not client.exists(key):
+                # First deploy or an eviction: the list is not a fleet yet.
+                _mark_registry_reconverging(app_name)
             client.zadd(key, {dyno_name: score})
         return True
     except Exception:

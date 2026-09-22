@@ -33,12 +33,14 @@ at the decision point, so a marker published after a readiness check still
 stops the resize. The sibling metric reads keep the read client.
 A registry write that raises records the dyno name in
 `heroku:dynos:v1:{app}:degraded`, and readiness fails closed for the whole app
-while that ledger names a live dyno. Readiness and the destructive gates read
-the ledger uncached through the write client, never a replica, so a failure
-recorded after a readiness check still stops the resize. An entry clears
-itself when the dyno registers again or when its liveness key expires; an
-evicted ZSET needs no entry, because every dyno re-registers within one
-autoscale interval. The sibling metric reads keep the read client.
+while that ledger names a live dyno. A check-in that finds the member list
+missing - first deploy, or an eviction - marks
+`heroku:dynos:v1:{app}:reconverging` for two autoscale intervals, because the
+fleet only re-registers over the next interval. Readiness and the destructive
+gates read both markers uncached through the write client, never a replica, so
+a failure recorded after a readiness check still stops the resize. A ledger
+entry clears only on proof: an index score newer than the recorded failure, or
+a missing liveness key. The sibling metric reads keep the read client.
 
 Deploy prerequisites, all of which held for every Floship app at release time:
 

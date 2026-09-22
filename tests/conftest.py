@@ -111,9 +111,12 @@ def patch_index_backend(memory_store):
                 value = self._backend.get(key)
             return pickle.dumps(value) if value is not None else None
 
-        def zrange(self, key, start, end):
+        def zrange(self, key, start, end, withscores=False):
             # No failed-writer ledger in the fixture store: never degraded.
             return []
+
+        def exists(self, key):
+            return 1 if key in self._backend._store else 0
 
         def mget(self, keys):
             import pickle
