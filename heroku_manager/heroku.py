@@ -21,30 +21,25 @@ logger = logging.getLogger(__name__)
 
 
 def _index_ready(instance):
-    """Phase B runtime readiness for the indexed dyno registry (fail closed).
+    """Phase C runtime readiness for the indexed dyno registry (fail closed).
 
-    Ready only when ALL of: the per-app rollout flag is true (default false),
-    the current dyno has a fresh v1 index score, and every member found by the
-    compatibility SCAN is represented in the index.  Any uncertainty means the
-    index may undercount, so destructive actions must not be authorized.
+    The app ZSET is the only member list: the compatibility SCAN was removed
+    after the migration window, so every writer runs this package version or
+    later.  Readiness is the current dyno's own fresh index score - a dyno that
+    cannot prove its writer works must not authorize destructive actions
+    (downscale, formation-idle downscale, zombie restart).  Any uncertainty
+    fails closed; ordinary check-ins and safe upscale behavior stay available.
     """
-    if os.environ.get('HEROKU_DYNO_INDEX_V1_READY', '').lower() != 'true':
-        return False
     if not instance.app_name or not instance.dyno_name:
         return False
     cutoff = _stale_cutoff()
     try:
         adapter = _IndexAdapter(instance.app_name)
         client = adapter._connect()
+        if client is None:
+            return False  # no raw client → cannot prove the index → fail closed
         own_score = client.zscore(adapter._index_key, instance.dyno_name)
-        if own_score is None or own_score <= cutoff:
-            return False
-        members = adapter.fresh_members(cutoff)
-        scanned_keys = adapter.scan_keys('heroku:dyno_alive:')
-        if scanned_keys is None:
-            return False  # cap exceeded / error → incomplete → not ready
-        scanned = [key.split(':')[-1] for key in scanned_keys]
-        return all(member in members for member in scanned)
+        return own_score is not None and own_score > cutoff
     except Exception:
         logger.warning(
             "Indexed dyno registry readiness check failed for app %s; failing "
@@ -56,9 +51,8 @@ def _index_ready(instance):
 def _index_fail_closed(instance):
     """True when index readiness is uncertain: destructive actions (downscale,
     formation-idle authorization, zombie restart) are only authorized when the
-    indexed registry is runtime-ready.  Flag false/absent means readiness is
-    false, so destructive actions fail closed; the compatibility SCAN remains
-    available only to non-destructive sibling readers/safe upscale.
+    current dyno proves a fresh index score.  Sibling readers read the same
+    index and yield nothing on an uncertain read.
     """
     return not instance.index_ready
 
@@ -74,7 +68,7 @@ class _IndexAdapter:
 
     Centralizes physical-key derivation (``cache.make_key``) and keeps all
     Redis access inside one seam.  Every read here is bounded: sorted-set
-    range operations plus a bounded SCAN; no KEYS.
+    range operations and batched MGET; no SCAN, no KEYS.
     """
 
     def __init__(self, app_name):
@@ -82,10 +76,6 @@ class _IndexAdapter:
         self._client = None
         self._index_key = None
         self._decoder = None
-        # ponytail: hard cap on compatibility-scan results.  A fleet exceeding
-        # this means the index is out of sync; readers fail closed until
-        # reconciliation instead of scanning unbounded.
-        self.scan_cap = int(os.environ.get('HEROKU_DYNO_INDEX_SCAN_CAP', 500))
 
     def _connect(self):
         if self._client is None:
@@ -163,50 +153,6 @@ class _IndexAdapter:
         if raw_values is None:
             return None
         return [self.decode(value) for value in raw_values]
-
-    def scan_keys(self, prefix, count=1000):
-        """Bounded SCAN over physical keys with exact-prefix filtering.
-
-        Returns logical keys (physical prefix stripped).  Raw bytes returned by
-        redis-py are normalized.  None on error or when the cap is exceeded —
-        never a KEYS fallback.
-        """
-        client = self._connect()
-        if client is None:
-            return None
-        physical_prefix = cache.make_key(prefix)
-        match = f'{physical_prefix}*'
-        results = []
-        cursor = 0
-        while True:
-            result = client.scan(cursor=cursor, match=match, count=count)
-            try:
-                cursor, keys = result
-            except (TypeError, ValueError):
-                return None  # malformed scan result → uncertain, fail closed
-            for key in keys:
-                if isinstance(key, bytes):
-                    key = key.decode('utf-8', errors='replace')
-                if not key.startswith(physical_prefix):
-                    continue
-                results.append(key)
-            if len(results) > self.scan_cap:
-                logger.warning(
-                    "Compatibility scan for app %s exceeded cap %s (%s keys); "
-                    "readiness fails closed and sibling-upscale evidence "
-                    "degrades for this cycle (no KEYS fallback).",
-                    self.app_name, self.scan_cap, len(results),
-                )
-                return None
-            if not cursor:
-                break
-        # Reconstruct full logical keys: physical prefix stripped, logical
-        # prefix prepended, so callers keep working with logical key names.
-        return [
-            prefix + key[len(physical_prefix):]
-            for key in results
-            if key.startswith(physical_prefix)
-        ]
 
     def zremrangebyscore(self, min_score, max_score):
         """Prune through a write client; never write via a read replica."""
@@ -445,10 +391,10 @@ class HerokuDyno:
 
     @cached_property
     def index_ready(self):
-        """Phase B runtime readiness predicate for this dyno (fail closed).
+        """Phase C runtime readiness predicate for this dyno (fail closed).
 
         Cached for one autoscale cycle: ``check_in_dyno`` resets it, so the
-        compatibility SCAN runs at most once per cycle (readiness is reused by
+        own-member ZSCORE runs at most once per cycle (readiness is reused by
         the sibling-memory, load, and zombie readers).
         """
         return _index_ready(self)
@@ -1136,8 +1082,8 @@ class HerokuDyno:
     # Registers dyno as alive in redis cache table so other workers can check if it's alive and restart it if it doesn't respond for a while
     def check_in_dyno(self):
         now = timezone.now()
-        # Reset per-cycle readiness so the compatibility SCAN is recomputed
-        # once per autoscale cycle, not per reader.
+        # Reset per-cycle readiness so the own-member ZSCORE is recomputed once
+        # per autoscale cycle, not per reader.
         self.__dict__.pop('index_ready', None)
         # Use DYNO_ZOMBIE_THRESHOLD as the TTL so crashed dynos auto-expire before
         # the zombie detector fires — prevents stale memory keys from blocking downscale.
@@ -1170,43 +1116,27 @@ class HerokuDyno:
         ``metric`` is the cache key infix, e.g. ``'memory'`` or ``'load'``.
         Only siblings of the same formation are returned (own dyno is skipped).
 
-        Phase B: when the indexed registry is ready, members come from a bounded
-        ZRANGEBYSCORE on the app ZSET and values are batched with MGET.  During
-        the mixed-version window the same semantics are served by a bounded SCAN
-        with exact-prefix filtering — never KEYS.
+        Phase C: the app ZSET is the only member list.  Members come from one
+        bounded ZRANGEBYSCORE and values are batched with MGET; an uncertain
+        read yields nothing, because a reader that cannot list the fleet must
+        not present a partial answer as a full one.
         """
-        own_key = f'heroku:dyno_{metric}:{self.dyno_name}'
-        prefix = f'heroku:dyno_{metric}:{self.formation_name}.'
         cutoff = _stale_cutoff()
         adapter = _IndexAdapter(self.app_name)
-        if self.index_ready:
-            members = adapter.fresh_members(cutoff)
-            if members is None:
-                return
-            members = [
-                m for m in members
-                if m.startswith(f'{self.formation_name}.') and m != self.dyno_name
-            ]
-            keys = [f'heroku:dyno_{metric}:{m}' for m in members]
-            values = adapter.mget(keys) if keys else []
-            if values is None:
-                return
-            for member, value in zip(members, values):
-                if value is not None:
-                    yield member, value
+        members = adapter.fresh_members(cutoff)
+        if members is None:
+            return  # uncertain member read → yield nothing, never a partial fleet
+        members = [
+            m for m in members
+            if m.startswith(f'{self.formation_name}.') and m != self.dyno_name
+        ]
+        keys = [f'heroku:dyno_{metric}:{m}' for m in members]
+        values = adapter.mget(keys) if keys else []
+        if values is None:
             return
-        # Mixed window: bounded SCAN, exact prefix.  None (cap exceeded / error)
-        # means the fleet is larger than expected — fail closed by yielding
-        # nothing and letting the destructive-action gates see an empty set.
-        keys = adapter.scan_keys(prefix)
-        if keys is None:
-            return  # raw client unavailable/cap exceeded → uncertain, no KEYS
-        for key in keys:
-            if key == own_key:
-                continue
-            value = cache.get(key)
+        for member, value in zip(members, values):
             if value is not None:
-                yield key.split(':')[-1], value
+                yield member, value
 
     @property
     def any_sibling_still_high_memory(self):
@@ -1292,8 +1222,9 @@ class HerokuDyno:
         Check if any sibling dynos are marked as alive in the cache and restart them if they
         have not checked in within the DYNO_ZOMBIE_THRESHOLD seconds.
 
-        Phase B: the indexed registry (when ready) is the authoritative member
-        list.  Stale members are evaluated for zombie restart BEFORE the one
+        Phase C: the app ZSET is the authoritative member list and the only
+        one; no compatibility SCAN remains.  Stale members are evaluated for
+        zombie restart BEFORE the one
         bounded ZREMRANGEBYSCORE prune, which runs only when that evaluation
         completes; uncertain stale reads skip the prune.  One cutoff is shared
         by the stale evaluation and the prune, so no member at the boundary is

@@ -34,7 +34,7 @@ from unittest.mock import patch, MagicMock, PropertyMock, call
 from django.core.cache import cache
 from django.utils import timezone
 
-from tests.conftest import make_dyno, BaseLockTestCase, patch_cache_keys
+from tests.conftest import make_dyno, BaseLockTestCase, patch_index_backend
 
 
 def _mock_response(status=200):
@@ -112,7 +112,7 @@ class TestPhantomUpscaleUntilOnOriginalFormation(BaseLockTestCase):
         cache.set(dyno.original_size_cache_key,
                   {"size": "standard-2x", "time": timezone.now()}, timeout=None)
 
-        with patch_cache_keys({}):
+        with patch_index_backend({}):
             _apply_dyno_patches(dyno, {"current_memory_usage": 500.0,
                                        "current_memory_usage_percentage": 48.8},
                                 dyno.check_and_downscale_to_original_formation_size)
@@ -199,7 +199,7 @@ class TestPhantomExtendLoopOnOriginalFormation(BaseLockTestCase):
         cache.set(dyno.upscale_until_cache_key,
                   timezone.now() + timedelta(seconds=200), timeout=200)
 
-        with patch_cache_keys({}):
+        with patch_index_backend({}):
             with patch.object(cache, "ttl", return_value=50):
                 _apply_dyno_patches(dyno, {"current_memory_usage": 400.0,
                                            "current_memory_usage_percentage": 39.1},
@@ -330,7 +330,7 @@ class TestLegitimateUpscaleNotCleared(BaseLockTestCase):
         until = timezone.now() + timedelta(seconds=100)
         cache.set(dyno.upscale_until_cache_key, until, timeout=300)
 
-        with patch_cache_keys({}):
+        with patch_index_backend({}):
             with patch.object(cache, "ttl", return_value=50):
                 _apply_dyno_patches(dyno, {"current_memory_usage": 350.0,
                                            "current_memory_usage_percentage": 34.2},
@@ -349,7 +349,7 @@ class TestLegitimateUpscaleNotCleared(BaseLockTestCase):
         until = timezone.now() + timedelta(seconds=200)
         cache.set(dyno.upscale_until_cache_key, until, timeout=300)
 
-        with patch_cache_keys({}):
+        with patch_index_backend({}):
             with patch.object(cache, "ttl", return_value=50):
                 _apply_dyno_patches(dyno, {"current_memory_usage": 900.0,
                                            "current_memory_usage_percentage": 35.2},
@@ -389,7 +389,7 @@ class TestNearExpiryLegitimateDownscale(BaseLockTestCase):
         cache.set(dyno.upscale_until_cache_key,
                   timezone.now() + timedelta(seconds=50), timeout=50)
 
-        with patch_cache_keys({}):
+        with patch_index_backend({}):
             with patch.object(cache, "ttl", return_value=50):
                 with patch.object(dyno, "downscale_formation_to_original_size") as mock_ds:
                     _apply_dyno_patches(dyno, {
@@ -407,7 +407,7 @@ class TestNearExpiryLegitimateDownscale(BaseLockTestCase):
         cache.set(dyno.upscale_until_cache_key,
                   timezone.now() + timedelta(seconds=50), timeout=50)
 
-        with patch_cache_keys({}):
+        with patch_index_backend({}):
             with patch.object(cache, "ttl", return_value=50):
                 with patch.object(dyno, "restart_dyno") as mock_restart:
                     _apply_dyno_patches(dyno, {
@@ -435,7 +435,7 @@ class TestBottomGuardGenuinelyUpscaled(BaseLockTestCase):
                   {"size": "standard-1x", "time": timezone.now()}, timeout=None)
         # No upscale_until key (expired)
 
-        with patch_cache_keys({}):
+        with patch_index_backend({}):
             _apply_dyno_patches(dyno, {
                 "current_memory_usage": 600.0,
                 "current_memory_usage_percentage": 58.6,
@@ -452,7 +452,7 @@ class TestBottomGuardGenuinelyUpscaled(BaseLockTestCase):
         cache.set(dyno.original_size_cache_key,
                   {"size": "standard-1x", "time": timezone.now()}, timeout=None)
 
-        with patch_cache_keys({}):
+        with patch_index_backend({}):
             with patch.object(dyno, "downscale_formation_to_original_size") as mock_ds:
                 _apply_dyno_patches(dyno, {
                     "current_memory_usage": 300.0,
@@ -468,7 +468,7 @@ class TestBottomGuardGenuinelyUpscaled(BaseLockTestCase):
         cache.set(dyno.original_size_cache_key,
                   {"size": "standard-1x", "time": timezone.now()}, timeout=None)
 
-        with patch_cache_keys({}):
+        with patch_index_backend({}):
             _apply_dyno_patches(dyno, {
                 "current_memory_usage": 1000.0,
                 "current_memory_usage_percentage": 39.1,
@@ -783,7 +783,7 @@ class TestCanBeUpscaledGuard(BaseLockTestCase):
         dyno = make_dyno(formation_size="standard-2x")
         # No original_formation_size, but previous=standard-1x (from DYNO_SIZES)
 
-        with patch_cache_keys({}):
+        with patch_index_backend({}):
             _apply_dyno_patches(dyno, {
                 "current_memory_usage": 600.0,
                 "current_memory_usage_percentage": 58.6,
@@ -799,7 +799,7 @@ class TestCanBeUpscaledGuard(BaseLockTestCase):
         cache.set(dyno.original_size_cache_key,
                   {"size": "standard-2x", "time": timezone.now()}, timeout=None)
 
-        with patch_cache_keys({}):
+        with patch_index_backend({}):
             _apply_dyno_patches(dyno, {}, dyno.check_and_downscale_to_original_formation_size)
 
         self.assertIsNone(cache.get(dyno.upscale_until_cache_key))

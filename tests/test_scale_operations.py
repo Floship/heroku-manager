@@ -5,7 +5,7 @@ Uses patch context managers throughout to avoid PropertyMock class-level leakage
 import math
 import unittest
 from unittest.mock import patch, MagicMock, PropertyMock
-from tests.conftest import make_dyno, BaseLockTestCase, patch_cache_keys
+from tests.conftest import make_dyno, BaseLockTestCase, patch_index_backend
 from django.core.cache import cache
 
 
@@ -659,7 +659,7 @@ class TestSiblingTriggeredChainUpscale(BaseLockTestCase):
         dyno = make_dyno("normal_worker.2", formation_size="standard-2x")
         self._set_mem("normal_worker.1", 2183)  # 213% of 1024 MB
 
-        with patch_cache_keys(self._store):
+        with patch_index_backend(self._store):
             with patch.object(type(dyno), "current_memory_usage_percentage",
                               new_callable=PropertyMock, return_value=31.0):
                 with patch.object(type(dyno), "current_memory_usage",
@@ -681,7 +681,7 @@ class TestSiblingTriggeredChainUpscale(BaseLockTestCase):
         dyno = make_dyno("normal_worker.2", formation_size="standard-2x")
         self._set_mem("normal_worker.1", 317)  # 31% — cool
 
-        with patch_cache_keys(self._store):
+        with patch_index_backend(self._store):
             with patch.object(type(dyno), "current_memory_usage_percentage",
                               new_callable=PropertyMock, return_value=31.0):
                 with patch.object(type(dyno), "current_memory_usage",
@@ -708,7 +708,7 @@ class TestSiblingTriggeredChainUpscale(BaseLockTestCase):
         until = timezone.now() + timedelta(seconds=300)
         cache.set(dyno.upscale_until_cache_key, until, timeout=300)
 
-        with patch_cache_keys(self._store):
+        with patch_index_backend(self._store):
             with patch.object(type(dyno), "current_memory_usage_percentage",
                               new_callable=PropertyMock, return_value=31.0):
                 with patch.object(type(dyno), "current_memory_usage",
@@ -730,7 +730,7 @@ class TestSiblingTriggeredChainUpscale(BaseLockTestCase):
         until = timezone.now() + timedelta(seconds=300)
         cache.set(dyno.upscale_until_cache_key, until, timeout=300)
 
-        with patch_cache_keys(self._store):
+        with patch_index_backend(self._store):
             with patch.object(type(dyno), "current_memory_usage_percentage",
                               new_callable=PropertyMock, return_value=31.0):
                 with patch.object(dyno, "call_heroku_api") as mock_api:
@@ -750,7 +750,7 @@ class TestSiblingTriggeredChainUpscale(BaseLockTestCase):
         until = timezone.now() + timedelta(seconds=630)
         cache.set(dyno.upscale_until_cache_key, until, timeout=630)
 
-        with patch_cache_keys(self._store):
+        with patch_index_backend(self._store):
             with patch.object(type(dyno), "current_memory_usage_percentage",
                               new_callable=PropertyMock, return_value=31.0):
                 with patch.object(type(dyno), "current_memory_usage",
@@ -1054,7 +1054,7 @@ class TestMemoryStabilityDetection(BaseLockTestCase):
             f"heroku:dyno_memory:{dyno.dyno_name}": 15000,
             "heroku:dyno_memory:normal_worker.2": 15000,
         }
-        with patch_cache_keys(memory_store):
+        with patch_index_backend(memory_store):
             self.assertFalse(dyno.any_sibling_still_high_memory)
 
     def test_sibling_high_and_unstable_blocks_downscale(self):
@@ -1068,7 +1068,7 @@ class TestMemoryStabilityDetection(BaseLockTestCase):
             f"heroku:dyno_memory:{dyno.dyno_name}": 15000,
             "heroku:dyno_memory:normal_worker.2": 15000,
         }
-        with patch_cache_keys(memory_store):
+        with patch_index_backend(memory_store):
             self.assertTrue(dyno.any_sibling_still_high_memory)
 
     def test_sibling_high_with_no_stability_key_blocks_downscale(self):
@@ -1081,7 +1081,7 @@ class TestMemoryStabilityDetection(BaseLockTestCase):
             f"heroku:dyno_memory:{dyno.dyno_name}": 15000,
             "heroku:dyno_memory:normal_worker.2": 15000,
         }
-        with patch_cache_keys(memory_store):
+        with patch_index_backend(memory_store):
             self.assertTrue(dyno.any_sibling_still_high_memory)
 
     # --- record_memory_reading ---
@@ -1249,7 +1249,7 @@ class TestFormationIdleGate(BaseLockTestCase):
         dyno = make_dyno(formation_size="performance-l-ram")
         with patch.object(type(dyno), "avg_load_1min",
                           new_callable=PropertyMock, return_value=0.3):
-            with patch_cache_keys({}):
+            with patch_index_backend({}):
                 self.assertTrue(dyno.is_formation_idle)
 
     def test_idle_false_when_own_load_above_threshold(self):
@@ -1267,7 +1267,7 @@ class TestFormationIdleGate(BaseLockTestCase):
         }
         with patch.object(type(dyno), "avg_load_1min",
                           new_callable=PropertyMock, return_value=0.3):
-            with patch_cache_keys(load_store):
+            with patch_index_backend(load_store):
                 self.assertFalse(dyno.is_formation_idle)
 
     def test_idle_true_when_all_siblings_below_threshold(self):
@@ -1279,7 +1279,7 @@ class TestFormationIdleGate(BaseLockTestCase):
         }
         with patch.object(type(dyno), "avg_load_1min",
                           new_callable=PropertyMock, return_value=0.3):
-            with patch_cache_keys(load_store):
+            with patch_index_backend(load_store):
                 self.assertTrue(dyno.is_formation_idle)
 
     def test_idle_at_exact_threshold_is_not_idle(self):
@@ -1441,7 +1441,7 @@ class TestLockExpiryHandling(BaseLockTestCase):
     def test_zombie_check_handles_expired_lock(self):
         dyno = make_dyno()
         with patch.object(cache, "lock", return_value=self._expired_lock()):
-            with patch_cache_keys({}):
+            with patch_index_backend({}):
                 # Should not raise
                 dyno.check_for_sibling_zombie_dynos()
 
