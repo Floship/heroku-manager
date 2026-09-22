@@ -23,6 +23,12 @@ authorization, and no zombie restart; check-ins and safe local/sibling
 upscales remain allowed. Sibling readers are index-only as well: an uncertain
 member read yields nothing rather than a partial fleet.
 
+A registry write that raises publishes `heroku:dynos:v1:{app}:degraded` for
+two autoscale intervals and readiness fails closed for the whole app until a
+later check-in proves the writer works again. An evicted ZSET re-converges
+within one autoscale interval, because every dyno re-registers at its own
+check-in.
+
 Deploy prerequisites, all of which held for every Floship app at release time:
 
 1. v0.2.13 or later (index-aware writers) runs on every app for at least one

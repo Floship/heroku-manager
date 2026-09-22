@@ -1052,7 +1052,9 @@ class TestIndexedFailClosed(unittest.TestCase):
             "zrangebyscore": MagicMock(return_value=["normal_worker.2"]),
             "zremrangebyscore": MagicMock(return_value=1),
         })
-        backend.get.return_value = stale
+        # The alive read carries the stale timestamp; the readiness check's
+        # degraded-marker read must stay empty for this test to reach ZSCORE.
+        backend.get.side_effect = lambda key: stale if "dyno_alive" in key else None
         with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
             dyno.check_for_sibling_zombie_dynos()
         mock_restart.assert_not_called()
@@ -1113,7 +1115,7 @@ class TestIndexedFailClosed(unittest.TestCase):
             "zscore": MagicMock(return_value=time.time()),
             "zrangebyscore": MagicMock(return_value=[]),
         })
-        backend.get.return_value = stale
+        backend.get.side_effect = lambda key: stale if "dyno_alive" in key else None
         with patch.object(logging.getLogger("heroku_manager.heroku"), "error") as mock_error:
             with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
                 dyno.check_for_sibling_zombie_dynos()
@@ -1371,6 +1373,45 @@ class TestNoScanLeftInModule(unittest.TestCase):
         self.assertNotIn("HEROKU_DYNO_INDEX_V1_READY", source)
         self.assertNotIn("HEROKU_DYNO_INDEX_SCAN_CAP", source)
         self.assertFalse(hasattr(mod._IndexAdapter, "scan_keys"))
+
+
+class TestRegistryDegradedMarker(unittest.TestCase):
+    """Phase C: a failed index write closes the app's destructive gates."""
+
+    def setUp(self):
+        cache.clear()
+
+    def tearDown(self):
+        cache.clear()
+
+    def test_failed_registry_write_publishes_the_marker(self):
+        from heroku_manager.heroku import _registry_degraded_key
+        # LocMem exposes no raw write client, so the write fails like a Redis
+        # error and the dyno would be invisible to every reader.
+        self.assertFalse(_update_dyno_registry("floship", "web.1", score=123))
+        self.assertTrue(cache.get(_registry_degraded_key("floship")))
+
+    def test_marker_marks_readiness_false_without_a_score_read(self):
+        from heroku_manager.heroku import _registry_degraded_key
+        dyno = make_dyno("normal_worker.1")
+        _restore_real_index_ready(dyno)
+        backend = MagicMock()
+        client = MagicMock()
+        client.zscore.return_value = time.time()
+        backend.client.get_client.return_value = client
+        backend.make_key.side_effect = lambda key: key
+        backend.get.side_effect = lambda key: True if key == _registry_degraded_key("floship") else None
+        with patch("heroku_manager.heroku.cache", backend):
+            self.assertFalse(dyno.index_ready)
+        client.zscore.assert_not_called()
+
+    def test_marker_expires_after_two_autoscale_intervals(self):
+        from heroku_manager.heroku import _mark_registry_degraded, _registry_degraded_key
+        with patch("heroku_manager.heroku.cache") as mock_cache:
+            _mark_registry_degraded("floship")
+        mock_cache.set.assert_called_once_with(
+            _registry_degraded_key("floship"), True, timeout=60,
+        )
 
 
 class TestIndexAppIsolation(unittest.TestCase):

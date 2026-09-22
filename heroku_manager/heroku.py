@@ -34,6 +34,8 @@ def _index_ready(instance):
         return False
     cutoff = _stale_cutoff()
     try:
+        if cache.get(_registry_degraded_key(instance.app_name)):
+            return False  # a sibling reported its registry write failed
         adapter = _IndexAdapter(instance.app_name)
         client = adapter._connect()
         if client is None:
@@ -165,6 +167,30 @@ class _IndexAdapter:
         return client.zremrangebyscore(self._index_key, min_score, max_score)
 
 
+def _registry_degraded_key(app_name):
+    """Marker key for an app whose index may be missing a live dyno."""
+    return f'heroku:dynos:v1:{app_name}:degraded'
+
+
+def _mark_registry_degraded(app_name):
+    """Publish the short-lived degraded marker for one app (best effort).
+
+    A dyno whose index write failed is invisible to every reader, so the app
+    must stop authorizing destructive actions until a later check-in proves
+    the writer works again.  The marker is refreshed by every failed write and
+    expires after two autoscale intervals: a transient failure closes the gate
+    for about a minute, and a persistent one keeps it closed.
+    """
+    timeout = max(60, int(getattr(settings, 'DYNO_AUTOSCALE_INTERVAL', 30)) * 2)
+    try:
+        cache.set(_registry_degraded_key(app_name), True, timeout=timeout)
+    except Exception:
+        logger.warning(
+            "Failed to publish the dyno registry degraded marker for app %s.",
+            app_name, exc_info=True,
+        )
+
+
 def _update_dyno_registry(app_name, dyno_name, score=None):
     if not app_name or not dyno_name:
         return False
@@ -182,6 +208,7 @@ def _update_dyno_registry(app_name, dyno_name, score=None):
             "Failed to update indexed dyno registry for app %s, dyno %s.",
             app_name, dyno_name, exc_info=True,
         )
+        _mark_registry_degraded(app_name)
         return False
 
 # Gracefully handle lock expiry.  Consumers may configure different lock backends —
