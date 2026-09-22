@@ -58,8 +58,37 @@ def _index_fail_closed(instance):
     formation-idle authorization, zombie restart) are only authorized when the
     current dyno proves a fresh index score.  Sibling readers read the same
     index and yield nothing on an uncertain read.
+
+    The degraded marker is read here, uncached: ``index_ready`` lives for one
+    autoscale cycle, and a sibling can report a failed registry write after
+    that cache was filled.
     """
+    if _registry_degraded(instance):
+        return True
     return not instance.index_ready
+
+
+def _registry_degraded(instance):
+    """Uncached read of the app's degraded marker through the write authority.
+
+    False on a clean read; True when the marker is set or the read itself
+    fails, because the callers of this check authorize a resize.  A missing
+    raw client is not degraded on its own: ``index_ready`` already fails closed
+    for that case.
+    """
+    if not instance.app_name:
+        return True
+    try:
+        adapter = _IndexAdapter(instance.app_name, primary=True)
+        if adapter._connect() is None:
+            return False
+        return bool(adapter.get(_registry_degraded_key(instance.app_name)))
+    except Exception:
+        logger.warning(
+            "Dyno registry degraded-marker read failed for app %s; failing "
+            "closed (no destructive actions).", instance.app_name, exc_info=True,
+        )
+        return True
 
 
 def _stale_cutoff():
@@ -1278,7 +1307,7 @@ class HerokuDyno:
         try:
             with cache.lock('heroku:lock:dyno_alive_check', expire=30):
                 cutoff = _stale_cutoff()
-                if not self.index_ready:
+                if _index_fail_closed(self):
                     self.prune_stale_index_members(cutoff)
                     return
                 adapter = self._zombie_adapter()

@@ -1420,11 +1420,42 @@ class TestRegistryDegradedMarker(unittest.TestCase):
         from heroku_manager.heroku import _IndexAdapter
         backend = MagicMock()
         client = MagicMock()
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         backend.client.get_client.return_value = client
         backend.make_key.side_effect = lambda key: key
         with patch("heroku_manager.heroku.cache", backend):
             _IndexAdapter("floship").fresh_members(0)
         backend.client.get_client.assert_called_once_with(write=False)
+
+    def test_marker_published_after_readiness_was_cached_still_blocks(self):
+        import pickle
+        # The fixture seeds index_ready=True, which stands for a readiness
+        # cache filled earlier in the cycle: a marker published since then must
+        # still stop the resize at the decision point.
+        dyno = make_dyno("normal_worker.1", formation_size="standard-2x")
+        backend = MagicMock()
+        client = MagicMock()
+        client.get.return_value = None  # degraded marker absent unless the test sets it
+        client.get.return_value = pickle.dumps(True)
+        backend.client.get_client.return_value = client
+        backend.client.decode = pickle.loads
+        backend.make_key.side_effect = lambda key: key
+        with patch("heroku_manager.heroku.cache", backend):
+            self.assertTrue(dyno.index_ready)  # cached before the marker landed
+            self.assertFalse(dyno.allow_downscale)
+            self.assertFalse(dyno.allow_downscale_on_shutdown)
+            self.assertFalse(dyno.is_formation_idle)
+
+    def test_marker_read_failure_blocks_destructive_actions(self):
+        dyno = make_dyno("normal_worker.1", formation_size="standard-2x")
+        backend = MagicMock()
+        client = MagicMock()
+        client.get.return_value = None  # degraded marker absent unless the test sets it
+        client.get.side_effect = RuntimeError("redis read failed")
+        backend.client.get_client.return_value = client
+        backend.make_key.side_effect = lambda key: key
+        with patch("heroku_manager.heroku.cache", backend):
+            self.assertFalse(dyno.allow_downscale)
 
     def test_marker_expires_after_two_autoscale_intervals(self):
         from heroku_manager.heroku import _mark_registry_degraded, _registry_degraded_key

@@ -211,6 +211,7 @@ class TestCheckForSiblingZombieDynos(BaseLockTestCase):
                 dyno = make_dyno()  # cached-ready seed
                 backend = MagicMock()
                 client = MagicMock()
+                client.get.return_value = None  # degraded marker absent unless the test sets it
                 client.zremrangebyscore.return_value = 0
                 client.zrangebyscore.return_value = members
                 client.mget.return_value = mget_values

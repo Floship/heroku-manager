@@ -28,7 +28,9 @@ two autoscale intervals and readiness fails closed for the whole app until a
 later check-in proves the writer works again. An evicted ZSET re-converges
 within one autoscale interval, because every dyno re-registers at its own
 check-in. Readiness reads the marker and its own score through the write
-client, never a replica; the sibling metric reads keep the read client.
+client, never a replica, and the destructive gates re-read the marker uncached
+at the decision point, so a marker published after a readiness check still
+stops the resize. The sibling metric reads keep the read client.
 
 Deploy prerequisites, all of which held for every Floship app at release time:
 
