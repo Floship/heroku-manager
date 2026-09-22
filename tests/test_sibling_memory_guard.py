@@ -37,7 +37,7 @@ if not django_settings.configured:
     django.setup()
 
 from django.core.cache import cache
-from tests.conftest import patch_scan_backend, real_decoder
+from tests.conftest import patch_index_backend, real_decoder
 from heroku_manager.heroku import HerokuDyno, DYNO_SIZES, _update_dyno_registry
 
 
@@ -185,8 +185,8 @@ class TestAnySiblingStillHighMemory(unittest.TestCase):
         self._memory_store[key] = memory_mb
 
     def _patch_keys(self, pattern_to_keys=None):
-        """Patch a fake raw client so SCAN serves the seeded memory store."""
-        return patch_scan_backend(self._memory_store)
+        """Patch a fake raw client so the index reader serves the seeded memory store."""
+        return patch_index_backend(self._memory_store)
 
     def test_no_siblings_in_cache_returns_false(self):
         dyno = self._dyno()
@@ -249,8 +249,8 @@ class TestAllowDownscaleWithSiblingGuard(unittest.TestCase):
         self._memory_store[key] = memory_mb
 
     def _patch_keys(self):
-        """Patch a fake raw client so SCAN serves the seeded memory store."""
-        return patch_scan_backend(self._memory_store)
+        """Patch a fake raw client so the index reader serves the seeded memory store."""
+        return patch_index_backend(self._memory_store)
 
     def _dyno_allow_downscale_setup(self, own_memory, sibling_memory=None):
         """Helper: dyno with controlled memory, optional sibling in cache."""
@@ -369,9 +369,9 @@ def _make_full_dyno(dyno_name="normal_worker.1", formation_size="standard-2x",
     return dyno
 
 
-def _patch_cache_keys(memory_store):
-    """Patch a fake raw client so SCAN serves the provided key store."""
-    return patch_scan_backend(memory_store)
+def _patch_index_backend(memory_store):
+    """Patch a fake raw client so the index reader serves the provided key store."""
+    return patch_index_backend(memory_store)
 
 
 class TestR14R15GuardInteractions(unittest.TestCase):
@@ -385,38 +385,38 @@ class TestR14R15GuardInteractions(unittest.TestCase):
 
     def test_r15_blocks_allow_downscale(self):
         dyno = _make_full_dyno(own_memory=200, r15=True)
-        with _patch_cache_keys({}):
+        with _patch_index_backend({}):
             self.assertFalse(dyno.allow_downscale)
 
     def test_r14_does_not_block_allow_downscale_when_memory_is_cool(self):
         dyno = _make_full_dyno(own_memory=200, r14=True)
-        with _patch_cache_keys({}):
+        with _patch_index_backend({}):
             self.assertTrue(dyno.allow_downscale)
 
     def test_r15_blocks_allow_downscale_on_shutdown(self):
         dyno = _make_full_dyno(own_memory=200, r15=True)
-        with _patch_cache_keys({}):
+        with _patch_index_backend({}):
             self.assertFalse(dyno.allow_downscale_on_shutdown)
 
     def test_r14_does_not_block_allow_downscale_on_shutdown_when_memory_is_cool(self):
         dyno = _make_full_dyno(own_memory=200, r14=True)
-        with _patch_cache_keys({}):
+        with _patch_index_backend({}):
             self.assertTrue(dyno.allow_downscale_on_shutdown)
 
     def test_r14_and_r15_both_absent_allows_shutdown_downscale_when_cool(self):
         dyno = _make_full_dyno(own_memory=200, r14=False, r15=False)
-        with _patch_cache_keys({}):
+        with _patch_index_backend({}):
             self.assertTrue(dyno.allow_downscale_on_shutdown)
 
     def test_r15_without_r14_still_blocks_downscale(self):
         # R15 alone: requires_upscale=True is enough to block
         dyno = _make_full_dyno(own_memory=200, r14=False, r15=True)
-        with _patch_cache_keys({}):
+        with _patch_index_backend({}):
             self.assertFalse(dyno.allow_downscale)
 
     def test_neither_r14_nor_r15_cool_memory_allows_downscale(self):
         dyno = _make_full_dyno(own_memory=200, r14=False, r15=False)
-        with _patch_cache_keys({}):
+        with _patch_index_backend({}):
             self.assertTrue(dyno.allow_downscale)
 
 
@@ -439,18 +439,18 @@ class TestAllowDownscaleOnShutdownSiblingGuard(unittest.TestCase):
         # Self is cool but sibling is hot — shutdown must NOT trigger downscale
         dyno = _make_full_dyno("normal_worker.1", own_memory=200)
         self._set_mem("normal_worker.2", 1013)
-        with _patch_cache_keys(self._store):
+        with _patch_index_backend(self._store):
             self.assertFalse(dyno.allow_downscale_on_shutdown)
 
     def test_allows_shutdown_downscale_when_all_siblings_cool(self):
         dyno = _make_full_dyno("normal_worker.1", own_memory=200)
         self._set_mem("normal_worker.2", 300)
-        with _patch_cache_keys(self._store):
+        with _patch_index_backend(self._store):
             self.assertTrue(dyno.allow_downscale_on_shutdown)
 
     def test_allows_shutdown_downscale_with_no_siblings(self):
         dyno = _make_full_dyno("normal_worker.1", own_memory=200)
-        with _patch_cache_keys(self._store):
+        with _patch_index_backend(self._store):
             self.assertTrue(dyno.allow_downscale_on_shutdown)
 
 
@@ -512,14 +512,14 @@ class TestNullMemoryEdgeCases(unittest.TestCase):
 
     def test_zero_own_memory_does_not_raise_in_threshold_check(self):
         dyno = _make_full_dyno(own_memory=0)
-        with _patch_cache_keys({}):
+        with _patch_index_backend({}):
             # Must not raise TypeError
             result = dyno.is_still_high_memory_usage_for_downscale
             self.assertIsInstance(result, bool)
 
     def test_zero_own_memory_allow_downscale_returns_bool(self):
         dyno = _make_full_dyno(own_memory=0)
-        with _patch_cache_keys({}):
+        with _patch_index_backend({}):
             result = dyno.allow_downscale
             self.assertIsInstance(result, bool)
 
@@ -575,7 +575,7 @@ class TestFormationNameIsolation(unittest.TestCase):
 
         # Dict store: member derivation reads the store keys and cache.get
         # resolves the Python value (mirrors the legacy locmem seeding).
-        with patch_scan_backend(dict(all_keys)):
+        with patch_index_backend(dict(all_keys)):
             with patch.object(cache, "get", side_effect=lambda k: all_keys.get(k)):
                 self.assertTrue(dyno.any_sibling_still_high_memory)
 
@@ -609,12 +609,12 @@ class TestBaseFormationEdgeCases(unittest.TestCase):
         # threshold=0 → any_sibling_still_high_memory returns False (short-circuit)
         dyno = _make_full_dyno("normal_worker.1", formation_size="standard-1x", own_memory=200)
         store = {"heroku:dyno_memory:normal_worker.2": 9999}
-        with _patch_cache_keys(store):
+        with _patch_index_backend(store):
             self.assertFalse(dyno.any_sibling_still_high_memory)
 
     def test_allow_downscale_false_at_base_size_due_to_threshold(self):
         dyno = _make_full_dyno(formation_size="standard-1x", own_memory=1)
-        with _patch_cache_keys({}):
+        with _patch_index_backend({}):
             self.assertFalse(dyno.allow_downscale)
 
 
@@ -643,7 +643,7 @@ class TestThresholdBoundary(unittest.TestCase):
         dyno = _make_full_dyno("normal_worker.1", own_memory=200)
         store = {"heroku:dyno_memory:normal_worker.2": threshold}
         cache.set("heroku:dyno_memory:normal_worker.2", threshold, timeout=60)
-        with _patch_cache_keys(store):
+        with _patch_index_backend(store):
             self.assertTrue(dyno.any_sibling_still_high_memory)
 
     def test_at_upscale_threshold_does_not_upscale(self):
@@ -678,32 +678,32 @@ class TestAnySiblingRequiresUpscale(unittest.TestCase):
         # standard-2x: 1024 MB * 80% = 819.2 MB; sibling at 2183 MB → True
         dyno = make_dyno("normal_worker.2", formation_size="standard-2x")
         self._set_mem("normal_worker.1", 2183)
-        with _patch_cache_keys(self._store):
+        with _patch_index_backend(self._store):
             self.assertTrue(dyno.any_sibling_requires_upscale)
 
     def test_sibling_below_upscale_threshold_returns_false(self):
         # standard-2x: threshold 819.2 MB; sibling at 317 MB → False
         dyno = make_dyno("normal_worker.2", formation_size="standard-2x")
         self._set_mem("normal_worker.1", 317)
-        with _patch_cache_keys(self._store):
+        with _patch_index_backend(self._store):
             self.assertFalse(dyno.any_sibling_requires_upscale)
 
     def test_excludes_self(self):
         dyno = make_dyno("normal_worker.1", formation_size="standard-2x")
         self._set_mem("normal_worker.1", 2183)
-        with _patch_cache_keys(self._store):
+        with _patch_index_backend(self._store):
             self.assertFalse(dyno.any_sibling_requires_upscale)
 
     def test_no_siblings_returns_false(self):
         dyno = make_dyno("normal_worker.1", formation_size="standard-2x")
-        with _patch_cache_keys(self._store):
+        with _patch_index_backend(self._store):
             self.assertFalse(dyno.any_sibling_requires_upscale)
 
     def test_formation_name_isolation(self):
         # normal_worker_extra.1 at 9999 MB must NOT match normal_worker
         dyno = make_dyno("normal_worker.2", formation_size="standard-2x")
         self._set_mem("normal_worker_extra.1", 9999)
-        with _patch_cache_keys(self._store):
+        with _patch_index_backend(self._store):
             self.assertFalse(dyno.any_sibling_requires_upscale)
 
     def test_at_exact_threshold_returns_false(self):
@@ -711,7 +711,7 @@ class TestAnySiblingRequiresUpscale(unittest.TestCase):
         dyno = make_dyno("normal_worker.2", formation_size="standard-2x")
         threshold = DYNO_SIZES["standard-2x"]["memory"] * django_settings.UPSCALE_PERCENTAGE_HIGH_MEM_USE / 100
         self._set_mem("normal_worker.1", threshold)
-        with _patch_cache_keys(self._store):
+        with _patch_index_backend(self._store):
             self.assertFalse(dyno.any_sibling_requires_upscale)
 
     def test_none_memory_treated_as_absent(self):
@@ -719,7 +719,7 @@ class TestAnySiblingRequiresUpscale(unittest.TestCase):
         key = "heroku:dyno_memory:normal_worker.1"
         cache.set(key, None, timeout=60)
         self._store[key] = None
-        with _patch_cache_keys(self._store):
+        with _patch_index_backend(self._store):
             self.assertFalse(dyno.any_sibling_requires_upscale)
 
 
@@ -734,24 +734,23 @@ class TestQueueGating(unittest.TestCase):
 
     def test_tasks_in_queue_blocks_downscale_when_flag_false(self):
         dyno = _make_full_dyno(own_memory=200, no_tasks=False, downscale_on_non_empty=False)
-        with _patch_cache_keys({}):
+        with _patch_index_backend({}):
             self.assertFalse(dyno.allow_downscale)
 
     def test_tasks_in_queue_allows_downscale_when_flag_true(self):
         dyno = _make_full_dyno(own_memory=200, no_tasks=False, downscale_on_non_empty=True)
-        with _patch_cache_keys({}):
+        with _patch_index_backend({}):
             self.assertTrue(dyno.allow_downscale)
 
     def test_no_tasks_in_queue_allows_downscale_regardless_of_flag(self):
         dyno = _make_full_dyno(own_memory=200, no_tasks=True, downscale_on_non_empty=False)
-        with _patch_cache_keys({}):
+        with _patch_index_backend({}):
             self.assertTrue(dyno.allow_downscale)
 
 
 
 class TestIndexedDynoReadiness(unittest.TestCase):
-    """Phase B: runtime readiness = env flag true AND own fresh index score AND
-    every compatibility-SCAN member represented in the index."""
+    """Phase C: runtime readiness = the current dyno's own fresh index score."""
 
     def setUp(self):
         cache.clear()
@@ -770,6 +769,8 @@ class TestIndexedDynoReadiness(unittest.TestCase):
         """Patch heroku_manager.heroku.cache with a mock django-redis backend."""
         backend = MagicMock()
         client = MagicMock()
+        client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
         backend.client.get_client.return_value = client
@@ -782,71 +783,57 @@ class TestIndexedDynoReadiness(unittest.TestCase):
         self.addCleanup(self._cache_patcher.stop)
         return backend, client
 
-    def test_flag_defaults_false_when_env_missing(self):
+    def test_not_ready_without_raw_client(self):
+        # A LocMem-style backend exposes no raw client: readiness fails closed.
         dyno = self._dyno()
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("HEROKU_DYNO_INDEX_V1_READY", None)
-            self.assertFalse(dyno.index_ready)
+        self.assertFalse(dyno.index_ready)
 
     def test_not_ready_without_fresh_own_index_score(self):
         dyno = self._dyno()
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            self._patch_backend(client_attrs={"zscore": MagicMock(return_value=None)})
-            self.assertFalse(dyno.index_ready)
+        self._patch_backend(client_attrs={"zscore": MagicMock(return_value=None)})
+        self.assertFalse(dyno.index_ready)
 
-    def test_ready_when_flag_fresh_score_and_scan_reconciled(self):
+    def test_ready_from_fresh_own_index_score(self):
         dyno = self._dyno("normal_worker.1")
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=["normal_worker.1"]),
-                "scan": MagicMock(return_value=(0, ["heroku:dyno_alive:normal_worker.1"])),
-            })
-            self.assertTrue(dyno.index_ready)
+        _, client = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=time.time()),
+        })
+        self.assertTrue(dyno.index_ready)
+        # Phase C: readiness is the own score alone - no SCAN, no flag.
+        client.scan.assert_not_called()
 
-    def test_not_ready_when_scan_member_missing_from_index(self):
-        # Compatibility scan sees old-writer dyno not yet in the v1 index → not ready
+    def test_env_flag_no_longer_gates_readiness(self):
+        # The rollout flag is gone: a fresh own score is ready even when the
+        # retired flag is still set to false in the environment.
         dyno = self._dyno("normal_worker.1")
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=[]),
-                "scan": MagicMock(return_value=(0, ["heroku:dyno_alive:normal_worker.1"])),
-            })
-            self.assertFalse(dyno.index_ready)
+        os.environ["HEROKU_DYNO_INDEX_V1_READY"] = "false"
+        self.addCleanup(os.environ.pop, "HEROKU_DYNO_INDEX_V1_READY", None)
+        self._patch_backend(client_attrs={"zscore": MagicMock(return_value=time.time())})
+        self.assertTrue(dyno.index_ready)
 
     @patch("heroku_manager.heroku.time.time", return_value=1_700_000_000.0)
     def test_not_ready_when_own_index_score_equals_cutoff(self, mock_time):
         # Score at/under the prune cutoff is stale: readiness must be false.
         from heroku_manager.heroku import _stale_cutoff
         dyno = self._dyno("normal_worker.1")
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=_stale_cutoff()),
-                "zrangebyscore": MagicMock(return_value=["normal_worker.1"]),
-                "scan": MagicMock(return_value=(0, ["heroku:dyno_alive:normal_worker.1"])),
-            })
-            self.assertFalse(dyno.index_ready)
+        self._patch_backend(client_attrs={"zscore": MagicMock(return_value=_stale_cutoff())})
+        self.assertFalse(dyno.index_ready)
 
     def test_fresh_cutoff_is_exclusive_and_matches_prune_cutoff(self):
-        # Score exactly one microsecond above the prune cutoff is fresh, and
-        # the fresh range lower bound must equal the prune upper bound exactly
-        # (prune <= cutoff, fresh > cutoff).
+        # The sibling read's fresh range lower bound must equal the prune's
+        # upper bound exactly (prune <= cutoff, fresh > cutoff).
         from heroku_manager.heroku import _stale_cutoff
         dyno = self._dyno("normal_worker.1")
         with patch("heroku_manager.heroku.time.time", return_value=1_700_000_000.0):
-            fresh_score = _stale_cutoff() + 10  # safely above cutoff
-            with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-                _, client = self._patch_backend(client_attrs={
-                    "zscore": MagicMock(return_value=fresh_score),
-                    "zrangebyscore": MagicMock(return_value=["normal_worker.1"]),
-                    "scan": MagicMock(return_value=(0, ["heroku:dyno_alive:normal_worker.1"])),
-                    "zremrangebyscore": MagicMock(return_value=0),
-                })
-                self.assertTrue(dyno.index_ready)
-                # Non-vacuous: a prune must actually run so the prune cutoff is
-                # observed, not asserted against a never-called mock.
-                dyno.prune_stale_index_members()
+            _, client = self._patch_backend(client_attrs={
+                "zscore": MagicMock(return_value=_stale_cutoff() + 10),
+                "zrangebyscore": MagicMock(return_value=[]),
+                "zremrangebyscore": MagicMock(return_value=0),
+            })
+            # Both paths run so both cutoffs are observed, never asserted
+            # against a never-called mock.
+            list(dyno._iter_sibling_values("memory"))
+            dyno.prune_stale_index_members()
             # zremrangebyscore(key, min, max): the prune cutoff is the MAX bound.
             lower = client.zrangebyscore.call_args[0][1]
             prune = client.zremrangebyscore.call_args[0][2]
@@ -854,8 +841,9 @@ class TestIndexedDynoReadiness(unittest.TestCase):
 
 
 class TestIndexedSiblingValues(unittest.TestCase):
-    """Phase B: _iter_sibling_values uses the index; never KEYS; exact formation
-    prefix; own dyno excluded; missing values skipped; batched MGET."""
+    """Phase C: _iter_sibling_values reads the app index only; never SCAN, never
+    KEYS; exact formation prefix; own dyno excluded; missing values skipped;
+    batched MGET; an uncertain member read yields nothing."""
 
     def setUp(self):
         cache.clear()
@@ -873,6 +861,8 @@ class TestIndexedSiblingValues(unittest.TestCase):
     def _patch_backend(self, client_attrs=None, backend_attrs=None):
         backend = MagicMock()
         client = MagicMock()
+        client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
         backend.client.get_client.return_value = client
@@ -885,53 +875,49 @@ class TestIndexedSiblingValues(unittest.TestCase):
         self.addCleanup(self._cache_patcher.stop)
         return backend, client
 
-    def test_no_keys_call_in_any_readiness_state(self):
-        # Bounded SCAN must replace cache.keys entirely
+    def test_no_keys_or_scan_call_in_any_readiness_state(self):
+        # Phase C: sibling reads are index-only - no KEYS and no SCAN.
         import pickle
         dyno = self._dyno("normal_worker.1")
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            backend, _ = self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=["normal_worker.1", "normal_worker.2"]),
-                "mget": MagicMock(return_value=[None, pickle.dumps(300)]),
-                "scan": MagicMock(return_value=(0, ["heroku:dyno_alive:normal_worker.1", "heroku:dyno_alive:normal_worker.2"])),
-            })
-            backend.client.decode = _real_decoder()
-            backend.keys = MagicMock(side_effect=AssertionError("KEYS forbidden"))
-            list(dyno._iter_sibling_values("memory"))
+        backend, client = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=time.time()),
+            "zrangebyscore": MagicMock(return_value=["normal_worker.1", "normal_worker.2"]),
+            "mget": MagicMock(return_value=[pickle.dumps(300)]),
+        })
+        client.scan.side_effect = AssertionError("SCAN removed in Phase C")
+        backend.keys = MagicMock(side_effect=AssertionError("KEYS forbidden"))
+        backend.client.decode = _real_decoder()
+        values = list(dyno._iter_sibling_values("memory"))
+        self.assertEqual(values, [("normal_worker.2", 300)])
         backend.keys.assert_not_called()
+        client.scan.assert_not_called()
 
-    def test_bounded_scan_used_when_not_ready(self):
-        # Mixed window: bounded SCAN over the exact prefix, not KEYS
+    def test_uncertain_index_read_yields_no_siblings(self):
+        # None from ZRANGEBYSCORE means the member list is unknown: yield
+        # nothing rather than a partial fleet, and never fall back to SCAN.
         dyno = self._dyno("normal_worker.1")
-        scan_calls = []
-        def fake_scan(cursor=0, match=None, count=None):
-            scan_calls.append((match, count))
-            return (0, ["heroku:dyno_memory:normal_worker.2"])
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "false"}):
-            backend, _client = self._patch_backend(client_attrs={"scan": fake_scan})
-            backend.get.return_value = 300
-            values = list(dyno._iter_sibling_values("memory"))
-        self.assertEqual([v for _, v in values], [300])
-        self.assertTrue(scan_calls, "SCAN must be used when not ready")
-        match, count = scan_calls[0]
-        self.assertTrue(match.startswith("heroku:dyno_memory:normal_worker."))
-        self.assertIsNotNone(count)
+        backend, client = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=None),
+            "zrangebyscore": MagicMock(return_value=None),
+        })
+        client.scan.side_effect = AssertionError("SCAN removed in Phase C")
+        backend.get.return_value = 300
+        self.assertEqual(list(dyno._iter_sibling_values("memory")), [])
+        client.scan.assert_not_called()
+        client.mget.assert_not_called()
 
     def test_exact_formation_prefix_filters_index_members(self):
         # normal_worker_extra.1 must not match normal_worker
         import pickle
         dyno = self._dyno("normal_worker.1")
         members = ["normal_worker.1", "normal_worker.2", "normal_worker_extra.1"]
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            backend, _ = self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=members),
-                "mget": MagicMock(return_value=[pickle.dumps(400), pickle.dumps(9999)]),
-                "scan": MagicMock(return_value=(0, [f"heroku:dyno_alive:{m}" for m in members])),
-            })
-            backend.client.decode = _real_decoder()
-            values = list(dyno._iter_sibling_values("memory"))
+        backend, _ = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=time.time()),
+            "zrangebyscore": MagicMock(return_value=members),
+            "mget": MagicMock(return_value=[pickle.dumps(400), pickle.dumps(9999)]),
+        })
+        backend.client.decode = _real_decoder()
+        values = list(dyno._iter_sibling_values("memory"))
         names = [n for n, _ in values]
         self.assertNotIn("normal_worker_extra.1", names)
         self.assertEqual(names, ["normal_worker.2"])
@@ -941,45 +927,39 @@ class TestIndexedSiblingValues(unittest.TestCase):
         # Own dyno's hot value must never be treated as a sibling's
         import pickle
         dyno = self._dyno("normal_worker.2")
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            backend, _ = self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=["normal_worker.1", "normal_worker.2"]),
-                "mget": MagicMock(return_value=[pickle.dumps(300), pickle.dumps(9999)]),
-                "scan": MagicMock(return_value=(0, ["heroku:dyno_alive:normal_worker.1", "heroku:dyno_alive:normal_worker.2"])),
-            })
-            backend.client.decode = _real_decoder()
-            values = list(dyno._iter_sibling_values("memory"))
+        backend, _ = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=time.time()),
+            "zrangebyscore": MagicMock(return_value=["normal_worker.1", "normal_worker.2"]),
+            "mget": MagicMock(return_value=[pickle.dumps(300), pickle.dumps(9999)]),
+        })
+        backend.client.decode = _real_decoder()
+        values = list(dyno._iter_sibling_values("memory"))
         self.assertEqual(values, [("normal_worker.1", 300)])
 
     def test_missing_metric_values_skipped(self):
         import pickle
         dyno = self._dyno("normal_worker.1")
         members = ["normal_worker.1", "normal_worker.2", "normal_worker.3"]
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            backend, _ = self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=members),
-                "mget": MagicMock(return_value=[None, pickle.dumps(300)]),
-                "scan": MagicMock(return_value=(0, [f"heroku:dyno_alive:{m}" for m in members])),
-            })
-            backend.client.decode = _real_decoder()
-            values = list(dyno._iter_sibling_values("memory"))
+        backend, _ = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=time.time()),
+            "zrangebyscore": MagicMock(return_value=members),
+            "mget": MagicMock(return_value=[None, pickle.dumps(300)]),
+        })
+        backend.client.decode = _real_decoder()
+        values = list(dyno._iter_sibling_values("memory"))
         self.assertEqual(values, [("normal_worker.3", 300)])
 
     def test_batched_mget_used(self):
         import pickle
         dyno = self._dyno("normal_worker.1")
         members = ["normal_worker.1", "normal_worker.2", "normal_worker.3"]
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            backend, client = self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=members),
-                "mget": MagicMock(return_value=[pickle.dumps(300), pickle.dumps(400)]),
-                "scan": MagicMock(return_value=(0, [f"heroku:dyno_alive:{m}" for m in members])),
-            })
-            backend.client.decode = _real_decoder()
-            list(dyno._iter_sibling_values("memory"))
+        backend, client = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=time.time()),
+            "zrangebyscore": MagicMock(return_value=members),
+            "mget": MagicMock(return_value=[pickle.dumps(300), pickle.dumps(400)]),
+        })
+        backend.client.decode = _real_decoder()
+        list(dyno._iter_sibling_values("memory"))
         client.mget.assert_called_once()
         args = client.mget.call_args[0][0]
         self.assertIn("heroku:dyno_memory:normal_worker.2", args)
@@ -987,8 +967,8 @@ class TestIndexedSiblingValues(unittest.TestCase):
 
 
 class TestIndexedFailClosed(unittest.TestCase):
-    """Phase B: uncertain/incomplete/error index state must never authorize
-    downscale, formation-idle downscale, or zombie restart; safe upscale stays."""
+    """Phase C: an unproven own index score must never authorize downscale,
+    formation-idle downscale, or zombie restart; sibling reads stay index-only."""
 
     def setUp(self):
         cache.clear()
@@ -1006,6 +986,8 @@ class TestIndexedFailClosed(unittest.TestCase):
     def _patch_backend(self, client_attrs=None, backend_attrs=None):
         backend = MagicMock()
         client = MagicMock()
+        client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
         backend.client.get_client.return_value = client
@@ -1033,160 +1015,125 @@ class TestIndexedFailClosed(unittest.TestCase):
         type(dyno).previous_formation_size = PropertyMock(return_value="standard-1x")
         return dyno
 
-    def test_flag_false_blocks_downscale(self):
-        # Phase B contract: destructive actions (downscale) require runtime
-        # readiness, which requires the flag true.  Flag false/absent must
-        # never authorize a downscale even when memory is cool.
+    def test_missing_own_score_blocks_downscale(self):
+        # Destructive actions require a proven fresh own score; a missing score
+        # must never authorize a downscale even when memory is cool.
         dyno = self._cool_full_dyno()
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "false"}, clear=False):
-            backend, client = self._patch_backend(client_attrs={
-                "scan": MagicMock(return_value=(0, [])),
-            })
-            backend.get.return_value = None
-            self.assertFalse(dyno.allow_downscale)
-        client.zscore.assert_not_called()
+        _, client = self._patch_backend(client_attrs={"zscore": MagicMock(return_value=None)})
+        self.assertFalse(dyno.allow_downscale)
+        client.zscore.assert_called_once()
         client.scan.assert_not_called()
 
-    def test_flag_false_blocks_shutdown_downscale(self):
+    def test_missing_own_score_blocks_shutdown_downscale(self):
         dyno = self._cool_full_dyno()
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "false"}, clear=False):
-            _, client = self._patch_backend(client_attrs={
-                "scan": MagicMock(return_value=(0, [])),
-            })
-            self.assertFalse(dyno.allow_downscale_on_shutdown)
-        client.zscore.assert_not_called()
+        _, client = self._patch_backend(client_attrs={"zscore": MagicMock(return_value=None)})
+        self.assertFalse(dyno.allow_downscale_on_shutdown)
         client.scan.assert_not_called()
 
-    def test_flag_absent_blocks_formation_idle(self):
+    def test_stale_own_score_blocks_formation_idle(self):
+        from heroku_manager.heroku import _stale_cutoff
         dyno = self._cool_full_dyno()
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("HEROKU_DYNO_INDEX_V1_READY", None)
-            self._patch_backend(client_attrs={
-                "scan": MagicMock(return_value=(0, [])),
-            })
-            with patch.object(type(dyno), "avg_load_1min",
-                              new_callable=PropertyMock, return_value=0.4):
-                self.assertFalse(dyno.is_formation_idle)
+        self._patch_backend(client_attrs={"zscore": MagicMock(return_value=_stale_cutoff())})
+        with patch.object(type(dyno), "avg_load_1min",
+                          new_callable=PropertyMock, return_value=0.4):
+            self.assertFalse(dyno.is_formation_idle)
 
-    def test_flag_true_but_unreconciled_blocks_downscale(self):
+    def test_fresh_own_score_allows_shutdown_downscale_when_cool(self):
         dyno = self._cool_full_dyno()
-        # own score missing → not ready → downscale blocked
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            self._patch_backend(client_attrs={"zscore": MagicMock(return_value=None)})
-            self.assertFalse(dyno.allow_downscale)
+        self._patch_backend(client_attrs={"zscore": MagicMock(return_value=time.time())})
+        self.assertTrue(dyno.allow_downscale_on_shutdown)
 
-    def test_flag_true_reconciled_allows_shutdown_downscale_when_cool(self):
+    def test_fresh_own_score_allows_downscale(self):
         dyno = self._cool_full_dyno()
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=["normal_worker.1"]),
-                "scan": MagicMock(return_value=(0, ["heroku:dyno_alive:normal_worker.1"])),
-            })
-            self.assertTrue(dyno.allow_downscale_on_shutdown)
+        self._patch_backend(client_attrs={"zscore": MagicMock(return_value=time.time())})
+        self.assertTrue(dyno.allow_downscale)
 
-    def test_flag_true_reconciled_allows_downscale(self):
-        dyno = self._cool_full_dyno()
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=["normal_worker.1"]),
-                "scan": MagicMock(return_value=(0, ["heroku:dyno_alive:normal_worker.1"])),
-            })
-            self.assertTrue(dyno.allow_downscale)
-
-    def test_flag_false_blocks_zombie_restart(self):
-        # Phase B contract: zombie restart is destructive and requires index
-        # readiness.  Flag false must block the restart even when the SCAN
-        # sees a stale sibling.
+    def test_missing_own_score_blocks_zombie_restart(self):
+        # Zombie restart is destructive and requires a proven own score: without
+        # one the check prunes once and never restarts, whatever the index holds.
         dyno = self._dyno("normal_worker.1")
         stale = timezone.now() - timezone.timedelta(seconds=django_settings.DYNO_ZOMBIE_THRESHOLD + 10)
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "false"}, clear=False):
-            backend, client = self._patch_backend(client_attrs={
-                "scan": MagicMock(return_value=(0, ["heroku:dyno_alive:normal_worker.2"])),
-                "zremrangebyscore": MagicMock(return_value=1),
-            })
-            backend.get.return_value = stale
-            with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                dyno.check_for_sibling_zombie_dynos()
+        backend, client = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=None),
+            "zrangebyscore": MagicMock(return_value=["normal_worker.2"]),
+            "zremrangebyscore": MagicMock(return_value=1),
+        })
+        # The alive read carries the stale timestamp; the readiness check's
+        # degraded-marker read must stay empty for this test to reach ZSCORE.
+        backend.get.side_effect = lambda key: stale if "dyno_alive" in key else None
+        with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
+            dyno.check_for_sibling_zombie_dynos()
         mock_restart.assert_not_called()
-        client.zscore.assert_not_called()
+        client.zremrangebyscore.assert_called_once()
+        client.zscore.assert_called_once()
+        client.mget.assert_not_called()
         client.scan.assert_not_called()
 
-    def test_flag_false_still_prunes_stale_index_members_once(self):
-        # Prune is a non-destructive cleanup: it must run once under the lock
-        # even when readiness is false, then the check returns without
-        # restarting.
+    def test_not_ready_still_prunes_stale_index_members_once(self):
+        # Prune is a non-destructive cleanup: it runs once under the lock even
+        # when the own score is missing, then the check returns.
         dyno = self._dyno("normal_worker.1")
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "false"}, clear=False):
-            _, client = self._patch_backend(client_attrs={
-                "scan": MagicMock(return_value=(0, [])),
-                "zremrangebyscore": MagicMock(return_value=3),
-            })
-            with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                dyno.check_for_sibling_zombie_dynos()
+        _, client = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=None),
+            "zremrangebyscore": MagicMock(return_value=3),
+        })
+        with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
+            dyno.check_for_sibling_zombie_dynos()
         client.zremrangebyscore.assert_called_once()
         mock_restart.assert_not_called()
-        client.zscore.assert_not_called()
+        client.mget.assert_not_called()
         client.scan.assert_not_called()
 
-    def test_flag_true_zombie_restart_uses_index_members(self):
+    def test_ready_zombie_restart_uses_index_members(self):
         import pickle
         dyno = self._dyno("normal_worker.1")
         stale = timezone.now() - timezone.timedelta(seconds=django_settings.DYNO_ZOMBIE_THRESHOLD + 10)
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            backend, client = self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                # Fresh index members only: the stale read returns nothing so
-                # this zombie restart comes from the fresh-member evaluation.
-                "zrangebyscore": MagicMock(side_effect=lambda key, mn, mx: [] if mn == "-inf" else ["normal_worker.2"]),
-                "mget": MagicMock(return_value=[pickle.dumps(stale)]),
-                "scan": MagicMock(return_value=(0, ["heroku:dyno_alive:normal_worker.2"])),
-            })
-            backend.client.decode = _real_decoder()
-            with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                dyno.check_for_sibling_zombie_dynos()
+        backend, _ = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=time.time()),
+            # Fresh index members only: the stale read returns nothing so this
+            # zombie restart comes from the fresh-member evaluation.
+            "zrangebyscore": MagicMock(side_effect=lambda key, mn, mx: [] if mn == "-inf" else ["normal_worker.2"]),
+            "mget": MagicMock(return_value=[pickle.dumps(stale)]),
+        })
+        backend.client.decode = _real_decoder()
+        with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
+            dyno.check_for_sibling_zombie_dynos()
         mock_restart.assert_called_once_with("normal_worker.2")
 
-    def test_incomplete_index_never_authorizes_zombie_restart(self):
+    def test_absent_index_member_never_authorizes_zombie_restart(self):
         dyno = self._dyno("normal_worker.1")
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            # SCAN finds member not yet in index → incomplete → no restart
-            backend, _ = self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=[]),
-                "scan": MagicMock(return_value=(0, ["heroku:dyno_alive:normal_worker.2"])),
-            })
-            backend.client.decode = _real_decoder()
-            with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                dyno.check_for_sibling_zombie_dynos()
+        # A dyno that is not in the app index is not a member: no restart.
+        backend, _ = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=time.time()),
+            "zrangebyscore": MagicMock(return_value=[]),
+        })
+        backend.client.decode = _real_decoder()
+        with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
+            dyno.check_for_sibling_zombie_dynos()
         mock_restart.assert_not_called()
 
-    def test_incomplete_index_logs_no_misleading_restarting(self):
-        # Flag true but index incomplete: no restart may happen, so no
+    def test_empty_index_logs_no_misleading_restarting(self):
+        # Ready, but the index lists no members: no restart may happen, so no
         # "Restarting..." log may be emitted either.
         dyno = self._dyno("normal_worker.1")
         stale = timezone.now() - timezone.timedelta(seconds=django_settings.DYNO_ZOMBIE_THRESHOLD + 10)
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            backend, client = self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=[]),
-                "scan": MagicMock(return_value=(0, ["heroku:dyno_alive:normal_worker.2"])),
-            })
-            backend.get.return_value = stale
-            with patch.object(logging.getLogger("heroku_manager.heroku"), "error") as mock_error:
-                with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                    dyno.check_for_sibling_zombie_dynos()
+        backend, client = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=time.time()),
+            "zrangebyscore": MagicMock(return_value=[]),
+        })
+        backend.get.side_effect = lambda key: stale if "dyno_alive" in key else None
+        with patch.object(logging.getLogger("heroku_manager.heroku"), "error") as mock_error:
+            with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
+                dyno.check_for_sibling_zombie_dynos()
         mock_restart.assert_not_called()
         # Non-vacuous: the readiness predicate actually evaluated the own
-        # index score (missing here → not ready), so the check had a real
-        # reason to return before any restart could be considered.
+        # index score, so the check had a real reason to skip the restart.
         client.zscore.assert_called_once()
         mock_error.assert_not_called()
 
 
 class TestIndexedPrune(unittest.TestCase):
-    """Phase B: one bounded ZREMRANGEBYSCORE under the existing zombie-check lock."""
+    """Phase C: one bounded ZREMRANGEBYSCORE under the existing zombie-check lock."""
 
     def setUp(self):
         cache.clear()
@@ -1202,6 +1149,8 @@ class TestIndexedPrune(unittest.TestCase):
     def _patch_backend(self, client_attrs=None, backend_attrs=None):
         backend = MagicMock()
         client = MagicMock()
+        client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
         backend.client.get_client.return_value = client
@@ -1218,13 +1167,12 @@ class TestIndexedPrune(unittest.TestCase):
         # The zombie check holds the existing lock; the prune must run inside it
         # as exactly one bounded ZREMRANGEBYSCORE.
         dyno = self._dyno()
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "false"}):
-            _, client = self._patch_backend(client_attrs={
-                "scan": MagicMock(return_value=(0, [])),
-                "zremrangebyscore": MagicMock(return_value=1),
-            })
-            with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                dyno.check_for_sibling_zombie_dynos()
+        _, client = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=None),
+            "zremrangebyscore": MagicMock(return_value=1),
+        })
+        with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
+            dyno.check_for_sibling_zombie_dynos()
         client.zremrangebyscore.assert_called_once()
         args = client.zremrangebyscore.call_args[0]
         self.assertIn("heroku:dynos:v1:floship", str(args[0]))
@@ -1232,75 +1180,45 @@ class TestIndexedPrune(unittest.TestCase):
         self.assertIsInstance(args[2], (int, float))
         mock_restart.assert_not_called()
 
-    def test_cap_failure_blocks_destructive_actions(self):
-        # Cap exceeded: 501 keys > 500 cap → readers must fail closed (no
-        # downscale, no zombie restart) with no KEYS fallback.  Flag true and
-        # a fresh own index score force the readiness predicate to evaluate
-        # the SCAN, which returns None at cap+1.
+    def test_uncertain_read_blocks_zombie_restart_without_keys(self):
+        # An uncertain stale read (None) blocks the restart and the prune, and
+        # nothing ever falls back to KEYS or SCAN.
         dyno = self._dyno("normal_worker.1")
-        many_keys = [f"heroku:dyno_alive:normal_worker.{i}" for i in range(1, 502)]
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            backend, client = self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=["normal_worker.1"]),
-                "scan": MagicMock(return_value=(0, many_keys)),
-                "zremrangebyscore": MagicMock(return_value=0),
-            })
-            backend.keys = MagicMock(side_effect=AssertionError("KEYS forbidden"))
-            with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                dyno.check_for_sibling_zombie_dynos()
-        client.scan.assert_called_once()
+        backend, client = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=time.time()),
+            "zrangebyscore": MagicMock(return_value=None),
+            "zremrangebyscore": MagicMock(return_value=0),
+        })
+        backend.keys = MagicMock(side_effect=AssertionError("KEYS forbidden"))
+        with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
+            dyno.check_for_sibling_zombie_dynos()
         mock_restart.assert_not_called()
+        client.zremrangebyscore.assert_not_called()
+        client.scan.assert_not_called()
         backend.keys.assert_not_called()
 
     def test_no_keys_route_when_raw_client_missing(self):
         # Missing raw client → readers return uncertain, never fall back to
-        # Django cache.keys() (dynamic or lexical).  Flag true: the predicate
-        # must actually attempt the connection (get_client called) and fail
-        # closed.
+        # Django cache.keys() (dynamic or lexical).  The predicate must
+        # actually attempt the connection (get_client called) and fail closed.
         dyno = self._dyno("normal_worker.1")
         backend = MagicMock()
         backend.client.get_client.side_effect = AttributeError("no raw client")
         backend.make_key.side_effect = lambda key: key
         backend.get.return_value = None
         backend.keys = MagicMock(side_effect=AssertionError("KEYS forbidden"))
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            with patch("heroku_manager.heroku.cache", backend):
-                with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                    dyno.check_for_sibling_zombie_dynos()
+        with patch("heroku_manager.heroku.cache", backend):
+            with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
+                dyno.check_for_sibling_zombie_dynos()
         backend.client.get_client.assert_called()
-        mock_restart.assert_not_called()
-        backend.keys.assert_not_called()
-
-    def test_no_keys_route_when_scan_cap_exceeded(self):
-        # Cap exceeded → uncertain, never KEYS fallback.  Flag true + fresh
-        # own index score: the predicate's SCAN actually exceeds the cap, so
-        # the readiness gate is proven rather than skipped by the flag.
-        dyno = self._dyno("normal_worker.1")
-        many_keys = [f"heroku:dyno_alive:normal_worker.{i}" for i in range(1, 502)]
-        backend = MagicMock()
-        client = MagicMock()
-        client.zscore.return_value = time.time()
-        client.zrangebyscore.return_value = ["normal_worker.1"]
-        client.scan.return_value = (0, many_keys)
-        client.zremrangebyscore.return_value = 0
-        backend.client.get_client.return_value = client
-        backend.make_key.side_effect = lambda key: key
-        backend.get.return_value = None
-        backend.keys = MagicMock(side_effect=AssertionError("KEYS forbidden"))
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            with patch("heroku_manager.heroku.cache", backend):
-                with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                    dyno.check_for_sibling_zombie_dynos()
-        client.scan.assert_called_once()
         mock_restart.assert_not_called()
         backend.keys.assert_not_called()
 
 
 class TestIndexedPhysicalKeyContract(unittest.TestCase):
-    """Phase B contract: every raw SCAN/MGET key derives through cache.make_key
-    physical prefix; raw bytes normalize safely; fresh range is (cutoff, +inf);
-    one readiness SCAN per autoscale cycle."""
+    """Phase C contract: every raw MGET key derives through cache.make_key
+    physical prefix; raw bytes normalize safely; the fresh range is
+    (cutoff, +inf); one readiness ZSCORE per autoscale cycle."""
 
     def setUp(self):
         cache.clear()
@@ -1316,6 +1234,8 @@ class TestIndexedPhysicalKeyContract(unittest.TestCase):
     def _patch_backend(self, client_attrs=None, backend_attrs=None):
         backend = MagicMock()
         client = MagicMock()
+        client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
         backend.client.get_client.return_value = client
@@ -1332,57 +1252,25 @@ class TestIndexedPhysicalKeyContract(unittest.TestCase):
     def test_fresh_members_uses_cutoff_to_plus_inf(self, mock_time):
         from heroku_manager.heroku import _stale_cutoff
         dyno = self._dyno()
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            _, client = self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=["normal_worker.1"]),
-                "scan": MagicMock(return_value=(0, ["prefix:1:heroku:dyno_alive:normal_worker.1"])),
-            })
-            dyno.index_ready
+        _, client = self._patch_backend(client_attrs={
+            "zrangebyscore": MagicMock(return_value=["normal_worker.1"]),
+        })
+        list(dyno._iter_sibling_values("memory"))
         args = client.zrangebyscore.call_args[0]
         self.assertEqual(args[0], "prefix:1:heroku:dynos:v1:floship")
         self.assertEqual(args[1], f'({_stale_cutoff()}')
         self.assertEqual(args[2], "+inf")
 
-    def test_scan_uses_physical_make_key_prefix_and_bytes(self):
-        # Non-destructive sibling path in the mixed window: the compatibility
-        # SCAN must use the physical make_key prefix, normalize raw bytes, and
-        # still surface a hot sibling for safe upscale advocacy.
-        dyno = self._dyno("normal_worker.1", formation_size="standard-2x")
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("HEROKU_DYNO_INDEX_V1_READY", None)
-            backend, client = self._patch_backend(client_attrs={
-                "scan": MagicMock(return_value=(
-                    0,
-                    [b"prefix:1:heroku:dyno_memory:normal_worker.2"],
-                )),
-            })
-            # SCAN physical keys decode into the logical memory keys; the
-            # sibling reader resolves values via cache.get.
-            backend.get.side_effect = lambda key: (
-                2183 if key == "heroku:dyno_memory:normal_worker.2" else None
-            )
-            values = list(dyno._iter_sibling_values("memory"))
-        self.assertEqual(values, [("normal_worker.2", 2183)])
-        match = client.scan.call_args.kwargs["match"]
-        self.assertEqual(match, "prefix:1:heroku:dyno_memory:normal_worker.*")
-
     def test_mget_uses_physical_make_key_keys(self):
         import pickle
         dyno = self._dyno("normal_worker.1")
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            backend, client = self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=["normal_worker.1", "normal_worker.2"]),
-                "mget": MagicMock(return_value=[pickle.dumps(300)]),
-                "scan": MagicMock(return_value=(
-                    0,
-                    ["prefix:1:heroku:dyno_alive:normal_worker.1",
-                     "prefix:1:heroku:dyno_alive:normal_worker.2"],
-                )),
-            })
-            backend.client.decode = _real_decoder()
-            values = list(dyno._iter_sibling_values("memory"))
+        backend, client = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=time.time()),
+            "zrangebyscore": MagicMock(return_value=["normal_worker.1", "normal_worker.2"]),
+            "mget": MagicMock(return_value=[pickle.dumps(300)]),
+        })
+        backend.client.decode = _real_decoder()
+        values = list(dyno._iter_sibling_values("memory"))
         self.assertEqual(values, [("normal_worker.2", 300)])
         self.assertEqual(
             client.mget.call_args[0][0],
@@ -1395,21 +1283,15 @@ class TestIndexedPhysicalKeyContract(unittest.TestCase):
         # and MGET key construction.
         import pickle
         dyno = self._dyno("normal_worker.1")
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            backend, client = self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=[
-                    b"normal_worker.1", b"normal_worker.2", b"normal_worker_extra.1",
-                ]),
-                "mget": MagicMock(return_value=[pickle.dumps(300)]),
-                "scan": MagicMock(return_value=(
-                    0,
-                    ["prefix:1:heroku:dyno_alive:normal_worker.1",
-                     "prefix:1:heroku:dyno_alive:normal_worker.2"],
-                )),
-            })
-            backend.client.decode = _real_decoder()
-            values = list(dyno._iter_sibling_values("memory"))
+        backend, client = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=time.time()),
+            "zrangebyscore": MagicMock(return_value=[
+                b"normal_worker.1", b"normal_worker.2", b"normal_worker_extra.1",
+            ]),
+            "mget": MagicMock(return_value=[pickle.dumps(300)]),
+        })
+        backend.client.decode = _real_decoder()
+        values = list(dyno._iter_sibling_values("memory"))
         self.assertEqual(values, [("normal_worker.2", 300)])
         self.assertEqual(
             client.mget.call_args[0][0],
@@ -1426,137 +1308,226 @@ class TestIndexedPhysicalKeyContract(unittest.TestCase):
         # pickle.dumps(300) is not int()-parseable, so DefaultClient.decode
         # falls through to the serializer and returns 300.
         raw = pickle.dumps(300)
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            backend, _ = self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=[
-                    "normal_worker.1", "normal_worker.2",
-                ]),
-                "mget": MagicMock(return_value=[raw, None]),
-                "scan": MagicMock(return_value=(
-                    0,
-                    ["prefix:1:heroku:dyno_alive:normal_worker.1",
-                     "prefix:1:heroku:dyno_alive:normal_worker.2"],
-                )),
-            })
-            # The production adapter captures the decoder from cache.client
-            # (the django-redis DefaultClient); give the mock backend a real
-            # DefaultClient.decode and wrap it to prove the decode path runs.
-            with patch.object(DefaultClient, "decode", wraps=DefaultClient.decode) as decode:
-                backend.client.decode = real_decoder()
-                values = list(dyno._iter_sibling_values("memory"))
+        backend, _ = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=time.time()),
+            "zrangebyscore": MagicMock(return_value=[
+                "normal_worker.1", "normal_worker.2",
+            ]),
+            "mget": MagicMock(return_value=[raw, None]),
+        })
+        # The production adapter captures the decoder from cache.client
+        # (the django-redis DefaultClient); give the mock backend a real
+        # DefaultClient.decode and wrap it to prove the decode path runs.
+        with patch.object(DefaultClient, "decode", wraps=DefaultClient.decode) as decode:
+            backend.client.decode = real_decoder()
+            values = list(dyno._iter_sibling_values("memory"))
         self.assertEqual(values, [("normal_worker.2", 300)])
         self.assertGreaterEqual(decode.call_count, 1)
 
     def test_stale_index_member_pruned_not_restarted(self):
         dyno = self._dyno("normal_worker.1")
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            _, client = self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=["normal_worker.2"]),
-                "mget": MagicMock(return_value=[None]),
-                "scan": MagicMock(return_value=(
-                    0,
-                    ["prefix:1:heroku:dyno_alive:normal_worker.1",
-                     "prefix:1:heroku:dyno_alive:normal_worker.2"],
-                )),
-                "zremrangebyscore": MagicMock(return_value=1),
-            })
-            with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                dyno.check_for_sibling_zombie_dynos()
+        _, client = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=time.time()),
+            "zrangebyscore": MagicMock(return_value=["normal_worker.2"]),
+            "mget": MagicMock(return_value=[None]),
+            "zremrangebyscore": MagicMock(return_value=1),
+        })
+        with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
+            dyno.check_for_sibling_zombie_dynos()
         # Stale member (score ≤ cutoff) is pruned once and never restarted.
         client.zremrangebyscore.assert_called_once()
         mock_restart.assert_not_called()
 
-    def test_readiness_reused_one_scan_per_cycle(self):
+    def test_one_zscore_per_autoscale_cycle(self):
+        # Readiness is a cached property: one ZSCORE serves the whole cycle,
+        # however many sibling and zombie reads run inside it.
         dyno = self._dyno("normal_worker.1")
-        scan_returns = [
-            (0, ["prefix:1:heroku:dyno_alive:normal_worker.1"]),
-            (0, ["prefix:1:heroku:dyno_alive:normal_worker.2"]),
-        ]
-        scan_calls = []
-        def fake_scan(cursor=0, match=None, count=None):
-            scan_calls.append((cursor, match, count))
-            return scan_returns.pop(0)
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "true"}):
-            _, client = self._patch_backend(client_attrs={
-                "zscore": MagicMock(return_value=time.time()),
-                "zrangebyscore": MagicMock(return_value=["normal_worker.1"]),
-                "scan": fake_scan,
-                "mget": MagicMock(return_value=[None]),
-                "zremrangebyscore": MagicMock(return_value=0),
-            })
-            # readiness, memory sibling read, load sibling read, and zombie check
-            # within one autoscale cycle must reuse the first SCAN result.
-            dyno.index_ready
-            list(dyno._iter_sibling_values("memory"))
-            list(dyno._iter_sibling_values("load"))
-            with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                dyno.check_for_sibling_zombie_dynos()
-        self.assertEqual(len(scan_calls), 1)
+        _, client = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=time.time()),
+            "zrangebyscore": MagicMock(return_value=["normal_worker.1"]),
+            "mget": MagicMock(return_value=[None]),
+            "zremrangebyscore": MagicMock(return_value=0),
+        })
+        dyno.index_ready
+        list(dyno._iter_sibling_values("memory"))
+        list(dyno._iter_sibling_values("load"))
+        with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
+            dyno.check_for_sibling_zombie_dynos()
+        self.assertEqual(client.zscore.call_count, 1)
+        client.scan.assert_not_called()
         mock_restart.assert_not_called()
 
-    def test_flag_false_compat_scan_keeps_sibling_upscale_evidence(self):
-        # Mixed window with physical keys: bounded SCAN must still surface a hot
-        # sibling so safe upscale advocacy works (never silently empty).
+    def test_index_only_reader_keeps_sibling_upscale_evidence(self):
+        # Phase C: sibling reads come from the index whatever the own score
+        # says, so safe upscale advocacy keeps its evidence.
+        import pickle
         dyno = self._dyno("normal_worker.1", formation_size="standard-2x")
-        with patch.dict(os.environ, {"HEROKU_DYNO_INDEX_V1_READY": "false"}):
-            backend, client = self._patch_backend(client_attrs={
-                "scan": MagicMock(return_value=(
-                    0,
-                    [b"prefix:1:heroku:dyno_memory:normal_worker.2"],
-                )),
-                "zremrangebyscore": MagicMock(return_value=0),
-            })
-            backend.get.side_effect = lambda key: (
-                2183 if key == "heroku:dyno_memory:normal_worker.2" else None
-            )
-            self.assertTrue(dyno.any_sibling_requires_upscale)
-        self.assertEqual(
-            client.scan.call_args.kwargs["match"],
-            "prefix:1:heroku:dyno_memory:normal_worker.*",
-        )
+        backend, _ = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=None),
+            "zrangebyscore": MagicMock(return_value=["normal_worker.1", "normal_worker.2"]),
+            "mget": MagicMock(return_value=[pickle.dumps(2183)]),
+        })
+        backend.client.decode = _real_decoder()
+        self.assertTrue(dyno.any_sibling_requires_upscale)
 
 
-    def test_not_ready_compat_scan_still_detects_hot_sibling_for_upscale(self):
-        # Non-destructive sibling upscale evidence must remain available in the
-        # not-ready compatibility-SCAN window.
-        dyno = self._dyno("normal_worker.1", formation_size="standard-2x")
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("HEROKU_DYNO_INDEX_V1_READY", None)
-            backend, _ = self._patch_backend(client_attrs={
-                "scan": MagicMock(return_value=(
-                    0,
-                    [b"prefix:1:heroku:dyno_memory:normal_worker.2"],
-                )),
-            })
-            backend.get.side_effect = lambda key: (
-                2183 if key == "heroku:dyno_memory:normal_worker.2" else None
-            )
-            self.assertTrue(dyno.any_sibling_requires_upscale)
+class TestNoScanLeftInModule(unittest.TestCase):
+    """Phase C source guard: the compatibility SCAN, its flag and its cap are gone."""
+
+    def test_no_scan_identifiers_or_rollout_flag_in_source(self):
+        import inspect
+        from heroku_manager import heroku as mod
+        source = inspect.getsource(mod)
+        self.assertNotIn("scan_keys", source)
+        self.assertNotIn("scan(", source)
+        self.assertNotIn("HEROKU_DYNO_INDEX_V1_READY", source)
+        self.assertNotIn("HEROKU_DYNO_INDEX_SCAN_CAP", source)
+        self.assertFalse(hasattr(mod._IndexAdapter, "scan_keys"))
 
 
-class TestScanCapExceeded(unittest.TestCase):
-    """HEROKU_DYNO_INDEX_SCAN_CAP: cap+1 keys -> None + per-app warning; no KEYS."""
+class TestRegistryDegradedLedger(unittest.TestCase):
+    """Phase C: a failed index write, or a re-created member list, keeps the
+    app's destructive gates closed while a live dyno can be invisible."""
 
-    def test_cap_plus_one_returns_none_and_logs_warning(self):
-        from heroku_manager.heroku import _IndexAdapter
+    def setUp(self):
+        cache.clear()
+
+    def tearDown(self):
+        cache.clear()
+
+    def _dyno(self, dyno_name="normal_worker.1", seeded_ready=False):
+        dyno = make_dyno(dyno_name, formation_size="standard-2x")
+        if not seeded_ready:
+            _restore_real_index_ready(dyno)
+        return dyno
+
+    def _patch_backend(self, client_attrs=None):
         backend = MagicMock()
         client = MagicMock()
-        client.scan.return_value = (0, [
-            f"p:heroku:dyno_alive:normal_worker.{i}" for i in range(1, 4)
-        ])
+        client.get.return_value = None
+        client.zrange.return_value = []
+        for name, value in (client_attrs or {}).items():
+            setattr(client, name, value)
         backend.client.get_client.return_value = client
-        backend.make_key.side_effect = lambda key: f"p:{key}"
-        backend.keys = MagicMock(side_effect=AssertionError("KEYS forbidden"))
-        with patch("heroku_manager.heroku.cache", backend):
-            adapter = _IndexAdapter("floship")
-            adapter.scan_cap = 2
-            with self.assertLogs("heroku_manager.heroku", level="WARNING") as logs:
-                result = adapter.scan_keys("heroku:dyno_alive:")
-        self.assertIsNone(result)
-        self.assertTrue(any("floship" in line and "2" in line for line in logs.output))
-        backend.keys.assert_not_called()
+        backend.make_key.side_effect = lambda key: key
+        patcher = patch("heroku_manager.heroku.cache", backend)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return backend, client
+
+    @staticmethod
+    def _alive_only(key):
+        return b"checked in" if "dyno_alive" in str(key) else None
+
+    def test_failed_registry_write_records_the_dyno_in_the_ledger(self):
+        from heroku_manager.heroku import _registry_degraded_key, _registry_degraded_ttl
+        _, client = self._patch_backend()
+        client.zadd.side_effect = [RuntimeError("write failed"), 1]
+        self.assertFalse(_update_dyno_registry("floship", "web.1", score=123))
+        ledger = _registry_degraded_key("floship")
+        self.assertEqual(client.zadd.call_args_list[-1][0], (ledger, {"web.1": ANY}))
+        client.expire.assert_called_once_with(ledger, _registry_degraded_ttl())
+
+    def test_ledger_entry_of_a_live_missing_writer_is_degraded(self):
+        from heroku_manager.heroku import _registry_degraded
+        _, client = self._patch_backend({
+            "zrange": MagicMock(return_value=[(b"web.1", 1000.0)]),
+            "zscore": MagicMock(return_value=None),
+            "get": MagicMock(side_effect=self._alive_only),
+        })
+        self.assertTrue(_registry_degraded(self._dyno()))
+        client.zrem.assert_not_called()
+
+    def test_ledger_keeps_an_older_score_degraded(self):
+        from heroku_manager.heroku import _registry_degraded
+        # The score predates the failed write, so it does not prove recovery;
+        # the dyno is alive and must keep the gate closed.
+        _, client = self._patch_backend({
+            "zrange": MagicMock(return_value=[(b"web.1", 2000.0)]),
+            "zscore": MagicMock(return_value=1000.0),
+            "get": MagicMock(side_effect=self._alive_only),
+        })
+        self.assertTrue(_registry_degraded(self._dyno()))
+        client.zrem.assert_not_called()
+
+    def test_ledger_drops_a_writer_that_registered_again(self):
+        from heroku_manager.heroku import _registry_degraded, _registry_degraded_key
+        _, client = self._patch_backend({
+            "zrange": MagicMock(return_value=[(b"web.1", 1000.0)]),
+            "zscore": MagicMock(return_value=2000.0),
+        })
+        self.assertFalse(_registry_degraded(self._dyno()))
+        client.zrem.assert_called_once_with(_registry_degraded_key("floship"), "web.1")
+
+    def test_ledger_drops_a_dyno_that_is_gone(self):
+        from heroku_manager.heroku import _registry_degraded
+        _, client = self._patch_backend({
+            "zrange": MagicMock(return_value=[(b"web.1", 1000.0)]),
+            "zscore": MagicMock(return_value=None),
+            "get": MagicMock(return_value=None),
+        })
+        self.assertFalse(_registry_degraded(self._dyno()))
+        client.zrem.assert_called_once()
+
+    def test_full_ledger_batch_fails_closed(self):
+        from heroku_manager.heroku import _registry_degraded, _DEGRADED_LEDGER_LIMIT
+        entries = [(b"web.%d" % i, 1000.0) for i in range(_DEGRADED_LEDGER_LIMIT)]
+        _, client = self._patch_backend({
+            "zrange": MagicMock(return_value=entries),
+            "zscore": MagicMock(return_value=2000.0),
+        })
+        # Every inspected entry recovered, but a full batch cannot prove that
+        # no later entry names a live missing writer.
+        self.assertTrue(_registry_degraded(self._dyno()))
+        self.assertEqual(client.zrem.call_count, _DEGRADED_LEDGER_LIMIT)
+
+    def test_ledger_read_failure_is_degraded(self):
+        from heroku_manager.heroku import _registry_degraded
+        self._patch_backend({"zrange": MagicMock(side_effect=RuntimeError("redis down"))})
+        self.assertTrue(_registry_degraded(self._dyno()))
+
+    def test_recreated_member_list_publishes_the_reconvergence_marker(self):
+        from heroku_manager.heroku import _registry_reconverging_key
+        backend, client = self._patch_backend({"exists": MagicMock(return_value=0)})
+        self.assertTrue(_update_dyno_registry("floship", "web.1", score=123))
+        backend.set.assert_called_once_with(_registry_reconverging_key("floship"), True, timeout=60)
+        client.zadd.assert_called_once()
+
+    def test_reconvergence_marker_blocks_destructive_actions(self):
+        dyno = self._dyno(seeded_ready=True)
+        self._patch_backend({
+            "get": MagicMock(side_effect=lambda key: b"1" if "reconverging" in str(key) else None),
+        })
+        self.assertTrue(dyno.index_ready)  # cached before the fleet re-registered
+        self.assertFalse(dyno.allow_downscale)
+        self.assertFalse(dyno.allow_downscale_on_shutdown)
+        self.assertFalse(dyno.is_formation_idle)
+
+    def test_ledger_published_after_readiness_was_cached_still_blocks(self):
+        # The fixture seeds index_ready=True, which stands for a readiness
+        # cache filled earlier in the cycle: a failure recorded since then must
+        # still stop the resize at the decision point.
+        dyno = self._dyno(seeded_ready=True)
+        self._patch_backend({
+            "zrange": MagicMock(return_value=[(b"web.1", 1000.0)]),
+            "zscore": MagicMock(return_value=None),
+            "get": MagicMock(side_effect=self._alive_only),
+        })
+        self.assertTrue(dyno.index_ready)  # cached before the failure landed
+        self.assertFalse(dyno.allow_downscale)
+        self.assertFalse(dyno.allow_downscale_on_shutdown)
+        self.assertFalse(dyno.is_formation_idle)
+
+    def test_ledger_read_failure_blocks_destructive_actions(self):
+        dyno = self._dyno(seeded_ready=True)
+        self._patch_backend({"zrange": MagicMock(side_effect=RuntimeError("redis down"))})
+        self.assertFalse(dyno.allow_downscale)
+
+    def test_metric_reads_use_the_read_client(self):
+        from heroku_manager.heroku import _IndexAdapter
+        backend, _ = self._patch_backend()
+        _IndexAdapter("floship").fresh_members(0)
+        backend.client.get_client.assert_called_once_with(write=False)
 
 
 class TestIndexAppIsolation(unittest.TestCase):
@@ -1571,6 +1542,8 @@ class TestIndexAppIsolation(unittest.TestCase):
         from heroku_manager.heroku import _IndexAdapter
         backend = MagicMock()
         client = MagicMock()
+        client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         zsets = {
             "p:heroku:dynos:v1:app-a": ["a_worker.1", "a_worker.2"],
             "p:heroku:dynos:v1:app-b": ["b_worker.1"],

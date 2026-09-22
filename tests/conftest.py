@@ -67,14 +67,14 @@ def make_dyno(dyno_name="normal_worker.1", formation_size="standard-2x",
     return dyno
 
 
-def patch_cache_keys(memory_store):
-    """Patch the raw client so SCAN serves keys from ``memory_store``.
+def patch_index_backend(memory_store):
+    """Patch the raw client so the index adapter reads ``memory_store``.
 
     LocMem has no raw client; the Phase B adapter requires one.  This helper
     installs a django-redis-style backend proxy on top of the real LocMemCache
-    (delegating get/set/delete/lock) with ``make_key`` identity and a SCAN that
-    returns the provided logical keys — the same shape tests previously served
-    through ``cache.keys()`` mocks.
+    (delegating get/set/delete/lock) with ``make_key`` identity and a
+    ZRANGEBYSCORE that lists the fixture store's dyno names.  There is no SCAN
+    on the fake client, so a test that still tried to scan would fail loudly.
     """
     from django.core.cache import cache as real_cache
 
@@ -83,9 +83,6 @@ def patch_cache_keys(memory_store):
 
         def __init__(self, backend):
             self._backend = backend
-
-        def scan(self, cursor=0, match=None, count=None):
-            return self._backend._scan(cursor=cursor, match=match, count=count)
 
         def zremrangebyscore(self, key, min_score, max_score):
             return 0
@@ -106,6 +103,20 @@ def patch_cache_keys(memory_store):
             # so the real predicate fails closed.  Legacy destructive-gate
             # tests seed index_ready directly and never hit this.
             return None
+
+        def get(self, key):
+            import pickle
+            value = self._backend._store.get(key, None)
+            if value is None:
+                value = self._backend.get(key)
+            return pickle.dumps(value) if value is not None else None
+
+        def zrange(self, key, start, end, withscores=False):
+            # No failed-writer ledger in the fixture store: never degraded.
+            return []
+
+        def exists(self, key):
+            return 1 if key in self._backend._store else 0
 
         def mget(self, keys):
             import pickle
@@ -137,8 +148,8 @@ def patch_cache_keys(memory_store):
 
         def __init__(self, store):
             if isinstance(store, list):
-                # List fixtures (raw SCAN key lists) mirror the locmem cache:
-                # values live in the real backend, reachable via get().
+                # List fixtures (bare key lists) mirror the locmem cache: values
+                # live in the real backend, reachable via get().
                 self._store = {key: None for key in store}
             else:
                 self._store = dict(store)
@@ -157,25 +168,12 @@ def patch_cache_keys(memory_store):
         def client(self):
             return self._raw
 
-        def _scan(self, cursor=0, match=None, count=None):
-            pattern = match or "*"
-            if pattern.endswith("*"):
-                prefix = pattern[:-1]
-            else:
-                prefix = pattern
-            keys = [
-                key for key in self._store
-                if key.startswith(prefix)
-            ]
-            return (0, keys)
-
         def __getattr__(self, name):
             return getattr(real_cache, name)
 
     return patch("heroku_manager.heroku.cache", _ScanBackend(memory_store))
 
 
-patch_scan_backend = patch_cache_keys
 
 
 def real_decoder():

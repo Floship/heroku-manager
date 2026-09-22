@@ -79,10 +79,11 @@ class TestCheckForSiblingZombieDynos(BaseLockTestCase):
         """django-redis-shaped backend with distinct stale/fresh member sets."""
         backend = MagicMock()
         client = MagicMock()
+        client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         client.zscore.return_value = time.time()
         client.zrangebyscore.side_effect = lambda key, mn, mx: stale if mn == "-inf" else fresh
         client.mget.return_value = alive_values
-        client.scan.return_value = (0, [])
         backend.client.get_client.return_value = client
         backend.client.decode = pickle.loads
         backend.make_key.side_effect = lambda key: key
@@ -160,42 +161,47 @@ class TestCheckForSiblingZombieDynos(BaseLockTestCase):
         self.assertLess(calls.index("mget"), calls.index("zremrangebyscore"))
 
     def test_prune_uses_write_client_not_read_replica(self):
-        # Not-ready path: the one prune comes from get_client(write=True) and
-        # no read/replica client is acquired at all.
+        # Not-ready path: readiness reads through the read client; the one
+        # prune goes through get_client(write=True).  No write rides on the
+        # read client.
         dyno = make_dyno(index_ready_seed=False)
         backend = MagicMock()
-        client = MagicMock()
-        client.zremrangebyscore.return_value = 1
-        backend.client.get_client.return_value = client
+        read_client = MagicMock()
+        read_client.zscore.return_value = None
+        write_client = MagicMock()
+        write_client.zremrangebyscore.return_value = 1
+        backend.client.get_client.side_effect = (
+            lambda write=False: write_client if write else read_client
+        )
         backend.make_key.side_effect = lambda key: key
         backend.get.return_value = None
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("HEROKU_DYNO_INDEX_V1_READY", None)
-            with patch("heroku_manager.heroku.cache", backend):
-                dyno.check_for_sibling_zombie_dynos()
-        backend.client.get_client.assert_called_once_with(write=True)
-        client.zremrangebyscore.assert_called_once()
+        with patch("heroku_manager.heroku.cache", backend):
+            dyno.check_for_sibling_zombie_dynos()
+        backend.client.get_client.assert_any_call(write=True)
+        read_client.zremrangebyscore.assert_not_called()
+        write_client.zremrangebyscore.assert_called_once()
 
     def test_prune_runs_once_before_readiness_check_then_returns_immediately(self):
-        # The zombie check prunes once under the lock; when not ready it must
-        # return immediately (no SCAN-based restart evaluation).
+        # The zombie check prunes once under the lock; when the own score is
+        # missing it returns immediately, with no member read and no restart.
         dyno = make_dyno(index_ready_seed=False)
         backend = MagicMock()
         client = MagicMock()
+        client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         client.zremrangebyscore.return_value = 2
-        client.scan.side_effect = AssertionError("not-ready must not scan for zombies")
-        client.zscore.side_effect = AssertionError("not-ready must not zscore")
+        client.zscore.return_value = None
         backend.client.get_client.return_value = client
         backend.make_key.side_effect = lambda key: key
         backend.get.return_value = None
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("HEROKU_DYNO_INDEX_V1_READY", None)
-            with patch("heroku_manager.heroku.cache", backend):
-                with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
-                    dyno.check_for_sibling_zombie_dynos()
+        with patch("heroku_manager.heroku.cache", backend):
+            with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
+                dyno.check_for_sibling_zombie_dynos()
         client.zremrangebyscore.assert_called_once()
+        client.zscore.assert_called_once()
+        client.zrangebyscore.assert_not_called()
+        client.mget.assert_not_called()
         client.scan.assert_not_called()
-        client.zscore.assert_not_called()
         mock_restart.assert_not_called()
 
     def test_cached_ready_none_fresh_members_or_mget_fails_closed(self):
@@ -207,6 +213,8 @@ class TestCheckForSiblingZombieDynos(BaseLockTestCase):
                 dyno = make_dyno()  # cached-ready seed
                 backend = MagicMock()
                 client = MagicMock()
+                client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
+                client.get.return_value = None  # degraded marker absent unless the test sets it
                 client.zremrangebyscore.return_value = 0
                 client.zrangebyscore.return_value = members
                 client.mget.return_value = mget_values

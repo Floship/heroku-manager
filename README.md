@@ -10,43 +10,53 @@ cleanup removes it. Since 0.2.13 the sibling-memory, formation-idle, and zombie
 readers consume that index instead of Redis `KEYS`. The package never issues a
 Redis `KEYS` command at runtime.
 
-### Readiness flag (default false)
+### Readiness and the indexed registry (Phase C)
 
-Set `HEROKU_DYNO_INDEX_V1_READY=true` in an app's environment only after the
-staged rollout proof passes for that app:
+Since 0.2.14 the app ZSET is the only member list: the compatibility `SCAN` and
+its rollout flag are removed, and the package issues neither `SCAN` nor `KEYS`
+at runtime.
 
-1. Tag-pin before flag: pin the portal to this package's v0.2.13 tag (created
-   at merge time) and deploy with the flag unset (writers are unchanged; the
-   compatibility reader uses a bounded `SCAN` with exact-prefix filtering).
-2. Let at least two autoscaler check-in cycles run, obtain the expected active
-   autoscaled dyno names from the Heroku Platform API/`heroku ps`, and confirm
-   the fresh v1 index members contain every expected dyno in both cycles.
-3. Set the flag. Runtime readiness additionally requires the current dyno to
-   have a fresh v1 score and every compatibility-SCAN member to be represented
-   in the index.
+Runtime readiness is the current dyno's own fresh index score: the dyno must
+appear in the app ZSET with a score newer than `DYNO_ZOMBIE_THRESHOLD`. Every
+uncertainty fails closed, so no downscale, no formation-idle downscale
+authorization, and no zombie restart; check-ins and safe local/sibling
+upscales remain allowed. Sibling readers are index-only as well: an uncertain
+member read yields nothing rather than a partial fleet.
 
-The flag defaults to false, and destructive actions are never authorized
-without runtime readiness. When the flag is false/absent, or when it is set
-but readiness is uncertain, incomplete, or errored, the package fails closed:
-no downscale, no formation-idle downscale authorization, and no zombie
-restart. Check-ins and safe local/sibling upscales remain allowed, and the
-bounded compatibility SCAN stays available only to those non-destructive
-readers. Clearing the flag is the immediate rollback; the compatibility scan
-remains until a later Phase C release removes it.
+A registry write that raises publishes `heroku:dynos:v1:{app}:degraded` for
+two autoscale intervals and readiness fails closed for the whole app until a
+later check-in proves the writer works again. An evicted ZSET re-converges
+within one autoscale interval, because every dyno re-registers at its own
+check-in. Readiness reads the marker and its own score through the write
+client, never a replica, and the destructive gates re-read the marker uncached
+at the decision point, so a marker published after a readiness check still
+stops the resize. The sibling metric reads keep the read client.
+A registry write that raises records the dyno name in
+`heroku:dynos:v1:{app}:degraded`, and readiness fails closed for the whole app
+while that ledger names a live dyno. A check-in that finds the member list
+missing - first deploy, or an eviction - marks
+`heroku:dynos:v1:{app}:reconverging` for two autoscale intervals, because the
+fleet only re-registers over the next interval. Readiness and the destructive
+gates read both markers uncached through the write client, never a replica, so
+a failure recorded after a readiness check still stops the resize. A ledger
+entry clears only on proof: an index score newer than the recorded failure, or
+a missing liveness key. The sibling metric reads keep the read client.
 
-`HEROKU_DYNO_INDEX_SCAN_CAP` (default 500) bounds the compatibility SCAN per
-reader call. When a scan exceeds the cap, the reader logs a per-app warning
-and returns no results: readiness fails closed (no destructive actions) and
-sibling-upscale evidence degrades to empty for that cycle — never a `KEYS`
-fallback. Leave the default unless the fleet legitimately exceeds 500 dynos.
+Deploy prerequisites, all of which held for every Floship app at release time:
 
-After enabling the flag, verify per app:
-- no `KEYS` entries in the Redis slowlog for heroku-manager readers;
+1. v0.2.13 or later (index-aware writers) runs on every app for at least one
+   full `DYNO_ZOMBIE_THRESHOLD` window, so no live dyno can be missing from
+   the index.
+2. The app ZSET exists and the fresh members contain every dyno name
+   `heroku ps` reports.
+
+Rollback is the previous tag: v0.2.13 keeps its bounded compatibility `SCAN` in
+the not-ready window.
+
+After deploying, verify per app:
+- no `SCAN` and no `KEYS` entries in the Redis slowlog for heroku-manager;
 - fresh v1 index members match the `heroku ps` expected dyno names (parity);
-- a cool formation still downscales and a stale sibling is restarted once
-  (downscale/zombie behavior unchanged from the compatibility window);
-- rollback stays immediate: clearing `HEROKU_DYNO_INDEX_V1_READY` restores the
-  compatibility window.
+- a cool formation still downscales and a stale sibling is restarted once.
 
 ## Features
 
