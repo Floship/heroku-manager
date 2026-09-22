@@ -769,6 +769,7 @@ class TestIndexedDynoReadiness(unittest.TestCase):
         """Patch heroku_manager.heroku.cache with a mock django-redis backend."""
         backend = MagicMock()
         client = MagicMock()
+        client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
         client.get.return_value = None  # degraded marker absent unless the test sets it
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
@@ -860,6 +861,7 @@ class TestIndexedSiblingValues(unittest.TestCase):
     def _patch_backend(self, client_attrs=None, backend_attrs=None):
         backend = MagicMock()
         client = MagicMock()
+        client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
         client.get.return_value = None  # degraded marker absent unless the test sets it
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
@@ -984,6 +986,7 @@ class TestIndexedFailClosed(unittest.TestCase):
     def _patch_backend(self, client_attrs=None, backend_attrs=None):
         backend = MagicMock()
         client = MagicMock()
+        client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
         client.get.return_value = None  # degraded marker absent unless the test sets it
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
@@ -1146,6 +1149,7 @@ class TestIndexedPrune(unittest.TestCase):
     def _patch_backend(self, client_attrs=None, backend_attrs=None):
         backend = MagicMock()
         client = MagicMock()
+        client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
         client.get.return_value = None  # degraded marker absent unless the test sets it
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
@@ -1230,6 +1234,7 @@ class TestIndexedPhysicalKeyContract(unittest.TestCase):
     def _patch_backend(self, client_attrs=None, backend_attrs=None):
         backend = MagicMock()
         client = MagicMock()
+        client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
         client.get.return_value = None  # degraded marker absent unless the test sets it
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
@@ -1380,8 +1385,9 @@ class TestNoScanLeftInModule(unittest.TestCase):
         self.assertFalse(hasattr(mod._IndexAdapter, "scan_keys"))
 
 
-class TestRegistryDegradedMarker(unittest.TestCase):
-    """Phase C: a failed index write closes the app's destructive gates."""
+class TestRegistryDegradedLedger(unittest.TestCase):
+    """Phase C: a failed index write keeps the app's destructive gates closed
+    for as long as the missing writer is alive."""
 
     def setUp(self):
         cache.clear()
@@ -1389,81 +1395,94 @@ class TestRegistryDegradedMarker(unittest.TestCase):
     def tearDown(self):
         cache.clear()
 
-    def test_failed_registry_write_publishes_the_marker(self):
-        from heroku_manager.heroku import _registry_degraded_key
-        # LocMem exposes no raw write client, so the write fails like a Redis
-        # error and the dyno would be invisible to every reader.
-        self.assertFalse(_update_dyno_registry("floship", "web.1", score=123))
-        self.assertTrue(cache.get(_registry_degraded_key("floship")))
+    def _dyno(self, dyno_name="normal_worker.1", seeded_ready=False):
+        dyno = make_dyno(dyno_name, formation_size="standard-2x")
+        if not seeded_ready:
+            _restore_real_index_ready(dyno)
+        return dyno
 
-    def test_marker_marks_readiness_false_without_a_score_read(self):
-        import pickle
-        from heroku_manager.heroku import _registry_degraded_key
-        dyno = make_dyno("normal_worker.1")
-        _restore_real_index_ready(dyno)
+    def _patch_backend(self, client_attrs=None):
         backend = MagicMock()
         client = MagicMock()
-        client.get.return_value = None  # degraded marker absent unless the test sets it
-        client.zscore.return_value = time.time()
-        client.get.return_value = pickle.dumps(True)
+        client.get.return_value = None
+        client.zrange.return_value = []
+        for name, value in (client_attrs or {}).items():
+            setattr(client, name, value)
         backend.client.get_client.return_value = client
-        backend.client.decode = pickle.loads
         backend.make_key.side_effect = lambda key: key
-        with patch("heroku_manager.heroku.cache", backend):
-            self.assertFalse(dyno.index_ready)
-        client.get.assert_called_once_with(_registry_degraded_key("floship"))
-        client.zscore.assert_not_called()
-        # The safety marker comes from the write authority, never a replica.
-        backend.client.get_client.assert_called_once_with(write=True)
+        patcher = patch("heroku_manager.heroku.cache", backend)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return backend, client
+
+    def test_failed_registry_write_records_the_dyno_in_the_ledger(self):
+        from heroku_manager.heroku import _registry_degraded_key, _registry_degraded_ttl
+        _, client = self._patch_backend()
+        client.zadd.side_effect = [RuntimeError("write failed"), 1]
+        self.assertFalse(_update_dyno_registry("floship", "web.1", score=123))
+        ledger = _registry_degraded_key("floship")
+        self.assertEqual(client.zadd.call_args_list[-1][0], (ledger, {"web.1": ANY}))
+        client.expire.assert_called_once_with(ledger, _registry_degraded_ttl())
+
+    def test_ledger_entry_of_a_live_missing_writer_is_degraded(self):
+        from heroku_manager.heroku import _registry_degraded
+        _, client = self._patch_backend({
+            "zrange": MagicMock(return_value=[b"web.1"]),
+            "zscore": MagicMock(return_value=None),
+            "get": MagicMock(return_value=b"checked in"),
+        })
+        self.assertTrue(_registry_degraded(self._dyno()))
+        client.zrem.assert_not_called()
+
+    def test_ledger_drops_a_writer_that_registered_again(self):
+        from heroku_manager.heroku import _registry_degraded, _registry_degraded_key
+        _, client = self._patch_backend({
+            "zrange": MagicMock(return_value=["web.1"]),
+            "zscore": MagicMock(return_value=time.time()),
+        })
+        self.assertFalse(_registry_degraded(self._dyno()))
+        client.zrem.assert_called_once_with(_registry_degraded_key("floship"), "web.1")
+
+    def test_ledger_drops_a_dyno_that_is_gone(self):
+        from heroku_manager.heroku import _registry_degraded
+        _, client = self._patch_backend({
+            "zrange": MagicMock(return_value=["web.1"]),
+            "zscore": MagicMock(return_value=None),
+            "get": MagicMock(return_value=None),
+        })
+        self.assertFalse(_registry_degraded(self._dyno()))
+        client.zrem.assert_called_once()
+
+    def test_ledger_read_failure_is_degraded(self):
+        from heroku_manager.heroku import _registry_degraded
+        self._patch_backend({"zrange": MagicMock(side_effect=RuntimeError("redis down"))})
+        self.assertTrue(_registry_degraded(self._dyno()))
+
+    def test_ledger_published_after_readiness_was_cached_still_blocks(self):
+        # The fixture seeds index_ready=True, which stands for a readiness
+        # cache filled earlier in the cycle: a failure recorded since then must
+        # still stop the resize at the decision point.
+        dyno = self._dyno(seeded_ready=True)
+        self._patch_backend({
+            "zrange": MagicMock(return_value=[b"web.1"]),
+            "zscore": MagicMock(return_value=None),
+            "get": MagicMock(return_value=b"checked in"),
+        })
+        self.assertTrue(dyno.index_ready)  # cached before the failure landed
+        self.assertFalse(dyno.allow_downscale)
+        self.assertFalse(dyno.allow_downscale_on_shutdown)
+        self.assertFalse(dyno.is_formation_idle)
+
+    def test_ledger_read_failure_blocks_destructive_actions(self):
+        dyno = self._dyno(seeded_ready=True)
+        self._patch_backend({"zrange": MagicMock(side_effect=RuntimeError("redis down"))})
+        self.assertFalse(dyno.allow_downscale)
 
     def test_metric_reads_use_the_read_client(self):
         from heroku_manager.heroku import _IndexAdapter
-        backend = MagicMock()
-        client = MagicMock()
-        client.get.return_value = None  # degraded marker absent unless the test sets it
-        backend.client.get_client.return_value = client
-        backend.make_key.side_effect = lambda key: key
-        with patch("heroku_manager.heroku.cache", backend):
-            _IndexAdapter("floship").fresh_members(0)
+        backend, _ = self._patch_backend()
+        _IndexAdapter("floship").fresh_members(0)
         backend.client.get_client.assert_called_once_with(write=False)
-
-    def test_marker_published_after_readiness_was_cached_still_blocks(self):
-        import pickle
-        # The fixture seeds index_ready=True, which stands for a readiness
-        # cache filled earlier in the cycle: a marker published since then must
-        # still stop the resize at the decision point.
-        dyno = make_dyno("normal_worker.1", formation_size="standard-2x")
-        backend = MagicMock()
-        client = MagicMock()
-        client.get.return_value = None  # degraded marker absent unless the test sets it
-        client.get.return_value = pickle.dumps(True)
-        backend.client.get_client.return_value = client
-        backend.client.decode = pickle.loads
-        backend.make_key.side_effect = lambda key: key
-        with patch("heroku_manager.heroku.cache", backend):
-            self.assertTrue(dyno.index_ready)  # cached before the marker landed
-            self.assertFalse(dyno.allow_downscale)
-            self.assertFalse(dyno.allow_downscale_on_shutdown)
-            self.assertFalse(dyno.is_formation_idle)
-
-    def test_marker_read_failure_blocks_destructive_actions(self):
-        dyno = make_dyno("normal_worker.1", formation_size="standard-2x")
-        backend = MagicMock()
-        client = MagicMock()
-        client.get.return_value = None  # degraded marker absent unless the test sets it
-        client.get.side_effect = RuntimeError("redis read failed")
-        backend.client.get_client.return_value = client
-        backend.make_key.side_effect = lambda key: key
-        with patch("heroku_manager.heroku.cache", backend):
-            self.assertFalse(dyno.allow_downscale)
-
-    def test_marker_expires_after_two_autoscale_intervals(self):
-        from heroku_manager.heroku import _mark_registry_degraded, _registry_degraded_key
-        with patch("heroku_manager.heroku.cache") as mock_cache:
-            _mark_registry_degraded("floship")
-        mock_cache.set.assert_called_once_with(
-            _registry_degraded_key("floship"), True, timeout=60,
-        )
 
 
 class TestIndexAppIsolation(unittest.TestCase):
@@ -1478,6 +1497,7 @@ class TestIndexAppIsolation(unittest.TestCase):
         from heroku_manager.heroku import _IndexAdapter
         backend = MagicMock()
         client = MagicMock()
+        client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
         client.get.return_value = None  # degraded marker absent unless the test sets it
         zsets = {
             "p:heroku:dynos:v1:app-a": ["a_worker.1", "a_worker.2"],

@@ -34,15 +34,15 @@ def _index_ready(instance):
         return False
     cutoff = _stale_cutoff()
     try:
-        # Readiness authorizes destructive actions, so its marker and its own
+        # Readiness authorizes destructive actions, so its ledger and its own
         # score come from the write authority: a lagging replica must never
         # hide a sibling's failed registry write.
         adapter = _IndexAdapter(instance.app_name, primary=True)
         client = adapter._connect()
         if client is None:
             return False  # no raw client → cannot prove the index → fail closed
-        if adapter.get(_registry_degraded_key(instance.app_name)):
-            return False  # a sibling reported its registry write failed
+        if _registry_degraded(instance):
+            return False  # a live sibling is missing from the member list
         own_score = client.zscore(adapter._index_key, instance.dyno_name)
         return own_score is not None and own_score > cutoff
     except Exception:
@@ -59,36 +59,13 @@ def _index_fail_closed(instance):
     current dyno proves a fresh index score.  Sibling readers read the same
     index and yield nothing on an uncertain read.
 
-    The degraded marker is read here, uncached: ``index_ready`` lives for one
-    autoscale cycle, and a sibling can report a failed registry write after
+    The failed-writer ledger is read here, uncached: ``index_ready`` lives for
+    one autoscale cycle, and a sibling can report a failed registry write after
     that cache was filled.
     """
     if _registry_degraded(instance):
         return True
     return not instance.index_ready
-
-
-def _registry_degraded(instance):
-    """Uncached read of the app's degraded marker through the write authority.
-
-    False on a clean read; True when the marker is set or the read itself
-    fails, because the callers of this check authorize a resize.  A missing
-    raw client is not degraded on its own: ``index_ready`` already fails closed
-    for that case.
-    """
-    if not instance.app_name:
-        return True
-    try:
-        adapter = _IndexAdapter(instance.app_name, primary=True)
-        if adapter._connect() is None:
-            return False
-        return bool(adapter.get(_registry_degraded_key(instance.app_name)))
-    except Exception:
-        logger.warning(
-            "Dyno registry degraded-marker read failed for app %s; failing "
-            "closed (no destructive actions).", instance.app_name, exc_info=True,
-        )
-        return True
 
 
 def _stale_cutoff():
@@ -191,13 +168,6 @@ class _IndexAdapter:
             return None
         return [self.decode(value) for value in raw_values]
 
-    def get(self, key):
-        """One decoded raw GET; None means absent, an exception means uncertain."""
-        client = self._connect()
-        if client is None:
-            return None
-        return self.decode(client.get(cache.make_key(key)))
-
     def zremrangebyscore(self, min_score, max_score):
         """Prune through a write client; never write via a read replica."""
         if self._index_key is None:
@@ -209,28 +179,80 @@ class _IndexAdapter:
         return client.zremrangebyscore(self._index_key, min_score, max_score)
 
 
+#: Most failed-writer names probed in one degraded read.  The ledger is per app
+#: and normally holds one entry or none.
+_DEGRADED_LEDGER_LIMIT = 20
+
+
 def _registry_degraded_key(app_name):
-    """Marker key for an app whose index may be missing a live dyno."""
+    """Ledger of dyno names whose registry write failed (score = failure time)."""
     return f'heroku:dynos:v1:{app_name}:degraded'
 
 
-def _mark_registry_degraded(app_name):
-    """Publish the short-lived degraded marker for one app (best effort).
+def _registry_degraded_ttl():
+    """Ledger lifetime: two zombie windows after the last recorded failure."""
+    return 2 * int(getattr(settings, 'DYNO_ZOMBIE_THRESHOLD', 24 * 60 * 60))
 
-    A dyno whose index write failed is invisible to every reader, so the app
-    must stop authorizing destructive actions until a later check-in proves
-    the writer works again.  The marker is refreshed by every failed write and
-    expires after two autoscale intervals: a transient failure closes the gate
-    for about a minute, and a persistent one keeps it closed.
+
+def _mark_registry_degraded(app_name, dyno_name):
+    """Record one failed registry write in the app's ledger (best effort).
+
+    The entry lives until that dyno registers again or its liveness key
+    expires, which is exactly as long as a live dyno can be missing from the
+    only member list; _registry_degraded does that bookkeeping on read.  The
+    ledger key itself expires two zombie windows after the last failure.
     """
-    timeout = max(60, int(getattr(settings, 'DYNO_AUTOSCALE_INTERVAL', 30)) * 2)
     try:
-        cache.set(_registry_degraded_key(app_name), True, timeout=timeout)
+        client = cache.client.get_client(write=True)
+        key = cache.make_key(_registry_degraded_key(app_name))
+        client.zadd(key, {dyno_name: time.time()})
+        client.expire(key, _registry_degraded_ttl())
     except Exception:
         logger.warning(
-            "Failed to publish the dyno registry degraded marker for app %s.",
-            app_name, exc_info=True,
+            "Failed to record the failed registry write for app %s, dyno %s.",
+            app_name, dyno_name, exc_info=True,
         )
+
+
+def _registry_degraded(instance):
+    """Uncached read of the app's failed-writer ledger (primary read).
+
+    True when the ledger names a dyno that is alive but absent from the only
+    member list, which means a sibling workload can be invisible to every
+    destructive gate.  Entries clear themselves: a dyno that registers again
+    (fresh index score) or that is gone (its liveness key expired) drops out
+    of the ledger.  Any read failure counts as degraded, because the callers
+    authorize a resize; a missing raw client is left to ``index_ready``, which
+    already fails closed for it.
+    """
+    if not instance.app_name:
+        return True
+    try:
+        adapter = _IndexAdapter(instance.app_name, primary=True)
+        client = adapter._connect()
+        if client is None:
+            return False
+        ledger = cache.make_key(_registry_degraded_key(instance.app_name))
+        members = client.zrange(ledger, 0, _DEGRADED_LEDGER_LIMIT - 1) or []
+        if not members:
+            return False
+        cutoff = _stale_cutoff()
+        for raw in members:
+            member = raw.decode('utf-8', errors='replace') if isinstance(raw, bytes) else raw
+            score = client.zscore(adapter._index_key, member)
+            if score is not None and score > cutoff:
+                client.zrem(ledger, member)  # registered again
+                continue
+            if client.get(cache.make_key(f'heroku:dyno_alive:{member}')) is not None:
+                return True  # alive, but missing from the member list
+            client.zrem(ledger, member)  # gone: its liveness key expired
+        return False
+    except Exception:
+        logger.warning(
+            "Dyno registry degraded-ledger read failed for app %s; failing "
+            "closed (no destructive actions).", instance.app_name, exc_info=True,
+        )
+        return True
 
 
 def _update_dyno_registry(app_name, dyno_name, score=None):
@@ -250,7 +272,7 @@ def _update_dyno_registry(app_name, dyno_name, score=None):
             "Failed to update indexed dyno registry for app %s, dyno %s.",
             app_name, dyno_name, exc_info=True,
         )
-        _mark_registry_degraded(app_name)
+        _mark_registry_degraded(app_name, dyno_name)
         return False
 
 # Gracefully handle lock expiry.  Consumers may configure different lock backends —

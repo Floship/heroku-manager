@@ -79,6 +79,7 @@ class TestCheckForSiblingZombieDynos(BaseLockTestCase):
         """django-redis-shaped backend with distinct stale/fresh member sets."""
         backend = MagicMock()
         client = MagicMock()
+        client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
         client.get.return_value = None  # degraded marker absent unless the test sets it
         client.zscore.return_value = time.time()
         client.zrangebyscore.side_effect = lambda key, mn, mx: stale if mn == "-inf" else fresh
@@ -186,6 +187,7 @@ class TestCheckForSiblingZombieDynos(BaseLockTestCase):
         dyno = make_dyno(index_ready_seed=False)
         backend = MagicMock()
         client = MagicMock()
+        client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
         client.get.return_value = None  # degraded marker absent unless the test sets it
         client.zremrangebyscore.return_value = 2
         client.zscore.return_value = None
@@ -211,6 +213,7 @@ class TestCheckForSiblingZombieDynos(BaseLockTestCase):
                 dyno = make_dyno()  # cached-ready seed
                 backend = MagicMock()
                 client = MagicMock()
+                client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
                 client.get.return_value = None  # degraded marker absent unless the test sets it
                 client.zremrangebyscore.return_value = 0
                 client.zrangebyscore.return_value = members
