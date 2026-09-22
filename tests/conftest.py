@@ -104,6 +104,13 @@ def patch_index_backend(memory_store):
             # tests seed index_ready directly and never hit this.
             return None
 
+        def get(self, key):
+            import pickle
+            value = self._backend._store.get(key, None)
+            if value is None:
+                value = self._backend.get(key)
+            return pickle.dumps(value) if value is not None else None
+
         def mget(self, keys):
             import pickle
             # Dict fixtures carry Python values (mirroring cache.set); list

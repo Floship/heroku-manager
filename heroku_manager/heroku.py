@@ -34,12 +34,15 @@ def _index_ready(instance):
         return False
     cutoff = _stale_cutoff()
     try:
-        if cache.get(_registry_degraded_key(instance.app_name)):
-            return False  # a sibling reported its registry write failed
-        adapter = _IndexAdapter(instance.app_name)
+        # Readiness authorizes destructive actions, so its marker and its own
+        # score come from the write authority: a lagging replica must never
+        # hide a sibling's failed registry write.
+        adapter = _IndexAdapter(instance.app_name, primary=True)
         client = adapter._connect()
         if client is None:
             return False  # no raw client → cannot prove the index → fail closed
+        if adapter.get(_registry_degraded_key(instance.app_name)):
+            return False  # a sibling reported its registry write failed
         own_score = client.zscore(adapter._index_key, instance.dyno_name)
         return own_score is not None and own_score > cutoff
     except Exception:
@@ -73,17 +76,20 @@ class _IndexAdapter:
     range operations and batched MGET; no SCAN, no KEYS.
     """
 
-    def __init__(self, app_name):
+    def __init__(self, app_name, primary=False):
         self.app_name = app_name
         self._client = None
         self._index_key = None
         self._decoder = None
+        # Readiness reads through the primary; ordinary metric reads use the
+        # read client (a replica when the cache configures one).
+        self._primary = primary
 
     def _connect(self):
         if self._client is None:
             try:
                 backend = cache.client
-                self._client = backend.get_client(write=False)
+                self._client = backend.get_client(write=self._primary)
                 # The raw redis-py client has no decode(); the decoder lives on
                 # the django-redis DefaultClient itself and turns serialized
                 # bytes back into Python values.
@@ -155,6 +161,13 @@ class _IndexAdapter:
         if raw_values is None:
             return None
         return [self.decode(value) for value in raw_values]
+
+    def get(self, key):
+        """One decoded raw GET; None means absent, an exception means uncertain."""
+        client = self._connect()
+        if client is None:
+            return None
+        return self.decode(client.get(cache.make_key(key)))
 
     def zremrangebyscore(self, min_score, max_score):
         """Prune through a write client; never write via a read replica."""

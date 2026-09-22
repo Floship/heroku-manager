@@ -27,7 +27,8 @@ A registry write that raises publishes `heroku:dynos:v1:{app}:degraded` for
 two autoscale intervals and readiness fails closed for the whole app until a
 later check-in proves the writer works again. An evicted ZSET re-converges
 within one autoscale interval, because every dyno re-registers at its own
-check-in.
+check-in. Readiness reads the marker and its own score through the write
+client, never a replica; the sibling metric reads keep the read client.
 
 Deploy prerequisites, all of which held for every Floship app at release time:
 

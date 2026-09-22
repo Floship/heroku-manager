@@ -79,6 +79,7 @@ class TestCheckForSiblingZombieDynos(BaseLockTestCase):
         """django-redis-shaped backend with distinct stale/fresh member sets."""
         backend = MagicMock()
         client = MagicMock()
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         client.zscore.return_value = time.time()
         client.zrangebyscore.side_effect = lambda key, mn, mx: stale if mn == "-inf" else fresh
         client.mget.return_value = alive_values
@@ -185,6 +186,7 @@ class TestCheckForSiblingZombieDynos(BaseLockTestCase):
         dyno = make_dyno(index_ready_seed=False)
         backend = MagicMock()
         client = MagicMock()
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         client.zremrangebyscore.return_value = 2
         client.zscore.return_value = None
         backend.client.get_client.return_value = client

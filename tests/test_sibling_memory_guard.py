@@ -769,6 +769,7 @@ class TestIndexedDynoReadiness(unittest.TestCase):
         """Patch heroku_manager.heroku.cache with a mock django-redis backend."""
         backend = MagicMock()
         client = MagicMock()
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
         backend.client.get_client.return_value = client
@@ -859,6 +860,7 @@ class TestIndexedSiblingValues(unittest.TestCase):
     def _patch_backend(self, client_attrs=None, backend_attrs=None):
         backend = MagicMock()
         client = MagicMock()
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
         backend.client.get_client.return_value = client
@@ -982,6 +984,7 @@ class TestIndexedFailClosed(unittest.TestCase):
     def _patch_backend(self, client_attrs=None, backend_attrs=None):
         backend = MagicMock()
         client = MagicMock()
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
         backend.client.get_client.return_value = client
@@ -1143,6 +1146,7 @@ class TestIndexedPrune(unittest.TestCase):
     def _patch_backend(self, client_attrs=None, backend_attrs=None):
         backend = MagicMock()
         client = MagicMock()
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
         backend.client.get_client.return_value = client
@@ -1226,6 +1230,7 @@ class TestIndexedPhysicalKeyContract(unittest.TestCase):
     def _patch_backend(self, client_attrs=None, backend_attrs=None):
         backend = MagicMock()
         client = MagicMock()
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
         backend.client.get_client.return_value = client
@@ -1392,18 +1397,34 @@ class TestRegistryDegradedMarker(unittest.TestCase):
         self.assertTrue(cache.get(_registry_degraded_key("floship")))
 
     def test_marker_marks_readiness_false_without_a_score_read(self):
+        import pickle
         from heroku_manager.heroku import _registry_degraded_key
         dyno = make_dyno("normal_worker.1")
         _restore_real_index_ready(dyno)
         backend = MagicMock()
         client = MagicMock()
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         client.zscore.return_value = time.time()
+        client.get.return_value = pickle.dumps(True)
         backend.client.get_client.return_value = client
+        backend.client.decode = pickle.loads
         backend.make_key.side_effect = lambda key: key
-        backend.get.side_effect = lambda key: True if key == _registry_degraded_key("floship") else None
         with patch("heroku_manager.heroku.cache", backend):
             self.assertFalse(dyno.index_ready)
+        client.get.assert_called_once_with(_registry_degraded_key("floship"))
         client.zscore.assert_not_called()
+        # The safety marker comes from the write authority, never a replica.
+        backend.client.get_client.assert_called_once_with(write=True)
+
+    def test_metric_reads_use_the_read_client(self):
+        from heroku_manager.heroku import _IndexAdapter
+        backend = MagicMock()
+        client = MagicMock()
+        backend.client.get_client.return_value = client
+        backend.make_key.side_effect = lambda key: key
+        with patch("heroku_manager.heroku.cache", backend):
+            _IndexAdapter("floship").fresh_members(0)
+        backend.client.get_client.assert_called_once_with(write=False)
 
     def test_marker_expires_after_two_autoscale_intervals(self):
         from heroku_manager.heroku import _mark_registry_degraded, _registry_degraded_key
@@ -1426,6 +1447,7 @@ class TestIndexAppIsolation(unittest.TestCase):
         from heroku_manager.heroku import _IndexAdapter
         backend = MagicMock()
         client = MagicMock()
+        client.get.return_value = None  # degraded marker absent unless the test sets it
         zsets = {
             "p:heroku:dynos:v1:app-a": ["a_worker.1", "a_worker.2"],
             "p:heroku:dynos:v1:app-b": ["b_worker.1"],
