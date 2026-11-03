@@ -81,7 +81,7 @@ class HerokuProxy:
                 self._credential = self._decode_credential(credential)
                 for value in (self.client_id, self.key_id):
                     if not isinstance(value, str) or not 1 <= len(value) <= 200 or value in (".", "..") or any(
-                            not (ch.isascii() and (ch.isalnum() or ch in "_-.@:")) for ch in value):
+                            not (ord(ch) < 128 and (ch.isalnum() or ch in "_-.@:")) for ch in value):
                         raise ValueError("Heroku proxy client and key identifiers are invalid")
                 if self._secret:
                     try:

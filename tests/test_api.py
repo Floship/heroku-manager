@@ -311,8 +311,25 @@ class TestTransportSelection(BaseLockTestCase):
         }, clear=True):
             dyno = HerokuDyno()
         self.assertTrue(dyno.proxy.enabled)
-        self.assertEqual(dyno.heroku_api_key, LEGACY_KEY)
+        self.assertIsNone(dyno.heroku_api_key)
         self.assert_fails_closed(dyno)
+
+    def test_selected_proxy_never_reads_the_legacy_token(self):
+        for url in ("https://manager.example/v1/heroku", "///"):
+            with self.subTest(url=url), patch.dict(os.environ, {
+                "HEROKU_PROXY_URL": url, "HEROKU_API_KEY": LEGACY_KEY,
+            }, clear=True):
+                original_get = os.environ.get
+
+                def lookup(name, default=None):
+                    if name == "HEROKU_API_KEY":
+                        self.fail("The selected proxy read the legacy credential")
+                    return original_get(name, default)
+
+                with patch.object(os.environ, "get", side_effect=lookup):
+                    dyno = HerokuDyno()
+                self.assertTrue(dyno.proxy.enabled)
+                self.assertIsNone(dyno.heroku_api_key)
 
     def test_legacy_key_without_a_proxy_url_selects_the_direct_transport(self):
         with patch.dict(os.environ, {"HEROKU_API_KEY": LEGACY_KEY}, clear=True):

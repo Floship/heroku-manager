@@ -360,8 +360,8 @@ class HerokuDyno:
         self.dyno_id = os.environ.get('HEROKU_DYNO_ID', None)
         # self.dyno_name = 'webhooks_worker.1'
         self.formation_name = self.dyno_name.split('.')[0] if self.dyno_name else None
-        self.heroku_api_key = os.environ.get('HEROKU_API_KEY')
         self.proxy = HerokuProxy()
+        self.heroku_api_key = None if self.proxy.enabled else os.environ.get('HEROKU_API_KEY')
         self._stop_autoscale_event = threading.Event()
         self._stop_file_cleaning_event = threading.Event()
         self._autoscale_thread = None
