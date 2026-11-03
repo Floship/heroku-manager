@@ -7,6 +7,7 @@ import json
 import os
 import time
 import uuid
+from typing import ClassVar
 from urllib.parse import unquote, urlsplit
 
 import requests
@@ -38,6 +39,14 @@ class HerokuProxy:
     CAPSULE_INFO = b"heroku-control:credential-transport:v1"
     INNER_MIN_BYTES = 44
     INNER_MAX_BYTES = 4124
+    UPSTREAMS: ClassVar[dict] = {
+        "platform": ("api.heroku.com", "/v1/heroku"),
+        "kolkrabbi": ("kolkrabbi.heroku.com", "/v1/kolkrabbi"),
+    }
+    RESPONSE_HEADERS = frozenset({
+        "content-type", "next-range", "content-range", "retry-after", "ratelimit-remaining", "etag",
+        "last-modified", "x-heroku-proxy-cache",
+    })
     SIGNED_HEADERS = ("accept", "cache-control", "content-type", "idempotency-key", "if-match", "if-none-match", "range")
     _HEX = frozenset("0123456789abcdef")
     _BASE64URL = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
@@ -55,6 +64,7 @@ class HerokuProxy:
         self._secret = b""
         self._credential = b""
         self._manager_id = ""
+        self._origin = ""
         # A bad configuration is recorded instead of raised: the proxy is built
         # from the environment while the dyno starts, and call_heroku_api must
         # stay able to fail closed without taking the whole app down.
@@ -77,6 +87,7 @@ class HerokuProxy:
                 if target.path not in ("", "/v1/heroku"):
                     raise ValueError("HEROKU_PROXY_URL must use the /v1/heroku endpoint")
                 self.base_url = "{}://{}{}".format(target.scheme, target.netloc, "/v1/heroku")
+                self._origin = f"{target.scheme}://{target.netloc}"
                 self._manager_id = self._canonical_manager(manager_id)
                 self._credential = self._decode_credential(credential)
                 for value in (self.client_id, self.key_id):
@@ -139,13 +150,19 @@ class HerokuProxy:
         return not self.config_error and bool(self.base_url and self.client_id and self._secret and self.key_id
                                              and self._manager_id and self._credential)
 
-    def request(self, method, url, *, headers=None, data=None, request_id=None):
+    def prepare_request(self, method, url, *, headers=None, data=None, request_id=None, upstream="platform"):
+        """Build the exact signed request without sending it."""
+        try:
+            upstream_host, route = self.UPSTREAMS[upstream]
+        except (KeyError, TypeError):
+            raise ValueError("Unsupported Heroku proxy upstream") from None
         if not self.configured:
             return None
         target = urlsplit(url)
         if target.scheme or target.netloc:
-            if target.scheme != "https" or target.netloc != "api.heroku.com" or target.username or target.fragment:
-                raise ValueError("Only Heroku Platform API URLs are accepted")
+            if (target.scheme != "https" or target.netloc != upstream_host
+                    or target.username or target.password or target.fragment):
+                raise ValueError("Only the selected upstream API host is accepted")
         elif not url.startswith("/") or url.startswith("//"):
             raise ValueError("A Heroku API path is required")
         if target.fragment or "\r" in url or "\n" in url or any(
@@ -167,7 +184,7 @@ class HerokuProxy:
         payload = json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8") if data is not None else b""
         outgoing.update({"x-heroku-client": self.client_id, "x-heroku-key-id": self.key_id,
                          "x-heroku-timestamp": str(int(time.time())), "x-heroku-nonce": str(uuid.uuid4())})
-        prepared = self._session.prepare_request(requests.Request(method, self.base_url + path,
+        prepared = self._session.prepare_request(requests.Request(method, self._origin + route + path,
                                                                   headers=outgoing, data=payload))
         lines = ["HEROKU-PROXY-HMAC-SHA256-SPLIT-1", self._manager_id, self.client_id, self.key_id,
                  outgoing["x-heroku-timestamp"], outgoing["x-heroku-nonce"], method,
@@ -179,22 +196,39 @@ class HerokuProxy:
         prepared.headers["x-heroku-signature"] = hmac.new(
             self._secret, (signing_message + "\nx-heroku-credential:" + capsule).encode("utf-8"), hashlib.sha256
         ).hexdigest()
+        return prepared
+
+    def sanitize_response(self, response, *, request_id=None):
+        """Project a requests or httpx response without retaining transport state."""
+        status_code = int(response.status_code)
+        if 300 <= status_code < 400:
+            return ProxyResponse(502, '{"id":"proxy_redirect_denied"}', request_id=request_id)
+        content = response.content
+        if isinstance(content, bytearray):
+            content = bytes(content)
+        elif not isinstance(content, bytes):
+            content = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+        headers = getattr(response, "headers", None) or {}
+        safe_headers = {name: value for name, value in headers.items()
+                        if str(name).lower() in self.RESPONSE_HEADERS}
+        return ProxyResponse(status_code, content, safe_headers, request_id)
+
+    def request(self, method, url, *, headers=None, data=None, request_id=None, upstream="platform"):
+        prepared = self.prepare_request(method, url, headers=headers, data=data,
+                                        request_id=request_id, upstream=upstream)
+        if prepared is None:
+            return None
+        request_id = prepared.headers.get("idempotency-key")
         # One attempt. A timeout on a mutation requires reconciliation, never a new request ID and automatic redispatch.
         try:
             response = self._session.send(prepared, timeout=(3, 25), allow_redirects=False)
         except requests.RequestException:
             # Keep transport internals and signed headers out of logs and caches.
-            if method not in ("GET", "HEAD"):
-                request_id = outgoing["idempotency-key"]
+            if prepared.method not in ("GET", "HEAD"):
                 return ProxyResponse(502, json.dumps({"id": "proxy_outcome_unknown", "request_id": request_id}),
                                      request_id=request_id)
             return None
-        safe_headers = {k: v for k, v in response.headers.items() if k.lower() in {
-            "content-type", "next-range", "content-range", "retry-after", "ratelimit-remaining", "etag", "last-modified", "x-heroku-proxy-cache"
-        }}
-        if 300 <= response.status_code < 400:
-            return ProxyResponse(502, '{"id":"proxy_redirect_denied"}', request_id=outgoing.get("idempotency-key"))
-        return ProxyResponse(response.status_code, response.content, safe_headers, outgoing.get("idempotency-key"))
+        return self.sanitize_response(response, request_id=request_id)
 
     def _build_capsule(self, signing_message, inner):
         """Wrap the fixed inner credential for one signed request."""

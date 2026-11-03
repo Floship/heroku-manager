@@ -149,6 +149,8 @@ result = autoscaler.exec_connect(command="echo 'hello' && env")
 ## Configuration
 
 Install `heroku-manager[proxy]` to use the encrypted proxy transport. Direct mode keeps the original dependencies.
+The proxy extra requires Python 3.8 or later through [cryptography](https://pypi.org/project/cryptography/46.0.0/).
+For local tests, install `python -m pip install -e '.[proxy]'`, then run `python -m unittest discover -s tests -t .`.
 
 Environment variables:
 - `HEROKU_PROXY_URL` (optional): HTTPS manager URL ending in `/v1/heroku`. Setting it selects the signed proxy transport.
@@ -171,6 +173,7 @@ Operational notes:
 - Uncertain mutations retain their request ID in shared Django cache and block automatic redispatch until reconciled.
 - Log-session creation is a repeatable read and can recover from a failed request on the next interval.
 - After verifying the provider outcome, use `reconcile_proxy_request(method, url, data, request_id)` to release that intent.
+- If the original payload is unavailable, use `reconcile_proxy_request(request_id=..., pending_key=...)` with both logged handles after verifying the provider outcome.
 - Enable Heroku runtime metrics (see Installation) so memory/load signals are available.
 - Autoscaling and cleaning rely on Django cache; ensure your cache backend is configured and shared across dynos.
 
