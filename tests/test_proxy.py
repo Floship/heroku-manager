@@ -4,6 +4,7 @@ import hmac
 import json
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import requests
@@ -205,6 +206,128 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(response.json(), [{"id": "a"}])
         self.assertFalse(ProxyResponse(403, "{}"))
 
+    @patch("heroku_manager.proxy.requests.Session.send")
+    def test_prepare_request_is_network_free_and_request_sends_it_unchanged(self, send):
+        send.return_value = self.response()
+        client, _ = self.make_client()
+        supplied = "8f14e45f-ceea-467a-9a3b-0a7b14a3f9c2"
+        prepared = client.prepare_request("PATCH", "/apps/x", data={"size": "standard-2x"}, request_id=supplied)
+        send.assert_not_called()
+        self.assertEqual(prepared.url, "https://manager.example/v1/heroku/apps/x")
+        self.assertEqual(prepared.body, b'{"size":"standard-2x"}')
+        self.assertEqual(prepared.headers["idempotency-key"], supplied)
+        with patch.object(client, "prepare_request", return_value=prepared) as prepare:
+            client.request("PATCH", "/apps/x", data={"size": "standard-2x"})
+        prepare.assert_called_once()
+        sent = send.call_args.args[0]
+        self.assertIs(sent, prepared)
+        self.assertEqual(sent.body, b'{"size":"standard-2x"}')
+        self.assertEqual(sent.path_url, "/v1/heroku/apps/x")
+
+    @patch("heroku_manager.proxy.requests.Session.send")
+    def test_default_prepared_wire_matches_the_split_fixture(self, send):
+        client, inner = self.make_client()
+        prepared = client.prepare_request("PATCH", "/apps/production/formation/worker",
+                                          data={"size": "standard-2x"})
+        send.assert_not_called()
+        message = signing_string(prepared, client)
+        capsule = prepared.headers["x-heroku-credential"]
+        self.assertEqual(prepared.headers["x-heroku-signature"], hmac.new(
+            bytes.fromhex(AUTH_HEX), (message + "\nx-heroku-credential:" + capsule).encode("utf-8"),
+            hashlib.sha256).hexdigest())
+        self.assertEqual(decrypt(capsule, message), inner)
+
+    @patch("heroku_manager.proxy.requests.Session.send")
+    def test_kolkrabbi_uses_its_own_signed_route_prefix(self, send):
+        client, inner = self.make_client()
+        prepared = client.prepare_request("GET", "/apps/production", upstream="kolkrabbi")
+        send.assert_not_called()
+        self.assertEqual(prepared.url, "https://manager.example/v1/kolkrabbi/apps/production")
+        self.assertEqual(prepared.path_url, "/v1/kolkrabbi/apps/production")
+        message = signing_string(prepared, client)
+        capsule = prepared.headers["x-heroku-credential"]
+        signature = prepared.headers["x-heroku-signature"]
+        self.assertEqual(decrypt(capsule, message), inner)
+        self.assertEqual(signature, hmac.new(
+            bytes.fromhex(AUTH_HEX), (message + "\nx-heroku-credential:" + capsule).encode("utf-8"),
+            hashlib.sha256).hexdigest())
+        swapped = message.replace("/v1/kolkrabbi", "/v1/heroku")
+        self.assertNotEqual(signature, hmac.new(
+            bytes.fromhex(AUTH_HEX), (swapped + "\nx-heroku-credential:" + capsule).encode("utf-8"),
+            hashlib.sha256).hexdigest())
+        with self.assertRaises(InvalidTag):
+            decrypt(capsule, swapped)
+
+    @patch("heroku_manager.proxy.requests.Session.send")
+    def test_prepare_freshness_is_per_call(self, send):
+        client, inner = self.make_client()
+        with patch("heroku_manager.proxy.time.time", return_value=1000):
+            first = client.prepare_request("GET", "/apps/production/dynos")
+            second = client.prepare_request("GET", "/apps/production/dynos")
+        send.assert_not_called()
+        self.assertNotEqual(first.headers["x-heroku-nonce"], second.headers["x-heroku-nonce"])
+        self.assertNotEqual(first.headers["x-heroku-credential"], second.headers["x-heroku-credential"])
+        self.assertNotEqual(first.headers["x-heroku-signature"], second.headers["x-heroku-signature"])
+        self.assertEqual(decrypt(first.headers["x-heroku-credential"], signing_string(first, client)), inner)
+        self.assertEqual(decrypt(second.headers["x-heroku-credential"], signing_string(second, client)), inner)
+
+    @patch("heroku_manager.proxy.requests.Session.send")
+    def test_unknown_or_mismatched_upstream_is_rejected_before_dispatch(self, send):
+        client, _ = self.make_client()
+        for upstream in ("admin", "", None, "Kolkrabbi", ["platform"]):
+            with self.subTest(upstream=upstream), self.assertRaises(ValueError):
+                client.prepare_request("GET", "/apps/x", upstream=upstream)
+        cases = [
+            ("GET", "https://kolkrabbi.heroku.com/apps", "platform"),
+            ("GET", "https://api.heroku.com/apps", "kolkrabbi"),
+            ("GET", "https://api.heroku.com.evil.example/apps", "platform"),
+            ("GET", "http://api.heroku.com/apps", "platform"),
+            ("GET", "https://manager.example/v1/heroku/apps", "platform"),
+            ("GET", "https://manager.example/v1/kolkrabbi/apps", "kolkrabbi"),
+        ]
+        for method, url, upstream in cases:
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                client.request(method, url, upstream=upstream)
+        send.assert_not_called()
+        self.assertEqual(client.prepare_request("GET", "https://api.heroku.com/apps").path_url,
+                         "/v1/heroku/apps")
+        self.assertEqual(client.prepare_request(
+            "GET", "https://kolkrabbi.heroku.com/apps", upstream="kolkrabbi").path_url, "/v1/kolkrabbi/apps")
+
+    @patch("heroku_manager.proxy.requests.Session.send")
+    def test_mutation_transport_error_keeps_the_supplied_request_id(self, send):
+        send.side_effect = requests.Timeout("private transport detail")
+        client, _ = self.make_client()
+        supplied = "8f14e45f-ceea-467a-9a3b-0a7b14a3f9c2"
+        result = client.request("PATCH", "/apps/x", data={}, request_id=supplied)
+        self.assertEqual(result.status_code, 502)
+        self.assertEqual(result.request_id, supplied)
+        self.assertEqual(result.json()["request_id"], supplied)
+        send.assert_called_once()
+
+    @patch("heroku_manager.proxy.requests.Session.send")
+    def test_get_transport_error_returns_none_without_retry(self, send):
+        send.side_effect = requests.ConnectionError("private transport detail")
+        client, _ = self.make_client()
+        self.assertIsNone(client.request("GET", "/apps/production/dynos"))
+        send.assert_called_once()
+
+    @patch("heroku_manager.proxy.requests.Session.send")
+    def test_request_preserves_the_supplied_request_id_on_success(self, send):
+        send.return_value = self.response(200)
+        client, _ = self.make_client()
+        supplied = "8f14e45f-ceea-467a-9a3b-0a7b14a3f9c2"
+        result = client.request("PATCH", "/apps/x", data={}, request_id=supplied)
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.request_id, supplied)
+
+    @patch("heroku_manager.proxy.requests.Session.send")
+    def test_prepare_and_request_return_none_when_unconfigured(self, send):
+        client = HerokuProxy("", "portal", AUTH_HEX, "v1", "legacy-envelope", "bad-manager")
+        self.assertIsNone(client.prepare_request("GET", "/apps/x"))
+        self.assertIsNone(client.request("GET", "/apps/x"))
+        send.assert_not_called()
+
 
 class CredentialConfigTests(unittest.TestCase):
     def test_exact_inner_size_bounds_are_accepted(self):
@@ -312,6 +435,66 @@ class CredentialConfigTests(unittest.TestCase):
                                      credential(bytes([1]) * 44), MANAGER)
                 self.assertFalse(client.configured)
                 self.assertIsNotNone(client.config_error)
+
+    def test_base_url_must_use_the_platform_endpoint(self):
+        for path in ("/v1/kolkrabbi", "/v1/other"):
+            with self.subTest(path=path):
+                client = HerokuProxy("https://manager.example" + path, "portal", AUTH_HEX, "v1",
+                                     credential(os.urandom(44)), MANAGER)
+                self.assertFalse(client.configured)
+                self.assertIn("/v1/heroku", client.config_error)
+
+
+class SanitizeResponseTests(unittest.TestCase):
+    def make_client(self):
+        return HerokuProxy("https://manager.example", "portal", AUTH_HEX, "v1",
+                           credential(bytes([1]) * 44), MANAGER)
+
+    def test_projects_binary_requests_response_without_transport_state(self):
+        client = self.make_client()
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b"\x00\xffbinary"
+        response.headers.update({"Content-Type": "application/octet-stream",
+                                 "Next-Range": "id next..", "Set-Cookie": "secret",
+                                 "Authorization": "Bearer provider-token",
+                                 "x-heroku-credential": "v1:capsule",
+                                 "x-heroku-signature": "signature"})
+        response.request = requests.Request("GET", "https://manager.example").prepare()
+        result = client.sanitize_response(response, request_id="rid-1")
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.content, b"\x00\xffbinary")
+        self.assertEqual(result.request_id, "rid-1")
+        self.assertEqual(result.headers["Next-Range"], "id next..")
+        self.assertNotIn("Set-Cookie", result.headers)
+        self.assertNotIn("Authorization", result.headers)
+        self.assertNotIn("x-heroku-credential", result.headers)
+        self.assertNotIn("x-heroku-signature", result.headers)
+        self.assertFalse(hasattr(result, "request"))
+
+    def test_projects_httpx_shaped_response(self):
+        client = self.make_client()
+        response = SimpleNamespace(status_code=206, content=b'[{"id":"a"}]',
+                                   headers={"content-type": "application/json",
+                                            "retry-after": "3", "set-cookie": "x"})
+        result = client.sanitize_response(response)
+        self.assertEqual(result.status_code, 206)
+        self.assertEqual(result.json(), [{"id": "a"}])
+        self.assertEqual(result.headers["Retry-After"], "3")
+        self.assertNotIn("set-cookie", result.headers)
+        self.assertIsNone(result.request_id)
+
+    def test_redirect_becomes_a_502_with_the_supplied_id(self):
+        client = self.make_client()
+        for status in (301, 302, 307, 308):
+            with self.subTest(status=status):
+                response = SimpleNamespace(status_code=status, content=b"redirect",
+                                           headers={"Location": "https://evil.example"})
+                result = client.sanitize_response(response, request_id="rid-2")
+                self.assertEqual(result.status_code, 502)
+                self.assertEqual(result.json(), {"id": "proxy_redirect_denied"})
+                self.assertEqual(result.request_id, "rid-2")
+                self.assertNotIn("Location", result.headers)
 
 
 if __name__ == "__main__":

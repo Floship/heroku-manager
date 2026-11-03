@@ -285,14 +285,32 @@ class TestTransportSelection(BaseLockTestCase):
 
     def assert_fails_closed(self, dyno):
         self.assertFalse(dyno.heroku_api_configured)
+        dyno.app_name = dyno.app_name or "synthetic"
         with patch("heroku_manager.heroku.requests.request") as direct, \
                 patch("heroku_manager.proxy.requests.Session.send") as proxy_send, \
                 patch("heroku_manager.heroku.logger") as logger:
             result = dyno.call_heroku_api("PATCH", FORMATION_URL, data={"size": "standard-2x"})
+            self.assertIsNone(dyno.get_heroku_logs())
+            self.assertIsNone(dyno.exec_connect(command="echo synthetic", dyno_name="worker.1"))
         self.assertIsNone(result)
         direct.assert_not_called()
         proxy_send.assert_not_called()
         logger.error.assert_called()
+
+    def test_uncertain_mutation_can_be_reconciled_using_its_logged_handle(self):
+        dyno = make_dyno()
+        method, url, data = "PATCH", FORMATION_URL, {"size": "standard-2x"}
+        with patch("heroku_manager.proxy.requests.Session.send", side_effect=requests.Timeout()), \
+                patch("heroku_manager.heroku.logger") as logger:
+            response = dyno.call_heroku_api(method, url, data=data)
+        pending = dyno._proxy_pending_key(method, url, data)
+        logger.warning.assert_any_call(
+            "Heroku proxy outcome requires reconciliation, request_id=%s pending_key=%s",
+            response.request_id, pending)
+        self.assertFalse(dyno.reconcile_proxy_request(request_id="wrong", pending_key=pending))
+        self.assertFalse(dyno.reconcile_proxy_request(request_id=response.request_id, pending_key="unrelated:key"))
+        self.assertTrue(dyno.reconcile_proxy_request(request_id=response.request_id, pending_key=pending))
+        self.assertIsNone(cache.get(pending))
 
     def test_configured_proxy_ignores_a_legacy_key_on_the_instance(self):
         dyno = make_dyno()

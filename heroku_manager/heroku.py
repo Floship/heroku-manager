@@ -778,9 +778,18 @@ class HerokuDyno:
                               sort_keys=True, separators=(",", ":"))
         return "heroku:proxy_pending:v1:" + hashlib.sha256(identity.encode()).hexdigest()
 
-    def reconcile_proxy_request(self, method, url, data, request_id):
+    def reconcile_proxy_request(self, method=None, url=None, data=None, request_id=None, *, pending_key=None):
         """Clear one uncertain intent only after the operator verifies its provider outcome."""
-        key = self._proxy_pending_key(method.upper(), url, data)
+        if not request_id:
+            return False
+        if pending_key is not None:
+            if not isinstance(pending_key, str) or not re.fullmatch(r"heroku:proxy_pending:v1:[0-9a-f]{64}", pending_key):
+                return False
+            key = pending_key
+        elif isinstance(method, str) and isinstance(url, str):
+            key = self._proxy_pending_key(method.upper(), url, data)
+        else:
+            return False
         return self._clear_proxy_pending(key, request_id)
 
     def _clear_proxy_pending(self, key, request_id):
@@ -821,7 +830,8 @@ class HerokuDyno:
             request_id = str(uuid.uuid4())
             if not cache.add(pending_key, request_id, timeout=None):
                 previous = cache.get(pending_key)
-                logger.warning("Heroku proxy operation requires reconciliation, request_id=%s", previous)
+                logger.warning("Heroku proxy operation requires reconciliation, request_id=%s pending_key=%s",
+                               previous, pending_key)
                 return ProxyResponse(409, json.dumps({"id": "proxy_reconciliation_required", "request_id": previous}),
                                      request_id=previous)
         try:
@@ -836,6 +846,9 @@ class HerokuDyno:
         if pending_key and response is not None and (200 <= response.status_code < 300
                 or response.status_code in (400, 401, 403, 404, 405, 413, 422, 429)):
             self._clear_proxy_pending(pending_key, request_id)
+        elif pending_key:
+            logger.warning("Heroku proxy outcome requires reconciliation, request_id=%s pending_key=%s",
+                           request_id, pending_key)
         if response is not None and response.status_code >= 400:
             logger.warning("Heroku proxy rejected %s for formation %s, status %s",
                            method, self.formation_name, response.status_code)
@@ -1824,6 +1837,9 @@ class HerokuDyno:
 
     def get_heroku_logs(self, source="heroku", date_from=None):
         if not self.heroku_api_configured:
+            if self.proxy.enabled:
+                logger.error("Cannot retrieve Heroku logs: proxy configuration is invalid (%s).",
+                             self.proxy.config_error or "missing proxy settings")
             return None
 
         cache_key = f'heroku:logs:{self.app_name}:{self.dyno_name}'
