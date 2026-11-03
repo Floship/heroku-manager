@@ -50,9 +50,10 @@ def _make_logplex_response(text):
 
 class TestGetHerokuLogs(BaseLockTestCase):
 
-    def test_returns_none_when_no_api_key(self):
+    def test_returns_none_when_no_transport_is_configured(self):
         dyno = make_dyno()
-        dyno.heroku_api_key = None
+        from heroku_manager.proxy import HerokuProxy
+        dyno.proxy = HerokuProxy("", "", "")
         result = dyno.get_heroku_logs()
         self.assertIsNone(result)
 

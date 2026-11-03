@@ -37,6 +37,7 @@ if not django_settings.configured:
     django.setup()
 
 from django.core.cache import cache
+from tests.conftest import TEST_PROXY_CREDENTIAL, TEST_PROXY_MANAGER_ID
 from tests.conftest import patch_scan_backend, real_decoder
 from heroku_manager.heroku import HerokuDyno, DYNO_SIZES, _update_dyno_registry
 
@@ -48,7 +49,10 @@ def make_dyno(dyno_name="normal_worker.1", formation_size="standard-2x"):
     dyno.dyno_name = dyno_name
     dyno.dyno_id = "abc123"
     dyno.formation_name = dyno_name.split(".")[0]
-    dyno.heroku_api_key = "fake"
+    dyno.heroku_api_key = None
+    from heroku_manager.proxy import HerokuProxy
+    dyno.proxy = HerokuProxy("https://manager.example", "test", "01" * 32,
+                            credential=TEST_PROXY_CREDENTIAL, manager_id=TEST_PROXY_MANAGER_ID)
     dyno._stop_autoscale_event = MagicMock()
     dyno._stop_file_cleaning_event = MagicMock()
     dyno._autoscale_thread = None
