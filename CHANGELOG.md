@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.15 - 2026-11-04
+- Add optional split-credential HMAC transport selected by `HEROKU_PROXY_URL`. Invalid selected configuration fails closed.
+- Keep the Heroku token on the manager. Clients hold an encrypted envelope and authenticate each request with a fresh capsule.
+- Preserve legacy direct transport and the existing Phase C registry behavior when the proxy URL is absent.
+- Keep uncertain mutation intents until operator reconciliation; log sessions remain repeatable reads.
+- Add the optional `proxy` dependency and regression coverage for transport selection, signing, response handling, and reconciliation.
+
 ## 0.2.14 - 2026-09-22
 - **Improvement: Phase C index-only dyno readers (FP-17968).** The app-scoped sorted set `heroku:dynos:v1:{app}` is now the only member list. The compatibility `SCAN` and the `HEROKU_DYNO_INDEX_V1_READY` rollout flag are removed, so runtime issues neither `SCAN` nor `KEYS`.
 - **Readiness is the own-member ZSCORE.** A dyno is ready when its own index score is present and fresher than `DYNO_ZOMBIE_THRESHOLD`; readiness fails closed on a missing raw client, a missing or stale score, or any read error. Downscale, formation-idle authorization, and zombie restart still require readiness; check-ins and safe upscales remain allowed.

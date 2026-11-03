@@ -158,13 +158,32 @@ result = autoscaler.exec_connect(command="echo 'hello' && env")
 
 ## Configuration
 
+Install `heroku-manager[proxy]` to use the encrypted proxy transport. Direct mode keeps the original dependencies.
+The proxy extra requires Python 3.8 or later through [cryptography](https://pypi.org/project/cryptography/46.0.0/).
+For local tests, install `python -m pip install -e '.[proxy]'`, then run `python -m unittest discover -s tests -t .`.
+
 Environment variables:
-- `HEROKU_API_KEY` (required): Heroku API key.
+- `HEROKU_PROXY_URL` (optional): HTTPS manager URL ending in `/v1/heroku`. Setting it selects the signed proxy transport.
+- `HEROKU_PROXY_CLIENT_ID` (required with a proxy URL): The manager's public client identifier.
+- `HEROKU_PROXY_KEY_ID` (optional, default `v1`): The configured signing-key version.
+- `HEROKU_PROXY_SECRET` (required with a proxy URL): 32 random bytes in lowercase hexadecimal, shared with the manager for authentication.
+- `HEROKU_PROXY_MANAGER_ID` (required with a proxy URL): The manager's canonical app UUID.
+- `HEROKU_PROXY_CREDENTIAL` (required with a proxy URL): The provisioned `v2:` encrypted Heroku credential. Its unwrap key stays on the manager.
+- `HEROKU_API_KEY` (used without a proxy URL): Heroku API key for the direct Platform API transport.
 - `HEROKU_APP_NAME` (required): Heroku app name.
 - `DYNO` (auto-set on Heroku): Current dyno name, used for formation detection.
 - `DYNO_RAM` (optional): Force the formation size via memory mapping when API calls are unavailable.
 
 Operational notes:
+- `HEROKU_PROXY_URL` decides the transport. Without it, calls use `HEROKU_API_KEY` directly as before.
+- A proxy URL with missing or invalid signing settings fails closed. It never falls back to `HEROKU_API_KEY`.
+- Proxy requests carry a fresh encrypted credential capsule, a time-bound HMAC signature, and a unique nonce. The signing secret and fixed envelope are never sent plainly.
+- The server's policy controls which operations the client may request, including one-off commands.
+- Direct mode keeps the shared rate limiter, five-second GET cache, transient-error retries and 429 back-off.
+- Uncertain mutations retain their request ID in shared Django cache and block automatic redispatch until reconciled.
+- Log-session creation is a repeatable read and can recover from a failed request on the next interval.
+- After verifying the provider outcome, use `reconcile_proxy_request(method, url, data, request_id)` to release that intent.
+- If the original payload is unavailable, use `reconcile_proxy_request(request_id=..., pending_key=...)` with both logged handles after verifying the provider outcome.
 - Enable Heroku runtime metrics (see Installation) so memory/load signals are available.
 - Autoscaling and cleaning rely on Django cache; ensure your cache backend is configured and shared across dynos.
 

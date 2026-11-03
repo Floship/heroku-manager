@@ -2,12 +2,13 @@ from setuptools import setup, find_packages
 
 setup(
     name="heroku_manager",
-    version="0.2.14",
+    version="0.2.15",
     packages=find_packages(),
     install_requires=[
         "django>=2.2",
         "requests>=2.0.0",
     ],
+    extras_require={"proxy": ["cryptography>=46.0.0"]},
     author="Floship",
     author_email="stas@floship.com",
     description="A package for managing Heroku dynos with autoscaling capabilities",

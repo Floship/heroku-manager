@@ -299,11 +299,12 @@ class TestApiUncoveredPaths(BaseLockTestCase):
         resp = _req.Response()
         resp.status_code = 404
         resp._content = b"not found"
-        with patch("heroku_manager.heroku.requests.request", return_value=resp):
+        with patch("heroku_manager.proxy.requests.Session.send", return_value=resp):
             with patch("heroku_manager.heroku.logger") as mock_log:
                 result = dyno.call_heroku_api("GET", "https://api.heroku.com/apps/x/dynos")
-        # 4xx returns the response (caller decides) but logs error
-        mock_log.error.assert_called()
+        # Return the safe response and log its status without provider text or signed headers.
+        self.assertEqual(result.status_code, 404)
+        mock_log.warning.assert_called()
 
     def test_call_heroku_api_none_when_rate_limited(self):
         dyno = make_dyno()

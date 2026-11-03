@@ -1,4 +1,6 @@
 import math
+import hashlib
+import json
 import os
 import re
 import shlex
@@ -6,6 +8,7 @@ import requests
 import threading
 import time
 import random
+import uuid
 from datetime import datetime, timedelta
 from requests.exceptions import SSLError, ConnectionError, Timeout
 
@@ -16,6 +19,7 @@ from django.utils import timezone
 from importlib import import_module
 
 import logging
+from .proxy import HerokuProxy, ProxyResponse
 
 logger = logging.getLogger(__name__)
 
@@ -424,7 +428,8 @@ class HerokuDyno:
         self.dyno_id = os.environ.get('HEROKU_DYNO_ID', None)
         # self.dyno_name = 'webhooks_worker.1'
         self.formation_name = self.dyno_name.split('.')[0] if self.dyno_name else None
-        self.heroku_api_key = os.environ.get('HEROKU_API_KEY')
+        self.proxy = HerokuProxy()
+        self.heroku_api_key = None if self.proxy.enabled else os.environ.get('HEROKU_API_KEY')
         self._stop_autoscale_event = threading.Event()
         self._stop_file_cleaning_event = threading.Event()
         self._autoscale_thread = None
@@ -432,6 +437,17 @@ class HerokuDyno:
         self._thread_lock = threading.Lock()
         self._last_file_cleaning = None
         self._formation_size_cached = None  # (size, timestamp) tuple for instance-level caching
+
+    @property
+    def heroku_api_configured(self):
+        """True when the selected transport can dispatch Platform API requests.
+
+        HEROKU_PROXY_URL selects the signed proxy and never falls back to a
+        local API key.  Without it the legacy direct transport uses the key.
+        """
+        if self.proxy.enabled:
+            return self.proxy.configured
+        return bool(self.heroku_api_key)
 
     # Per-dyno cache key prefixes — published in check_in_dyno, cleaned in
     # remove_dyno_from_alive_cache.  Add new metrics here to publish/clean
@@ -757,9 +773,90 @@ class HerokuDyno:
         )
         return False
 
+    def _proxy_pending_key(self, method, url, data):
+        identity = json.dumps([self.proxy.base_url, self.proxy.client_id, self.app_name, method, url, data],
+                              sort_keys=True, separators=(",", ":"))
+        return "heroku:proxy_pending:v1:" + hashlib.sha256(identity.encode()).hexdigest()
+
+    def reconcile_proxy_request(self, method=None, url=None, data=None, request_id=None, *, pending_key=None):
+        """Clear one uncertain intent only after the operator verifies its provider outcome."""
+        if not request_id:
+            return False
+        if pending_key is not None:
+            if not isinstance(pending_key, str) or not re.fullmatch(r"heroku:proxy_pending:v1:[0-9a-f]{64}", pending_key):
+                return False
+            key = pending_key
+        elif isinstance(method, str) and isinstance(url, str):
+            key = self._proxy_pending_key(method.upper(), url, data)
+        else:
+            return False
+        return self._clear_proxy_pending(key, request_id)
+
+    def _clear_proxy_pending(self, key, request_id):
+        with cache.lock(key + ":reconcile", expire=10):
+            if cache.get(key) == str(request_id):
+                cache.delete(key)
+                return True
+        return False
+
     def call_heroku_api(self, method, url, custom_headers=None, data=None):
+        """Central method for ALL Heroku Platform API calls.
+
+        HEROKU_PROXY_URL selects the signed proxy transport; otherwise the
+        direct Platform API transport runs unchanged.
         """
-        Central method for ALL Heroku Platform API calls.
+        if self.proxy.enabled:
+            return self._call_heroku_api_via_proxy(method, url, custom_headers, data)
+        return self._call_heroku_api_direct(method, url, custom_headers, data)
+
+    def _call_heroku_api_via_proxy(self, method, url, custom_headers, data):
+        """Use the permissioned HTTP proxy. Never use a local Heroku credential."""
+        if not self.proxy.configured:
+            logger.error(
+                "Heroku proxy is selected but not fully configured (%s); refusing to call Heroku directly.",
+                self.proxy.config_error or "missing proxy settings",
+            )
+            return None
+        if not self._acquire_rate_limit_token():
+            return None
+        pending_key = None
+        request_id = None
+        # Creating a log session is a repeatable read, despite Heroku's POST API.
+        log_session_read = method.upper() == "POST" and re.fullmatch(
+            r"(?:https://api\.heroku\.com)?/apps/[^/?#]+/log-sessions", url
+        ) is not None
+        if method.upper() not in ("GET", "HEAD") and not log_session_read:
+            pending_key = self._proxy_pending_key(method.upper(), url, data)
+            request_id = str(uuid.uuid4())
+            if not cache.add(pending_key, request_id, timeout=None):
+                previous = cache.get(pending_key)
+                logger.warning("Heroku proxy operation requires reconciliation, request_id=%s pending_key=%s",
+                               previous, pending_key)
+                return ProxyResponse(409, json.dumps({"id": "proxy_reconciliation_required", "request_id": previous}),
+                                     request_id=previous)
+        try:
+            response = self.proxy.request(method, url, headers=custom_headers, data=data, request_id=request_id)
+        except (ValueError, TypeError):
+            # Local request validation failed before dispatch. A corrected call may proceed.
+            if pending_key:
+                self._clear_proxy_pending(pending_key, request_id)
+            logger.error("Invalid Heroku proxy request; nothing was dispatched.")
+            return ProxyResponse(400, '{"id":"proxy_request_invalid"}', request_id=request_id)
+        # Keep uncertain outcomes reserved across ticks and worker restarts. A definite rejection can be corrected and resubmitted.
+        if pending_key and response is not None and (200 <= response.status_code < 300
+                or response.status_code in (400, 401, 403, 404, 405, 413, 422, 429)):
+            self._clear_proxy_pending(pending_key, request_id)
+        elif pending_key:
+            logger.warning("Heroku proxy outcome requires reconciliation, request_id=%s pending_key=%s",
+                           request_id, pending_key)
+        if response is not None and response.status_code >= 400:
+            logger.warning("Heroku proxy rejected %s for formation %s, status %s",
+                           method, self.formation_name, response.status_code)
+        return response
+
+    def _call_heroku_api_direct(self, method, url, custom_headers=None, data=None):
+        """
+        Direct Heroku Platform API transport, used when HEROKU_PROXY_URL is absent.
 
         Features:
         - Shared Redis rate limiter (coordinates across all dynos)
@@ -1739,7 +1836,10 @@ class HerokuDyno:
         return counter
 
     def get_heroku_logs(self, source="heroku", date_from=None):
-        if not self.heroku_api_key:
+        if not self.heroku_api_configured:
+            if self.proxy.enabled:
+                logger.error("Cannot retrieve Heroku logs: proxy configuration is invalid (%s).",
+                             self.proxy.config_error or "missing proxy settings")
             return None
 
         cache_key = f'heroku:logs:{self.app_name}:{self.dyno_name}'
@@ -1959,8 +2059,8 @@ class HerokuDyno:
             logger.error("Cannot connect to dyno: app_name or dyno_name is not set.")
             return None
 
-        if not self.heroku_api_key:
-            logger.error("Cannot execute command: HEROKU_API_KEY is not set.")
+        if not self.heroku_api_configured:
+            logger.error("Cannot execute command: no Heroku API transport is configured.")
             return None
 
         try:

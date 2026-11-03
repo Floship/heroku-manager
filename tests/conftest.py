@@ -3,6 +3,7 @@ Shared test setup: minimal Django config + make_dyno helper.
 Import this in every test module via `from tests.conftest import *` or rely on
 unittest discovery picking it up automatically.
 """
+import base64
 import os
 import time
 import threading
@@ -39,6 +40,10 @@ if not django_settings.configured:
 from unittest.mock import MagicMock, patch
 from heroku_manager.heroku import HerokuDyno, DYNO_SIZES
 
+TEST_PROXY_MANAGER_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+# Transport-only tests mock the server; this is a public, correctly sized envelope.
+TEST_PROXY_CREDENTIAL = "v2:" + base64.urlsafe_b64encode(bytes([3]) * 44).rstrip(b"=").decode()
+
 
 def make_dyno(dyno_name="normal_worker.1", formation_size="standard-2x",
               index_ready_seed=True):
@@ -48,7 +53,10 @@ def make_dyno(dyno_name="normal_worker.1", formation_size="standard-2x",
     dyno.dyno_name = dyno_name
     dyno.dyno_id = "abc123"
     dyno.formation_name = dyno_name.split(".")[0]
-    dyno.heroku_api_key = "fake-key"
+    dyno.heroku_api_key = None
+    from heroku_manager.proxy import HerokuProxy
+    dyno.proxy = HerokuProxy("https://manager.example", "test", "01" * 32,
+                            credential=TEST_PROXY_CREDENTIAL, manager_id=TEST_PROXY_MANAGER_ID)
     dyno._stop_autoscale_event = threading.Event()
     dyno._stop_file_cleaning_event = threading.Event()
     dyno._autoscale_thread = None
