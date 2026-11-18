@@ -16,11 +16,27 @@ import requests
 class ProxyResponse:
     """Keep request credentials and transport internals out of application caches."""
 
+    _ERROR_IDS = frozenset({
+        "already_dispatched_check_provider_state", "bad_request", "body_limit",
+        "busy", "cache_state_unavailable_check_provider_state", "conflict",
+        "cooldown", "database_unavailable", "deadline_exceeded_check_provider_state",
+        "forbidden", "idempotency_conflict", "idempotency_key_required",
+        "invalid_client", "invalid_credential", "invalid_json", "invalid_params",
+        "not_found", "operation_forbidden", "outcome_not_recorded_check_provider_state",
+        "path_forbidden", "proxy_outcome_unknown", "proxy_reconciliation_required",
+        "proxy_redirect_denied", "proxy_request_invalid", "quota_initialization_unavailable",
+        "quota_state_unavailable_check_provider_state",
+        "rate_limit", "replayed_request", "resource_forbidden", "resource_lookup_limit",
+        "resource_verification_unavailable", "unauthorized",
+        "upstream_outcome_recorded_check_provider_state", "upstream_outcome_unknown_do_not_retry",
+    })
+
     def __init__(self, status_code, text, headers=None, request_id=None):
         self.status_code = status_code
         self.content = text if isinstance(text, bytes) else text.encode("utf-8")
         self.headers = requests.structures.CaseInsensitiveDict(headers or {})
         self.request_id = request_id
+        self.reconciliation_required = False
 
     def __bool__(self):
         return self.status_code < 400
@@ -31,6 +47,19 @@ class ProxyResponse:
 
     def json(self):
         return json.loads(self.content)
+
+    @property
+    def error_id(self):
+        if len(self.content) > 4096:
+            return None
+        try:
+            payload = self.json()
+        except (ValueError, RecursionError):
+            return None
+        code = payload.get("id") if isinstance(payload, dict) else None
+        if isinstance(code, str) and code in self._ERROR_IDS:
+            return code
+        return None
 
 
 class HerokuProxy:
