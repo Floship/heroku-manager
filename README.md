@@ -181,6 +181,8 @@ Operational notes:
 - The server's policy controls which operations the client may request, including one-off commands.
 - Direct mode keeps the shared rate limiter, five-second GET cache, transient-error retries and 429 back-off.
 - Uncertain mutations retain their request ID in shared Django cache and block automatic redispatch until reconciled.
+- The manager reports the original uncertain response and includes the status, any recognized error code, and reconciliation handles.
+- A later attempt for the same pending intent can alert after the grace period. The cache limits repeat alerts to once per hour when available. The original response always reports its own outcome.
 - Log-session creation is a repeatable read and can recover from a failed request on the next interval.
 - After verifying the provider outcome, use `reconcile_proxy_request(method, url, data, request_id)` to release that intent.
 - If the original payload is unavailable, use `reconcile_proxy_request(request_id=..., pending_key=...)` with both logged handles after verifying the provider outcome.

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.16 - 2026-11-18
+- Report known proxy errors and deduplicate alerts for pending mutations.
+- Preserve the single-attempt guard and exact-request reconciliation.
+
 ## 0.2.15 - 2026-11-04
 - Add optional split-credential HMAC transport selected by `HEROKU_PROXY_URL`. Invalid selected configuration fails closed.
 - Keep the Heroku token on the manager. Clients hold an encrypted envelope and authenticate each request with a fresh capsule.
