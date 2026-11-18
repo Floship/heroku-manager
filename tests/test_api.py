@@ -219,6 +219,147 @@ class TestCallHerokuApiProxy(BaseLockTestCase):
             self.assertEqual(second.call_heroku_api(method, url, data=data).status_code, 200)
         send.assert_called_once()
 
+    def test_later_tick_alerts_once_when_original_attempt_left_no_alert(self):
+        dyno = make_dyno()
+        method, url, data = "PATCH", FORMATION_URL, {"size": "standard-2x"}
+        pending_key = dyno._proxy_pending_key(method, url, data)
+        request_id = "00000000-0000-4000-8000-000000000001"
+        cache.set(pending_key, request_id, timeout=None)
+        active_key = f"{pending_key}:active:{request_id}"
+        cache.set(active_key, True)
+        with patch("heroku_manager.proxy.requests.Session.send") as active_send, \
+                patch("heroku_manager.heroku.logger") as logger:
+            active = dyno.call_heroku_api(method, url, data=data)
+        self.assertEqual(active.status_code, 409)
+        active_send.assert_not_called()
+        logger.error.assert_not_called()
+
+        cache.delete(active_key)
+        with patch("heroku_manager.proxy.requests.Session.send") as send, \
+                self.assertLogs("heroku_manager.heroku", level="ERROR") as alerts:
+            first = dyno.call_heroku_api(method, url, data=data)
+            second = dyno.call_heroku_api(method, url, data=data)
+
+        send.assert_not_called()
+        self.assertEqual(first.status_code, 409)
+        self.assertEqual(second.request_id, request_id)
+        self.assertEqual(cache.get(pending_key), request_id)
+        self.assertEqual(len(alerts.output), 1)
+        self.assertIn(request_id, alerts.output[0])
+        self.assertIn("status=409 error=proxy_reconciliation_required", alerts.output[0])
+
+    def test_duplicate_during_send_reserves_the_alert_for_the_actual_response(self):
+        for status in (200, 503):
+            with self.subTest(status=status):
+                first, second = make_dyno(), make_dyno()
+                target_size = "standard-1x" if status == 200 else "standard-2x"
+                method, url, data = "PATCH", FORMATION_URL, {"size": target_size}
+                pending_key = first._proxy_pending_key(method, url, data)
+
+                def send_and_observe(prepared, **kwargs):
+                    blocked = second.call_heroku_api(method, url, data=data)
+                    self.assertEqual(blocked.status_code, 409)
+                    self.assertEqual(blocked.request_id, prepared.headers["idempotency-key"])
+                    logger.error.assert_not_called()
+                    return mock_response(status, {"id": "database_unavailable"})
+
+                with patch("heroku_manager.proxy.requests.Session.send", side_effect=send_and_observe) as send, \
+                        patch("heroku_manager.heroku.logger") as logger:
+                    result = first.call_heroku_api(method, url, data=data)
+
+                send.assert_called_once()
+                self.assertEqual(result.status_code, status)
+                if status == 200:
+                    logger.error.assert_not_called()
+                    self.assertIsNone(cache.get(pending_key))
+                else:
+                    logger.error.assert_called_once()
+                    self.assertEqual(logger.error.call_args.args[-2:], (503, "database_unavailable"))
+                    self.assertEqual(cache.get(pending_key), result.request_id)
+
+    def test_active_alert_marker_failure_does_not_abort_a_reserved_mutation(self):
+        dyno = make_dyno()
+        method, url, data = "PATCH", FORMATION_URL, {"size": "standard-2x"}
+        pending_key = dyno._proxy_pending_key(method, url, data)
+        set_value = cache.set
+
+        def set_except_active(key, value, timeout):
+            if ":active:" in key:
+                raise OSError("cache unavailable")
+            return set_value(key, value, timeout)
+
+        def send_and_check_reservation(prepared, **kwargs):
+            self.assertEqual(cache.get(pending_key), prepared.headers["idempotency-key"])
+            return mock_response(200)
+
+        with patch.object(cache, "set", side_effect=set_except_active), \
+                patch("heroku_manager.proxy.requests.Session.send", side_effect=send_and_check_reservation) as send:
+            result = dyno.call_heroku_api(method, url, data=data)
+
+        self.assertEqual(result.status_code, 200)
+        send.assert_called_once()
+        self.assertIsNone(cache.get(pending_key))
+
+    def test_reservation_failure_blocks_proxy_dispatch(self):
+        dyno = make_dyno()
+        method, url, data = "PATCH", FORMATION_URL, {"size": "standard-2x"}
+        with patch.object(cache, "add", side_effect=OSError("cache unavailable")), \
+                patch("heroku_manager.proxy.requests.Session.send") as send:
+            with self.assertRaises(OSError):
+                dyno.call_heroku_api(method, url, data=data)
+
+        send.assert_not_called()
+        self.assertIsNone(cache.get(dyno._proxy_pending_key(method, url, data)))
+
+    def test_control_service_unavailable_errors_are_recognized(self):
+        for error_id in (
+            "quota_initialization_unavailable",
+            "resource_lookup_limit",
+            "resource_verification_unavailable",
+        ):
+            with self.subTest(error_id=error_id):
+                cache.clear()
+                dyno = make_dyno()
+                with patch("heroku_manager.proxy.requests.Session.send",
+                           return_value=mock_response(503, {"id": error_id})), \
+                        self.assertLogs("heroku_manager.heroku", level="ERROR") as alerts:
+                    result = dyno.call_heroku_api("PATCH", FORMATION_URL, data={"size": "standard-2x"})
+
+                self.assertEqual(result.status_code, 503)
+                self.assertIn(f"status=503 error={error_id}", alerts.output[0])
+
+    def test_alert_cache_failure_preserves_the_uncertain_response_and_pending_id(self):
+        dyno = make_dyno()
+        method, url, data = "PATCH", FORMATION_URL, {"size": "standard-2x"}
+        pending_key = dyno._proxy_pending_key(method, url, data)
+        add = cache.add
+
+        def add_except_alert(key, value, timeout):
+            if ":alert:" in key:
+                raise OSError("cache unavailable")
+            return add(key, value, timeout)
+
+        with patch.object(cache, "add", side_effect=add_except_alert), \
+                patch("heroku_manager.proxy.requests.Session.send",
+                      return_value=mock_response(503, {"id": "database_unavailable"})), \
+                self.assertLogs("heroku_manager.heroku", level="ERROR") as alerts:
+            response = dyno.call_heroku_api(method, url, data=data)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(cache.get(pending_key), response.request_id)
+        self.assertIn("status=503 error=database_unavailable", alerts.output[0])
+
+    def test_alert_omits_unrecognized_provider_error_ids(self):
+        dyno = make_dyno()
+        with patch("heroku_manager.proxy.requests.Session.send",
+                   return_value=mock_response(503, {"id": "opaque_token_value"})), \
+                self.assertLogs("heroku_manager.heroku", level="ERROR") as alerts:
+            response = dyno.call_heroku_api("PATCH", FORMATION_URL, data={"size": "standard-2x"})
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("status=503", alerts.output[0])
+        self.assertNotIn("opaque_token_value", alerts.output[0])
+
     def test_rate_limit_token_exhausted_returns_none(self):
         dyno = make_dyno()
         with patch.object(dyno, "_acquire_rate_limit_token", return_value=False), \
@@ -304,9 +445,9 @@ class TestTransportSelection(BaseLockTestCase):
                 patch("heroku_manager.heroku.logger") as logger:
             response = dyno.call_heroku_api(method, url, data=data)
         pending = dyno._proxy_pending_key(method, url, data)
-        logger.warning.assert_any_call(
-            "Heroku proxy outcome requires reconciliation, request_id=%s pending_key=%s",
-            response.request_id, pending)
+        logger.error.assert_called_once_with(
+            "Heroku proxy operation pending for %s, request_id=%s pending_key=%s status=%s error=%s",
+            dyno.formation_name, response.request_id, pending, 502, "proxy_outcome_unknown")
         self.assertFalse(dyno.reconcile_proxy_request(request_id="wrong", pending_key=pending))
         self.assertFalse(dyno.reconcile_proxy_request(request_id=response.request_id, pending_key="unrelated:key"))
         self.assertTrue(dyno.reconcile_proxy_request(request_id=response.request_id, pending_key=pending))
