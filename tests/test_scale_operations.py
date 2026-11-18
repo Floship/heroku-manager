@@ -121,6 +121,41 @@ class TestDownscaleFormationToOriginalSize(BaseLockTestCase):
                 dyno.downscale_formation_to_original_size()
         mock_log.error.assert_called()
 
+    def test_downscale_alerts_once_for_an_uncertain_proxy_request(self):
+        from requests.exceptions import ReadTimeout
+
+        dyno = make_dyno(formation_size="standard-2x")
+        cache.set(dyno.original_size_cache_key, {"size": "standard-1x"}, timeout=None)
+        with patch("heroku_manager.proxy.requests.Session.send", side_effect=ReadTimeout()) as send, \
+                self.assertLogs("heroku_manager.heroku", level="ERROR") as first_attempt:
+            dyno.downscale_formation_to_original_size()
+
+        cache.delete(dyno.downscale_cache_key)
+        with patch("heroku_manager.proxy.requests.Session.send") as retry, \
+                patch("heroku_manager.heroku.logger") as logger:
+            dyno.downscale_formation_to_original_size()
+
+        send.assert_called_once()
+        retry.assert_not_called()
+        self.assertIn("status=502 error=proxy_outcome_unknown", first_attempt.output[0])
+        logger.error.assert_not_called()
+        self.assertEqual(dyno.formation_size, "standard-2x")
+
+    def test_downscale_reports_an_actual_rate_limit(self):
+        from requests import Response
+
+        dyno = make_dyno(formation_size="standard-2x")
+        dyno.set_original_formation_size("standard-1x")
+        response = Response()
+        response.status_code = 429
+        response._content = b'{"id":"rate_limit","message":"provider details"}'
+        with patch("heroku_manager.proxy.requests.Session.send", return_value=response), \
+                self.assertLogs("heroku_manager.heroku", level="ERROR") as failure:
+            dyno.downscale_formation_to_original_size()
+
+        self.assertIn("HTTP 429, error=rate_limit", failure.output[0])
+        self.assertNotIn("provider details", failure.output[0])
+
 
 class TestCheckAndDownscale(BaseLockTestCase):
 

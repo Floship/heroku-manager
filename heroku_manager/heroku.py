@@ -759,13 +759,23 @@ class HerokuDyno:
         ) is not None
         if method.upper() not in ("GET", "HEAD") and not log_session_read:
             pending_key = self._proxy_pending_key(method.upper(), url, data)
-            request_id = str(uuid.uuid4())
-            if not cache.add(pending_key, request_id, timeout=None):
-                previous = cache.get(pending_key)
-                logger.warning("Heroku proxy operation requires reconciliation, request_id=%s pending_key=%s",
-                               previous, pending_key)
-                return ProxyResponse(409, json.dumps({"id": "proxy_reconciliation_required", "request_id": previous}),
-                                     request_id=previous)
+            previous = cache.get(pending_key)
+            reserved = False
+            if previous is None:
+                request_id = str(uuid.uuid4())
+                # Publish the grace period before another worker can see the reservation.
+                # It outlasts the proxy deadline and expires if this worker exits.
+                try:
+                    cache.set(f"{pending_key}:active:{request_id}", True, timeout=90)
+                except Exception:
+                    logger.debug("Could not record the Heroku proxy alert grace period.")
+                reserved = cache.add(pending_key, request_id, timeout=None)
+                if not reserved:
+                    previous = cache.get(pending_key)
+            if not reserved:
+                response = ProxyResponse(409, json.dumps({"id": "proxy_reconciliation_required", "request_id": previous}),
+                                         request_id=previous)
+                return self._report_proxy_reconciliation(pending_key, response)
         try:
             response = self.proxy.request(method, url, headers=custom_headers, data=data, request_id=request_id)
         except (ValueError, TypeError):
@@ -779,12 +789,42 @@ class HerokuDyno:
                 or response.status_code in (400, 401, 403, 404, 405, 413, 422, 429)):
             self._clear_proxy_pending(pending_key, request_id)
         elif pending_key:
-            logger.warning("Heroku proxy outcome requires reconciliation, request_id=%s pending_key=%s",
-                           request_id, pending_key)
+            if response is None:
+                response = ProxyResponse(502, '{"id":"proxy_outcome_unknown"}', request_id=request_id)
+            return self._report_proxy_reconciliation(pending_key, response, original_attempt=True)
         if response is not None and response.status_code >= 400:
             logger.warning("Heroku proxy rejected %s for formation %s, status %s",
                            method, self.formation_name, response.status_code)
         return response
+
+    def _report_proxy_reconciliation(self, pending_key, response, *, original_attempt=False):
+        response.reconciliation_required = True
+        request_id = response.request_id
+        if not request_id:
+            return response
+        # Alert bookkeeping must preserve the actual response and pending intent.
+        try:
+            if not original_attempt and cache.get(f"{pending_key}:active:{request_id}"):
+                return response
+            first_alert = cache.add(f"{pending_key}:alert:{request_id}", True, timeout=3600)
+        except Exception:
+            first_alert = False
+        if original_attempt or first_alert:
+            logger.error(
+                "Heroku proxy operation pending for %s, request_id=%s pending_key=%s status=%s error=%s",
+                self.formation_name, request_id, pending_key, response.status_code, response.error_id,
+            )
+        return response
+
+    @staticmethod
+    def _log_api_failure(operation, response):
+        if response is None:
+            logger.error("%s. API call was rate-limited or failed.", operation)
+        elif isinstance(response, ProxyResponse):
+            if not response.reconciliation_required:
+                logger.error("%s. HTTP %s, error=%s.", operation, response.status_code, response.error_id)
+        else:
+            logger.error("%s. HTTP %s.", operation, response.status_code)
 
     def _call_heroku_api_direct(self, method, url, custom_headers=None, data=None):
         """
@@ -1548,12 +1588,9 @@ class HerokuDyno:
 
             if not self.remote_monitoring:
                 self.stop_continuous_autoscale()
-        elif response:
-            self.clear_upscaling()
-            logger.error(f"Failed to upscale formation {self.formation_name}. Response: {response.status_code} - {response.text}")
         else:
             self.clear_upscaling()
-            logger.error(f"Failed to upscale formation {self.formation_name}. API call was rate-limited or failed.")
+            self._log_api_failure(f"Failed to upscale formation {self.formation_name}", response)
 
     def check_and_downscale_to_original_formation_size(self):
         """
@@ -1693,10 +1730,8 @@ class HerokuDyno:
             cache.delete(self.memory_history_cache_key)
             if not self.remote_monitoring:
                 self.stop_continuous_autoscale()
-        elif response:
-            logger.error(f"Failed to downscale formation {self.formation_name}. Response: {response.status_code} - {response.text}")
         else:
-            logger.error(f"Failed to downscale formation {self.formation_name}. API call was rate-limited or failed.")
+            self._log_api_failure(f"Failed to downscale formation {self.formation_name}", response)
 
     def restart_dyno(self, dyno_name=None):
         if not self.app_name or (not self.dyno_name and not dyno_name):
@@ -1730,10 +1765,7 @@ class HerokuDyno:
             else:
                 self.remove_dyno_from_alive_cache(dyno_name)
             return True
-        elif response:
-            logger.error(f"Failed to restart dyno {dyno_name}. Response: {response.status_code} - {response.text}")
-        else:
-            logger.error(f"Failed to restart dyno {dyno_name}. API call was rate-limited or failed.")
+        self._log_api_failure(f"Failed to restart dyno {dyno_name}", response)
         return False
 
     def increment_dyno_counter(self, dyno_name=None):
@@ -2030,12 +2062,8 @@ class HerokuDyno:
                 dyno_data = response.json()
                 logger.info(f"Command execution started on one-off dyno {dyno_data.get('name')}.")
                 return _ApiResult(stdout=str(dyno_data), stderr="", returncode=0)
-            elif response:
-                logger.error(f"Failed to execute command via Heroku API. Response: {response.status_code} - {response.text}")
-                return None
-            else:
-                logger.error(f"Failed to execute command via Heroku API. API call was rate-limited or failed.")
-                return None
+            self._log_api_failure("Failed to execute command via Heroku API", response)
+            return None
         except Exception as e:
             logger.error(f"Failed to execute command via Heroku API. Error: {e}", exc_info=True)
             return None
