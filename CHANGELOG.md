@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.2.17 - 2026-11-19
+- Publish one score-bound per-dyno observation tuple containing memory, the stability computed from that same memory history, and load. Keep the legacy metric keys for older readers and rollback.
+- Register a dyno before telemetry sampling so a slow metric read cannot hide a joining worker. Reject stale cached measurements when live logs are unavailable. An owner or score rejection leaves the previous legacy keys unchanged, while an error after a write attempt leaves the outcome uncertain and strict readers closed.
+- Require the primary's scored formation roster for automatic downscale. Require exact score matches and usable memory for every member, plus usable load for the stability path. Re-read membership and degradation state before accepting a resize.
+- Bind registration, publication, and cleanup to an atomic per-dyno owner lease and the reserved score. Fence a superseded incarnation so it cannot overwrite or remove its replacement.
+- Add `downscale_formation_if_allowed()` so automatic and shutdown callers carry one evaluated downscale decision into the mutation. The v0.2.16 Boolean-and-direct-call path remains available to older consumers.
+- Route immediate worker memory pressure through an owner-bound veto. The veto publishes the legacy memory and unstable value together, blocks peer downscales, and clears only when the current owner publishes a newer valid memory sample. That first replacement sample is unstable.
+- Keep memory-pressure publication monotonic. The veto write watches the owner and veto values and refuses an older nudge that finishes after a newer one.
+- Publish a bounded contention marker while a second process competes for a dyno name. Strict readers stay closed until the marker expires or the conflict clears. Remote monitors cannot claim or remove a local dyno registration.
+- Evaluate ordinary and stability downscales from one roster, one observation batch, and one final owner, membership, and degradation check. A changed snapshot denies both paths for that check-in.
+- Perform the final downscale validation and resize-flag reservation in one watched primary Redis transaction. The same transaction verifies the roster, owners, contention markers, memory vetoes, degradation state, target tier, and existing flag. Upscale uses the same owner-bound flag reservation rule.
+- Capture the effective downscale target when memory eligibility is evaluated and use it for the threshold and PATCH. Watch the baseline key during reservation and abort if the target changed.
+- Use the previous-tier fallback only when the recorded baseline key is absent. A present invalid, undecodable, or serialized-`None` value remains unavailable. Validate the carried target and snapshot before at-or-below cleanup, preserving the baseline and upscale timer on mismatch. A present upscale timer must decode to a `datetime`, so malformed, wrong-type, or serialized-`None` timer values cannot trigger cleanup.
+- Revalidate a stale sibling's liveness on primary Redis before restarting it, and carry the captured owner and score into cleanup so a delayed response leaves a replacement untouched.
+- Keep the bounded heartbeat through the next scheduled scan after the zombie threshold, reject restart while a contention marker is live, and delay registry pruning through the same grace on both ready and readiness-failure scans. Recheck managed resize ownership and zombie liveness after acquiring the mutation lock, before reserving a flag or sending a PATCH or DELETE. Sample upscale diagnostics before the final ownership check.
+- Fail closed on mixed-version workers without observation tuples, roster changes detected with a fresh cutoff, missing or expired measurements, and malformed values. Continue best-effort advisory upscale by skipping malformed sibling values individually.
+- Scope self-monitoring log, scalar metric, timestamped metric, and memory-history keys by the verified `HEROKU_DYNO_ID`. Require matching source and incarnation data before accepting a numeric runtime sample. Keep the observation key shared by app and dyno name and bind its tuple to the check-in score.
+- Deduplicate memory history by source epoch, reject out-of-order samples, and use the retained source epoch for strict cache freshness so one reading cannot fabricate a plateau.
+- Gate both resize methods on the primary formation tier before any lock, resize flag, or PATCH. Defer stale, failed-read, invalid, undecodable, and `None` cases while preserving remote, unknown-`DYNO_RAM`, and genuine cache-miss behavior.
+- Scope each downscale flag to an attempt token so a definite rejection clears only its own flag and late cleanup cannot remove a newer attempt.
+- Record failed initial registrations, including exhausted WATCH retries, in the app ledger. Fail closed through the registration grace while the joining heartbeat may still be absent, then clear only the matching failure entry.
+- Use a separate short-lived strict raw-log cache and share one fetch between memory and load per check-in. Six distinct source epochs can now enter the 300-second stability window without counting one cached reading repeatedly.
+- Keep a failed standalone strict log read retryable on the next metric request while sharing one success or failure between memory and load inside a check-in.
+- Preserve the explicit remote manual downscale path without requiring local owner readiness while keeping the guarded decision mandatory for managed local downscales.
+- Initialize each app's rate-limit window atomically and count requests with one cache operation while the window exists.
+- Exclude the test package from built wheels while preserving the `heroku_manager` package boundary.
+- Collect autoscale diagnostics only at DEBUG level. Publish local thread usage once when enabled.
+- Treat a proxy cooldown 429 with a bounded positive ASCII `Retry-After` as one warning without an error event. Trim only ASCII space and tab, accept 1 through 86,400 seconds, and keep actual rate limits, malformed or oversized values, unknown 429 responses, and direct transport failures as errors. Direct retries retain the downscale flag unless every attempt was definitely rejected before dispatch.
+- Log stale zombie evidence as detection and emit the restart message only after Heroku accepts DELETE.
+
 ## 0.2.16 - 2026-11-18
 - Report known proxy errors and deduplicate alerts for pending mutations.
 - Preserve the single-attempt guard and exact-request reconciliation.

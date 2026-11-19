@@ -75,7 +75,7 @@ def make_dyno(dyno_name="normal_worker.1", formation_size="standard-2x",
     return dyno
 
 
-def patch_index_backend(memory_store):
+def patch_index_backend(memory_store, own_dyno="normal_worker.1"):
     """Patch the raw client so the index adapter reads ``memory_store``.
 
     LocMem has no raw client; the Phase B adapter requires one.  This helper
@@ -86,6 +86,102 @@ def patch_index_backend(memory_store):
     """
     from django.core.cache import cache as real_cache
 
+    class _FakePipeline:
+        """Small WATCH/MULTI implementation for the task-owned test fixture."""
+
+        def __init__(self, client):
+            self._client = client
+            self._backend = client._backend
+            self._watched = {}
+            self._commands = []
+
+        def watch(self, *keys):
+            self._watched.update({
+                key: self._backend._versions.get(key, 0) for key in keys
+            })
+            return self
+
+        def multi(self):
+            return self
+
+        def get(self, key):
+            return self._client.get(key)
+
+        def zscore(self, key, member):
+            return self._client.zscore(key, member)
+
+        def zrangebyscore(self, *args, **kwargs):
+            return self._client.zrangebyscore(*args, **kwargs)
+
+        def mget(self, keys):
+            return self._client.mget(keys)
+
+        def zrange(self, *args, **kwargs):
+            return self._client.zrange(*args, **kwargs)
+
+        def exists(self, *keys):
+            return self._client.exists(*keys)
+
+        def set(self, key, value, px=None):
+            self._commands.append(("set", key, value))
+            return self
+
+        def delete(self, key):
+            self._commands.append(("delete", key, None))
+            return self
+
+        def zadd(self, key, mapping):
+            self._commands.append(("zadd", key, mapping))
+            return self
+
+        def zrem(self, key, member):
+            self._commands.append(("zrem", key, member))
+            return self
+
+        def ping(self):
+            self._commands.append(("ping", None, None))
+            return self
+
+        def execute(self):
+            import pickle
+            from redis.exceptions import WatchError
+            for key, version in self._watched.items():
+                if self._backend._versions.get(key, 0) != version:
+                    self.reset()
+                    raise WatchError("watched cache value changed")
+            results = []
+            for command, key, value in self._commands:
+                if command == "set":
+                    self._backend._store[key] = value
+                    cached_value = value
+                    if isinstance(value, bytes):
+                        try:
+                            cached_value = pickle.loads(value)
+                        except Exception:
+                            cached_value = value
+                    real_cache.set(key, cached_value)
+                    results.append(True)
+                elif command == "delete":
+                    self._backend._store.pop(key, None)
+                    real_cache.delete(key)
+                    results.append(1)
+                elif command == "zadd":
+                    self._backend._index_scores.update(value)
+                    results.append(len(value))
+                elif command == "zrem":
+                    self._backend._index_scores.pop(value, None)
+                    results.append(1)
+                elif command == "ping":
+                    results.append(True)
+                self._backend._touch(key)
+            self.reset()
+            return results
+
+        def reset(self):
+            self._watched = {}
+            self._commands = []
+            return None
+
     class _FakeClient:
         """Raw redis-py client with a real decode for the adapter."""
 
@@ -95,39 +191,50 @@ def patch_index_backend(memory_store):
         def zremrangebyscore(self, key, min_score, max_score):
             return 0
 
-        def zrangebyscore(self, key, min_score, max_score):
+        def zrangebyscore(self, key, min_score, max_score, withscores=False):
             # Derive fresh index members from the fixture store's metric keys
             # so legacy ready-path fixtures (seeded index_ready) actually see
             # their siblings through the index.
-            dynos = set()
-            for k in self._backend._store:
-                parts = k.split(":")
-                if len(parts) == 3 and parts[0] == "heroku":
-                    dynos.add(parts[2])
-            return sorted(dynos)
+            self._backend._ensure_index()
+            members = sorted(self._backend._index_scores)
+            if withscores:
+                return [(member, self._backend._index_scores[member]) for member in members]
+            return members
 
         def zscore(self, key, member):
-            # No index ZSET in the fixture store: readiness is not derivable,
-            # so the real predicate fails closed.  Legacy destructive-gate
-            # tests seed index_ready directly and never hit this.
-            return None
+            return self._backend._index_scores.get(member)
 
         def get(self, key):
             import pickle
-            value = self._backend._store.get(key, None)
+            value = self._backend._raw_lookup(key)
             if value is None:
-                value = self._backend.get(key)
-            return pickle.dumps(value) if value is not None else None
+                return None
+            return value if isinstance(value, bytes) else pickle.dumps(value)
+
+        def delete(self, key):
+            existed = key in self._backend._store
+            self._backend._store.pop(key, None)
+            self._backend._touch(key)
+            return 1 if existed else 0
 
         def zrange(self, key, start, end, withscores=False):
             # No failed-writer ledger in the fixture store: never degraded.
             return []
 
-        def exists(self, key):
-            return 1 if key in self._backend._store else 0
+        def exists(self, *keys):
+            count = 0
+            for key in keys:
+                if key in self._backend._store:
+                    count += 1
+                elif key.startswith("autoscaler") or "heroku:dynos:v1:" in key:
+                    count += 1 if self._backend._index_scores else 0
+                elif self._backend._lookup(key) is not None:
+                    count += 1
+            return count
 
         def mget(self, keys):
             import pickle
+            self._backend._ensure_observations()
             # Dict fixtures carry Python values (mirroring cache.set); list
             # fixtures only name keys, so their values live in the real locmem
             # backend behind ``_ScanBackend.get``.  Either way raw MGET results
@@ -135,21 +242,40 @@ def patch_index_backend(memory_store):
             # Python numbers/datetimes before callers compare them.
             raw = []
             for key in keys:
-                value = self._backend._store.get(key, None)
+                value = self._backend._raw_lookup(key)
                 if value is None:
-                    value = self._backend.get(key)
-                raw.append(pickle.dumps(value) if value is not None else None)
+                    raw.append(None)
+                elif isinstance(value, bytes):
+                    raw.append(value)
+                else:
+                    raw.append(pickle.dumps(value))
             return raw
 
         def decode(self, value):
             import pickle
             return pickle.loads(value)
 
+        def encode(self, value):
+            import pickle
+            return pickle.dumps(value)
+
         def zadd(self, *args, **kwargs):
+            if len(args) >= 2 and isinstance(args[1], dict):
+                self._backend._index_scores.update(args[1])
+                self._backend._touch(args[0])
             return 1
 
         def zrem(self, *args, **kwargs):
+            if len(args) >= 2:
+                self._backend._index_scores.pop(args[1], None)
+                self._backend._touch(args[0])
             return 1
+
+        def expire(self, key, timeout):
+            return 1
+
+        def pipeline(self, transaction=True):
+            return _FakePipeline(self)
 
     class _ScanBackend:
         """Proxy: raw-client seam for the index adapter, LocMem for the rest."""
@@ -161,6 +287,16 @@ def patch_index_backend(memory_store):
                 self._store = {key: None for key in store}
             else:
                 self._store = dict(store)
+            dynos = {own_dyno}
+            for key in self._store:
+                parts = key.split(":")
+                if len(parts) == 3 and parts[0] == "heroku":
+                    dynos.add(parts[2])
+            self._initial_dynos = dynos
+            self._index_scores = {}
+            self._versions = {}
+            self._synthetic_owners = set()
+            self._synthetic_observations = set()
             self._client = _FakeClient(self)
             self._raw = MagicMock()
             self._raw.get_client.return_value = self._client
@@ -168,9 +304,88 @@ def patch_index_backend(memory_store):
             # (the django-redis DefaultClient), so the fake backend must expose
             # the real decode there too.
             self._raw.decode = self._client.decode
+            self._raw.encode = self._client.encode
+
+        def _touch(self, key):
+            self._versions[key] = self._versions.get(key, 0) + 1
+
+        def _raw_lookup(self, key):
+            if key in self._store:
+                return self._store[key]
+            return real_cache.get(key)
+
+        def _lookup(self, key):
+            import pickle
+            value = self._raw_lookup(key)
+            if isinstance(value, bytes):
+                try:
+                    return pickle.loads(value)
+                except Exception:
+                    return value
+            return value
+
+        def _ensure_index(self):
+            dynos = set(self._initial_dynos)
+            for key in self._store:
+                parts = key.split(":")
+                if len(parts) == 3 and parts[0] == "heroku":
+                    dynos.add(parts[2])
+            check_in_epoch = time.time()
+            for dyno in dynos:
+                self._index_scores.setdefault(dyno, check_in_epoch)
+
+        def _metric_value(self, key, default):
+            if key in self._store:
+                return self._store[key]
+            value = real_cache.get(key)
+            return default if value is None and key not in self._store else value
+
+        def _ensure_observations(self):
+            self._ensure_index()
+            self._ensure_owners()
+            for dyno, check_in_epoch in self._index_scores.items():
+                observation_key = f"heroku:dyno_observation:v1:floship:{dyno}"
+                if observation_key in self._store and observation_key not in self._synthetic_observations:
+                    continue
+                memory = self._metric_value(f"heroku:dyno_memory:{dyno}", 100.0)
+                stable = self._metric_value(f"heroku:dyno_memory_stable:{dyno}", False)
+                load = self._metric_value(f"heroku:dyno_load:{dyno}", 0.0)
+                self._store[observation_key] = (
+                    check_in_epoch, memory, stable, load,
+                )
+                self._synthetic_observations.add(observation_key)
+
+        def _ensure_owners(self):
+            for dyno in self._index_scores:
+                owner_key = f"heroku:dyno_owner:v1:floship:{dyno}"
+                if owner_key not in self._store:
+                    self._store[owner_key] = f"fixture-owner:{dyno}"
+                    self._synthetic_owners.add(owner_key)
 
         def make_key(self, key, version=None):
             return key
+
+        def get(self, key, default=None):
+            value = self._lookup(key)
+            return default if value is None else value
+
+        def set(self, key, value, timeout=None, **kwargs):
+            self._store[key] = value
+            real_cache.set(key, value, timeout=timeout)
+            self._touch(key)
+            return True
+
+        def delete(self, key, **kwargs):
+            existed = key in self._store or real_cache.get(key) is not None
+            self._store.pop(key, None)
+            real_cache.delete(key)
+            self._touch(key)
+            return existed
+
+        def ttl(self, key, default_timeout=None):
+            if key in self._store:
+                return 300
+            return real_cache.ttl(key)
 
         @property
         def client(self):

@@ -2,8 +2,8 @@ from setuptools import setup, find_packages
 
 setup(
     name="heroku_manager",
-    version="0.2.16",
-    packages=find_packages(),
+    version="0.2.17",
+    packages=find_packages(include=("heroku_manager", "heroku_manager.*")),
     install_requires=[
         "django>=2.2",
         "requests>=2.0.0",

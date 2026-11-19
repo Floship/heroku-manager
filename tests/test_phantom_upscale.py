@@ -27,14 +27,20 @@ Extended edge cases cover:
   K. Bottom guard on genuinely upscaled formation with hot memory
 """
 
+import os
+import pickle
+import time
 import unittest
+from contextlib import ExitStack
 from datetime import timedelta
 from unittest.mock import patch, MagicMock, PropertyMock, call
 
 from django.core.cache import cache
 from django.utils import timezone
+from redis.exceptions import ResponseError
 
 from tests.conftest import make_dyno, BaseLockTestCase, patch_index_backend
+from heroku_manager.heroku import _IndexAdapter
 
 
 def _mock_response(status=200):
@@ -63,10 +69,14 @@ def _apply_dyno_patches(dyno, overrides, fn):
             patch.object(type(dyno), attr, new_callable=PropertyMock, return_value=val)
         )
 
+    cache.set(f"heroku:dyno_memory:{dyno.dyno_name}", defaults["current_memory_usage"], timeout=60)
+    cache.set(f"heroku:dyno_load:{dyno.dyno_name}", defaults["avg_load_1min"], timeout=60)
+
     result = None
     ctx_managers = [p.__enter__() for p in patches]
     try:
-        result = fn()
+        with patch_index_backend({}):
+            result = fn()
     finally:
         for p in reversed(patches):
             p.__exit__(None, None, None)
@@ -329,16 +339,31 @@ class TestLegitimateUpscaleNotCleared(BaseLockTestCase):
                   {"size": "standard-1x", "time": timezone.now()}, timeout=None)
         until = timezone.now() + timedelta(seconds=100)
         cache.set(dyno.upscale_until_cache_key, until, timeout=300)
+        cache.set(
+            f"heroku:dyno_memory_stable:{dyno.dyno_name}", False, timeout=60,
+        )
 
-        with patch_index_backend({}):
-            with patch.object(cache, "ttl", return_value=50):
-                _apply_dyno_patches(dyno, {"current_memory_usage": 350.0,
-                                           "current_memory_usage_percentage": 34.2},
-                                    dyno.check_and_downscale_to_original_formation_size)
+        with patch.object(cache, "ttl", return_value=50), \
+                patch.object(
+                    type(dyno),
+                    "downscale_on_non_empty_queue",
+                    new_callable=PropertyMock,
+                    return_value=False,
+                ), \
+                patch.object(dyno, "call_heroku_api") as api:
+            _apply_dyno_patches(dyno, {
+                "current_memory_usage": 350.0,
+                "current_memory_usage_percentage": 34.2,
+                "no_tasks_in_queue": False,
+                "tasks_in_queue": 1,
+            }, dyno.check_and_downscale_to_original_formation_size)
 
         extended = cache.get(dyno.upscale_until_cache_key)
+        api.assert_not_called()
+        self.assertIsNone(cache.get(dyno.downscale_cache_key))
         self.assertIsNotNone(extended,
             "Legitimate upscale timer must be extended, not cleared")
+        self.assertGreater(extended, until)
 
     def test_multi_level_upscale_timer_preserved(self):
         """On performance-m (2560MB), original=standard-1x (512MB) —
@@ -348,16 +373,31 @@ class TestLegitimateUpscaleNotCleared(BaseLockTestCase):
                   {"size": "standard-1x", "time": timezone.now()}, timeout=None)
         until = timezone.now() + timedelta(seconds=200)
         cache.set(dyno.upscale_until_cache_key, until, timeout=300)
+        cache.set(
+            f"heroku:dyno_memory_stable:{dyno.dyno_name}", False, timeout=60,
+        )
 
-        with patch_index_backend({}):
-            with patch.object(cache, "ttl", return_value=50):
-                _apply_dyno_patches(dyno, {"current_memory_usage": 900.0,
-                                           "current_memory_usage_percentage": 35.2},
-                                    dyno.check_and_downscale_to_original_formation_size)
+        with patch.object(cache, "ttl", return_value=50), \
+                patch.object(
+                    type(dyno),
+                    "downscale_on_non_empty_queue",
+                    new_callable=PropertyMock,
+                    return_value=False,
+                ), \
+                patch.object(dyno, "call_heroku_api") as api:
+            _apply_dyno_patches(dyno, {
+                "current_memory_usage": 900.0,
+                "current_memory_usage_percentage": 35.2,
+                "no_tasks_in_queue": False,
+                "tasks_in_queue": 1,
+            }, dyno.check_and_downscale_to_original_formation_size)
 
         extended = cache.get(dyno.upscale_until_cache_key)
+        api.assert_not_called()
+        self.assertIsNone(cache.get(dyno.downscale_cache_key))
         self.assertIsNotNone(extended,
             "Multi-level upscale timer must be preserved")
+        self.assertGreater(extended, until)
 
     def test_upscale_timer_not_near_expiry_returns_early(self):
         """TTL still high (500) — should return early without extending or clearing."""
@@ -398,6 +438,30 @@ class TestNearExpiryLegitimateDownscale(BaseLockTestCase):
                     }, dyno.check_and_downscale_to_original_formation_size)
 
         mock_ds.assert_called_once()
+
+    def test_missing_sibling_load_blocks_near_expiry_plateau_downscale(self):
+        dyno = make_dyno(formation_size="standard-2x")
+        cache.set(dyno.original_size_cache_key, {"size": "standard-1x", "time": timezone.now()}, timeout=None)
+        cache.set(dyno.upscale_until_cache_key, timezone.now() + timedelta(seconds=50), timeout=50)
+        store = {"heroku:dyno_memory:normal_worker.2": 300}
+        overrides = {
+            "current_memory_usage": 600.0,
+            "current_memory_usage_percentage": 58.6,
+            "is_memory_stabilized": True,
+            "avg_load_1min": 0.2,
+            "no_tasks_in_queue": False,
+            "tasks_in_queue": 1,
+        }
+        with (
+            patch_index_backend(store),
+            patch.object(cache, "ttl", return_value=50),
+            patch.object(dyno, "downscale_formation_to_original_size") as downscale,
+            patch.object(dyno, "restart_dyno") as restart,
+        ):
+            _apply_dyno_patches(dyno, overrides, dyno.check_and_downscale_to_original_formation_size)
+
+        downscale.assert_not_called()
+        restart.assert_not_called()
 
     def test_near_expiry_r14_hot_empty_queue_restarts(self):
         """Upscaled, near expiry, R14 active + hot memory + empty queue → restart."""
@@ -803,6 +867,719 @@ class TestCanBeUpscaledGuard(BaseLockTestCase):
             _apply_dyno_patches(dyno, {}, dyno.check_and_downscale_to_original_formation_size)
 
         self.assertIsNone(cache.get(dyno.upscale_until_cache_key))
+
+
+class TestPhantomCleanupRace(BaseLockTestCase):
+
+    def test_newer_baseline_and_timer_after_capture_survive(self):
+        dyno = make_dyno(formation_size="standard-1x")
+        initial_time = timezone.now()
+        cache.set(
+            dyno.original_size_cache_key,
+            {"size": "standard-1x", "time": initial_time},
+            timeout=None,
+        )
+        cache.set(
+            dyno.upscale_until_cache_key,
+            initial_time + timedelta(seconds=30),
+            timeout=60,
+        )
+
+        with patch_index_backend({}) as backend:
+            original_get = backend._client.get
+            raced = []
+            captured_reads = 0
+            new_time = initial_time + timedelta(seconds=5)
+            new_timer = initial_time + timedelta(seconds=90)
+
+            def racing_get(key):
+                nonlocal captured_reads
+                captured = original_get(key)
+                captured_reads += 1
+                if captured_reads == 3 and not raced:
+                    raced.append(True)
+                    cache.set(
+                        dyno.original_size_cache_key,
+                        {"size": "standard-1x", "time": new_time},
+                        timeout=None,
+                    )
+                    cache.set(
+                        dyno.upscale_until_cache_key,
+                        new_timer,
+                        timeout=120,
+                    )
+                return captured
+
+            backend._client.get = racing_get
+            with patch.object(
+                        type(dyno),
+                        "current_memory_usage_percentage",
+                        new_callable=PropertyMock,
+                        return_value=0.0,
+                    ), \
+                    patch.object(dyno, "call_heroku_api") as api:
+                dyno.check_and_downscale_to_original_formation_size()
+
+            self.assertEqual(
+                cache.get(dyno.original_size_cache_key)["time"],
+                new_time,
+            )
+            self.assertEqual(
+                cache.get(dyno.upscale_until_cache_key),
+                new_timer,
+            )
+            self.assertIsNone(cache.get(dyno.downscale_cache_key))
+            api.assert_not_called()
+
+
+class TestScheduledTimerState(BaseLockTestCase):
+    """The scheduled path must decide timer state from the primary raw value."""
+
+    def _prime_upscaled(self, dyno, baseline="standard-1x"):
+        cache.set(
+            dyno.original_size_cache_key,
+            {"size": baseline, "time": timezone.now()},
+            timeout=None,
+        )
+        cache.set(
+            dyno.upscale_until_cache_key,
+            timezone.now() + timedelta(seconds=50),
+            timeout=50,
+        )
+
+    def _run_scheduled(self, dyno):
+        with patch.object(
+                    type(dyno),
+                    "current_memory_usage_percentage",
+                    new_callable=PropertyMock,
+                    return_value=10.0,
+                ), \
+                patch.object(
+                    type(dyno),
+                    "detected_r14",
+                    new_callable=PropertyMock,
+                    return_value=False,
+                ), \
+                patch.object(
+                    type(dyno),
+                    "detected_r15",
+                    new_callable=PropertyMock,
+                    return_value=False,
+                ), \
+                patch.object(dyno, "downscale_formation_to_original_size") as downscale, \
+                patch.object(dyno, "restart_dyno") as restart:
+            dyno.check_and_downscale_to_original_formation_size()
+        return downscale, restart
+
+    def test_serialized_none_timer_defers_without_resize(self):
+        dyno = make_dyno(formation_size="performance-m")
+        self._prime_upscaled(dyno)
+        poisoned = pickle.dumps(None)
+        with patch_index_backend({}) as backend:
+            backend._store[dyno.upscale_until_cache_key] = poisoned
+            downscale, restart = self._run_scheduled(dyno)
+
+            self.assertEqual(
+                backend._store[dyno.upscale_until_cache_key],
+                poisoned,
+            )
+        downscale.assert_not_called()
+        restart.assert_not_called()
+        self.assertEqual(
+            cache.get(dyno.original_size_cache_key)["size"],
+            "standard-1x",
+        )
+
+    def test_undecodable_timer_defers_without_resize(self):
+        dyno = make_dyno(formation_size="performance-m")
+        self._prime_upscaled(dyno)
+        poisoned = b"\x80not-a-pickle"
+        with patch_index_backend({}) as backend:
+            backend._store[dyno.upscale_until_cache_key] = poisoned
+            downscale, restart = self._run_scheduled(dyno)
+
+            self.assertEqual(
+                backend._store[dyno.upscale_until_cache_key],
+                poisoned,
+            )
+        downscale.assert_not_called()
+        restart.assert_not_called()
+        self.assertEqual(
+            cache.get(dyno.original_size_cache_key)["size"],
+            "standard-1x",
+        )
+
+    def test_wrong_type_timer_defers_without_resize(self):
+        dyno = make_dyno(formation_size="performance-m")
+        self._prime_upscaled(dyno)
+        with patch_index_backend({}) as backend:
+            real_get = backend._client.get
+
+            def wrong_type_get(key):
+                if key == dyno.upscale_until_cache_key:
+                    raise ResponseError(
+                        "WRONGTYPE Operation against a key holding the wrong "
+                        "kind of value",
+                    )
+                return real_get(key)
+
+            backend._client.get = wrong_type_get
+            downscale, restart = self._run_scheduled(dyno)
+
+        downscale.assert_not_called()
+        restart.assert_not_called()
+        self.assertEqual(
+            cache.get(dyno.original_size_cache_key)["size"],
+            "standard-1x",
+        )
+        self.assertIsNotNone(cache.get(dyno.upscale_until_cache_key))
+
+    def test_raw_timer_miss_keeps_expiry_path(self):
+        dyno = make_dyno(formation_size="performance-m")
+        cache.set(
+            dyno.original_size_cache_key,
+            {"size": "standard-1x", "time": timezone.now()},
+            timeout=None,
+        )
+
+        with patch_index_backend({}):
+            downscale, restart = self._run_scheduled(dyno)
+
+        downscale.assert_called_once()
+        restart.assert_not_called()
+
+    def test_live_timer_without_baseline_uses_previous_tier(self):
+        dyno = make_dyno(formation_size="performance-m")
+        timer = timezone.now() + timedelta(seconds=50)
+        cache.set(dyno.upscale_until_cache_key, timer, timeout=50)
+
+        with patch_index_backend({}), patch.object(cache, "ttl", return_value=50):
+            downscale, restart = self._run_scheduled(dyno)
+
+        downscale.assert_called_once()
+        restart.assert_not_called()
+        self.assertEqual(cache.get(dyno.upscale_until_cache_key), timer)
+        self.assertIsNone(cache.get(dyno.original_size_cache_key))
+
+    def _prime_live_timer_without_baseline(self, dyno):
+        formation_key = (
+            f"heroku:formation_size:{dyno.app_name}:{dyno.formation_name}"
+        )
+        cache.set(formation_key, dyno.formation_size, timeout=None)
+        cache.delete(dyno.original_size_cache_key)
+        timer = timezone.now() + timedelta(seconds=45)
+        cache.set(dyno.upscale_until_cache_key, timer, timeout=50)
+        return formation_key, timer
+
+    def _run_reservation_case(self, *, remote, replace_timer):
+        cache.clear()
+        dyno = make_dyno(formation_size="performance-m")
+        formation_key, timer = self._prime_live_timer_without_baseline(dyno)
+        replacement = timer + timedelta(seconds=600)
+        env = {
+            "DYNO": "other_worker.9" if remote else dyno.dyno_name,
+            "DYNO_RAM": "2560",
+        }
+        response = _mock_response(200)
+
+        with patch.dict(os.environ, env), \
+                patch_index_backend({}) as backend:
+            backend._store[
+                f"heroku:dyno_owner:v1:{dyno.app_name}:{dyno.dyno_name}"
+            ] = dyno._dyno_owner_token
+            real_pipeline = backend._client.pipeline
+            # The fake raw client uses identity keys, unlike LocMemCache.
+            timer_key = dyno.upscale_until_cache_key
+            state = {"fired": False}
+
+            class HookPipeline:
+                def __init__(self, pipeline):
+                    self._pipeline = pipeline
+
+                def watch(self, *keys):
+                    if replace_timer and not state["fired"] and timer_key in keys:
+                        state["fired"] = True
+                        cache.set(
+                            dyno.upscale_until_cache_key,
+                            replacement,
+                            timeout=600,
+                        )
+                    return self._pipeline.watch(*keys)
+
+                def __getattr__(self, name):
+                    return getattr(self._pipeline, name)
+
+            def hooked_pipeline(transaction=True):
+                return HookPipeline(real_pipeline(transaction=transaction))
+
+            backend._client.pipeline = hooked_pipeline
+            with patch.object(
+                        type(dyno),
+                        "current_memory_usage_percentage",
+                        new_callable=PropertyMock,
+                        return_value=10.0,
+                    ), \
+                    patch.object(
+                        type(dyno),
+                        "detected_r14",
+                        new_callable=PropertyMock,
+                        return_value=False,
+                    ), \
+                    patch.object(
+                        type(dyno),
+                        "detected_r15",
+                        new_callable=PropertyMock,
+                        return_value=False,
+                    ), \
+                    patch.object(
+                        dyno,
+                        "_defer_resize_for_retiring_dyno",
+                        return_value=False,
+                    ), \
+                    patch.object(
+                        dyno, "call_heroku_api", return_value=response,
+                    ) as api:
+                dyno.check_and_downscale_to_original_formation_size()
+
+            if replace_timer:
+                self.assertTrue(state["fired"])
+                api.assert_not_called()
+                self.assertIsNone(cache.get(dyno.downscale_cache_key))
+                self.assertEqual(
+                    cache.get(dyno.upscale_until_cache_key),
+                    replacement,
+                )
+                self.assertEqual(cache.get(formation_key), "performance-m")
+                return
+
+            self.assertFalse(state["fired"])
+            api.assert_called_once()
+            self.assertEqual(api.call_args[0][0], "PATCH")
+            self.assertEqual(api.call_args[1]["data"], {"size": "standard-2x"})
+            self.assertEqual(cache.get(formation_key), "standard-2x")
+
+    def test_unchanged_timer_before_reservation_downscales(self):
+        for remote in (False, True):
+            with self.subTest(remote=remote):
+                self._run_reservation_case(remote=remote, replace_timer=False)
+
+    def test_timer_replaced_before_watch_defers(self):
+        for remote in (False, True):
+            with self.subTest(remote=remote):
+                self._run_reservation_case(remote=remote, replace_timer=True)
+
+
+class TestScheduledRemoteReservation(BaseLockTestCase):
+    """Remote scheduled decisions keep their timer and baseline expectations."""
+
+    def _prime(self, dyno, *, baseline="standard-1x"):
+        formation_key = (
+            f"heroku:formation_size:{dyno.app_name}:{dyno.formation_name}"
+        )
+        cache.set(formation_key, dyno.formation_size, timeout=None)
+        cache.delete(dyno.original_size_cache_key)
+        if baseline is not None:
+            cache.set(
+                dyno.original_size_cache_key,
+                {"size": baseline, "time": timezone.now()},
+                timeout=None,
+            )
+        timer = timezone.now() + timedelta(seconds=45)
+        cache.set(dyno.upscale_until_cache_key, timer, timeout=50)
+        return formation_key, timer
+
+    def _enter_common(self, stack, dyno, api):
+        stack.enter_context(patch.object(
+            type(dyno),
+            "current_memory_usage_percentage",
+            new_callable=PropertyMock,
+            return_value=10.0,
+        ))
+        stack.enter_context(patch.object(
+            type(dyno),
+            "detected_r14",
+            new_callable=PropertyMock,
+            return_value=False,
+        ))
+        stack.enter_context(patch.object(
+            type(dyno),
+            "detected_r15",
+            new_callable=PropertyMock,
+            return_value=False,
+        ))
+        return stack.enter_context(patch.object(dyno, "call_heroku_api", **api))
+
+    def _patch_downscale_race(self, stack, dyno, race):
+        state = {"fired": False}
+        real_downscale = dyno.downscale_formation_to_original_size
+
+        def run_race_then_downscale(*args, **kwargs):
+            if not state["fired"]:
+                state["fired"] = True
+                race()
+            return real_downscale(*args, **kwargs)
+
+        stack.enter_context(patch.object(
+            dyno,
+            "downscale_formation_to_original_size",
+            side_effect=run_race_then_downscale,
+        ))
+        return state
+
+    def test_remote_scheduled_uses_recorded_baseline(self):
+        dyno = make_dyno(formation_size="performance-m")
+        formation_key, _ = self._prime(dyno)
+        response = _mock_response(200)
+
+        with patch.dict(
+                    os.environ,
+                    {"DYNO": "other_worker.9", "DYNO_RAM": "2560"},
+                ), \
+                patch_index_backend({}), \
+                ExitStack() as stack:
+            api = self._enter_common(
+                stack, dyno, {"return_value": response},
+            )
+            dyno.check_and_downscale_to_original_formation_size()
+
+        api.assert_called_once()
+        self.assertEqual(api.call_args[1]["data"], {"size": "standard-1x"})
+        self.assertEqual(cache.get(formation_key), "standard-1x")
+
+    def test_remote_scheduled_cleanup_preserves_replacement_timer(self):
+        dyno = make_dyno(formation_size="performance-m")
+        formation_key, timer = self._prime(dyno)
+        replacement = timer + timedelta(seconds=600)
+        original_evaluate = dyno._evaluate_downscale_snapshot
+
+        def evaluate_then_race(**kwargs):
+            decision = original_evaluate(**kwargs)
+            if decision.normal or decision.stability:
+                cache.set(formation_key, "standard-1x", timeout=None)
+                cache.set(
+                    dyno.upscale_until_cache_key,
+                    replacement,
+                    timeout=600,
+                )
+            return decision
+
+        with patch.dict(
+                    os.environ,
+                    {"DYNO": "other_worker.9", "DYNO_RAM": "2560"},
+                ), \
+                patch_index_backend({}), \
+                patch.object(
+                    dyno,
+                    "_evaluate_downscale_snapshot",
+                    side_effect=evaluate_then_race,
+                ), \
+                ExitStack() as stack:
+            api = self._enter_common(stack, dyno, {})
+            dyno.check_and_downscale_to_original_formation_size()
+
+        api.assert_not_called()
+        self.assertEqual(cache.get(dyno.upscale_until_cache_key), replacement)
+        self.assertEqual(
+            cache.get(dyno.original_size_cache_key)["size"],
+            "standard-1x",
+        )
+        self.assertEqual(cache.get(formation_key), "standard-1x")
+
+    def test_remote_manual_ignores_timer_change(self):
+        dyno = make_dyno(formation_size="performance-m")
+        formation_key, timer = self._prime(dyno)
+        replacement = timer + timedelta(seconds=600)
+        response = _mock_response(200)
+        flag_key = f"heroku:downscale_formation:{dyno.formation_name}"
+
+        with patch.dict(
+                    os.environ,
+                    {"DYNO": "other_worker.9", "DYNO_RAM": "2560"},
+                ), \
+                patch_index_backend({}) as backend, \
+                ExitStack() as stack:
+            real_pipeline = backend._client.pipeline
+            state = {"fired": False}
+
+            class HookPipeline:
+                def __init__(self, pipeline):
+                    self._pipeline = pipeline
+
+                def watch(self, *keys):
+                    result = self._pipeline.watch(*keys)
+                    if not state["fired"] and flag_key in keys:
+                        state["fired"] = True
+                        from heroku_manager import heroku as heroku_module
+                        heroku_module.cache.set(
+                            dyno.upscale_until_cache_key,
+                            replacement,
+                            timeout=600,
+                        )
+                    return result
+
+                def __getattr__(self, name):
+                    return getattr(self._pipeline, name)
+
+            def hooked_pipeline(transaction=True):
+                return HookPipeline(real_pipeline(transaction=transaction))
+
+            backend._client.pipeline = hooked_pipeline
+            api = self._enter_common(
+                stack, dyno, {"return_value": response},
+            )
+            dyno.downscale_formation_to_original_size()
+
+        self.assertTrue(state["fired"])
+        api.assert_called_once()
+        self.assertEqual(api.call_args[1]["data"], {"size": "standard-1x"})
+        self.assertEqual(cache.get(formation_key), "standard-1x")
+
+    def test_remote_scheduled_cleanup_preserves_late_baseline_change(self):
+        dyno = make_dyno(formation_size="performance-m")
+        formation_key = (
+            f"heroku:formation_size:{dyno.app_name}:{dyno.formation_name}"
+        )
+        cache.set(formation_key, "performance-m", timeout=None)
+        cache.set(
+            dyno.original_size_cache_key,
+            {"size": "standard-1x", "time": timezone.now()},
+            timeout=None,
+        )
+        cache.delete(dyno.upscale_until_cache_key)
+        new_baseline = {"size": "standard-2x", "time": timezone.now()}
+        original_read = _IndexAdapter.read_formation_size_raw
+        state = {"fired": False}
+
+        def read_then_change(adapter, formation_name, fallback_size):
+            cache.set(formation_key, "standard-1x", timeout=None)
+            result = original_read(adapter, formation_name, fallback_size)
+            if not state["fired"]:
+                state["fired"] = True
+                cache.set(
+                    dyno.original_size_cache_key,
+                    new_baseline,
+                    timeout=None,
+                )
+            return result
+
+        with patch.dict(
+                    os.environ,
+                    {"DYNO": "other_worker.9", "DYNO_RAM": "1024"},
+                ), \
+                patch_index_backend({}), \
+                patch.object(
+                    _IndexAdapter,
+                    "read_formation_size_raw",
+                    new=read_then_change,
+                ), \
+                ExitStack() as stack:
+            api = self._enter_common(stack, dyno, {})
+            dyno.check_and_downscale_to_original_formation_size()
+
+        self.assertTrue(state["fired"])
+        api.assert_not_called()
+        preserved_baseline = cache.get(dyno.original_size_cache_key)
+        self.assertIsNotNone(preserved_baseline)
+        self.assertEqual(preserved_baseline["size"], "standard-2x")
+        self.assertEqual(cache.get(formation_key), "standard-1x")
+
+    def test_remote_scheduled_miss_cleanup_preserves_new_timer(self):
+        dyno = make_dyno(formation_size="standard-2x")
+        formation_key = (
+            f"heroku:formation_size:{dyno.app_name}:{dyno.formation_name}"
+        )
+        cache.set(formation_key, "standard-2x", timeout=None)
+        cache.set(
+            dyno.original_size_cache_key,
+            {"size": "standard-2x", "time": timezone.now()},
+            timeout=None,
+        )
+        cache.delete(dyno.upscale_until_cache_key)
+        inserted = timezone.now() + timedelta(seconds=300)
+        original_capture = _IndexAdapter.capture_formation_cleanup_state
+        state = {"fired": False}
+
+        def capture_then_insert(adapter, formation_name):
+            result = original_capture(adapter, formation_name)
+            if not state["fired"]:
+                state["fired"] = True
+                cache.set(
+                    dyno.upscale_until_cache_key,
+                    inserted,
+                    timeout=300,
+                )
+            return result
+
+        with patch.dict(
+                    os.environ,
+                    {"DYNO": "other_worker.9", "DYNO_RAM": "1024"},
+                ), \
+                patch_index_backend({}), \
+                patch.object(
+                    _IndexAdapter,
+                    "capture_formation_cleanup_state",
+                    new=capture_then_insert,
+                ), \
+                ExitStack() as stack:
+            api = self._enter_common(stack, dyno, {})
+            dyno.check_and_downscale_to_original_formation_size()
+
+        self.assertTrue(state["fired"])
+        api.assert_not_called()
+        self.assertEqual(cache.get(dyno.upscale_until_cache_key), inserted)
+        self.assertEqual(
+            cache.get(dyno.original_size_cache_key)["size"],
+            "standard-2x",
+        )
+
+    def _assert_timer_expiry_unchanged(self, dyno, expected, observed):
+        self.assertEqual(cache.get(dyno.upscale_until_cache_key), expected)
+        elapsed = time.monotonic() - observed["started"]
+        remaining = cache.ttl(dyno.upscale_until_cache_key)
+        self.assertGreaterEqual(remaining, observed["ttl"] - elapsed - 2)
+        self.assertLessEqual(remaining, observed["ttl"] + 1)
+
+    def test_remote_scheduled_tier_drop_after_capture_defers_cleanup(self):
+        dyno = make_dyno(formation_size="performance-m")
+        formation_key, timer = self._prime(
+            dyno, baseline="standard-2x",
+        )
+        baseline = cache.get(dyno.original_size_cache_key)
+        observed = {
+            "started": time.monotonic(),
+            "ttl": cache.ttl(dyno.upscale_until_cache_key),
+        }
+
+        def race():
+            cache.set(formation_key, "standard-1x", timeout=None)
+
+        with patch.dict(
+                    os.environ,
+                    {"DYNO": "other_worker.9", "DYNO_RAM": "2560"},
+                ), \
+                patch_index_backend({}), \
+                ExitStack() as stack:
+            state = self._patch_downscale_race(stack, dyno, race)
+            api = self._enter_common(
+                stack, dyno, {"return_value": _mock_response(200)},
+            )
+            dyno.check_and_downscale_to_original_formation_size()
+
+        self.assertTrue(state["fired"])
+        api.assert_not_called()
+        self.assertIsNone(cache.get(dyno.downscale_cache_key))
+        self.assertEqual(cache.get(formation_key), "standard-1x")
+        self.assertEqual(cache.get(dyno.original_size_cache_key), baseline)
+        self._assert_timer_expiry_unchanged(dyno, timer, observed)
+
+    def test_remote_scheduled_tier_rise_after_timer_miss_is_cleanup_only(self):
+        dyno = make_dyno(formation_size="standard-2x")
+        formation_key = (
+            f"heroku:formation_size:{dyno.app_name}:{dyno.formation_name}"
+        )
+        cache.set(formation_key, "standard-2x", timeout=None)
+        baseline = {"size": "standard-2x", "time": timezone.now()}
+        cache.set(dyno.original_size_cache_key, baseline, timeout=None)
+        cache.delete(dyno.upscale_until_cache_key)
+        inserted = timezone.now() + timedelta(seconds=300)
+        observed = {}
+
+        def race():
+            cache.set(formation_key, "performance-m", timeout=None)
+            cache.set(
+                dyno.upscale_until_cache_key,
+                inserted,
+                timeout=300,
+            )
+            observed["started"] = time.monotonic()
+            observed["ttl"] = cache.ttl(dyno.upscale_until_cache_key)
+
+        with patch.dict(
+                    os.environ,
+                    {"DYNO": "other_worker.9", "DYNO_RAM": "1024"},
+                ), \
+                patch_index_backend({}), \
+                ExitStack() as stack:
+            stack.enter_context(patch.object(
+                dyno,
+                "_defer_resize_for_retiring_dyno",
+                return_value=False,
+            ))
+            state = self._patch_downscale_race(stack, dyno, race)
+            api = self._enter_common(
+                stack, dyno, {"return_value": _mock_response(200)},
+            )
+            dyno.check_and_downscale_to_original_formation_size()
+
+        self.assertTrue(state["fired"])
+        api.assert_not_called()
+        self.assertIsNone(cache.get(dyno.downscale_cache_key))
+        self.assertEqual(cache.get(formation_key), "performance-m")
+        self.assertEqual(cache.get(dyno.original_size_cache_key)["size"], "standard-2x")
+        self._assert_timer_expiry_unchanged(dyno, inserted, observed)
+
+    def test_local_scheduled_fallback_change_is_cleanup_only(self):
+        dyno = make_dyno(formation_size="standard-2x")
+        formation_key = (
+            f"heroku:formation_size:{dyno.app_name}:{dyno.formation_name}"
+        )
+        cache.set(formation_key, "standard-2x", timeout=None)
+        cache.set(
+            dyno.original_size_cache_key,
+            {"size": "standard-2x", "time": timezone.now()},
+            timeout=None,
+        )
+        cache.delete(dyno.upscale_until_cache_key)
+        replacement_baseline = {
+            "size": "standard-1x",
+            "time": timezone.now(),
+        }
+        inserted = timezone.now() + timedelta(seconds=300)
+        observed = {}
+
+        def race():
+            cache.set(
+                dyno.original_size_cache_key,
+                replacement_baseline,
+                timeout=None,
+            )
+            cache.set(
+                dyno.upscale_until_cache_key,
+                inserted,
+                timeout=300,
+            )
+            observed["started"] = time.monotonic()
+            observed["ttl"] = cache.ttl(dyno.upscale_until_cache_key)
+
+        with patch.dict(
+                    os.environ,
+                    {"DYNO": dyno.dyno_name, "DYNO_RAM": "1024"},
+                ), \
+                patch_index_backend({}) as backend, \
+                ExitStack() as stack:
+            backend._store[
+                f"heroku:dyno_owner:v1:{dyno.app_name}:{dyno.dyno_name}"
+            ] = dyno._dyno_owner_token
+            stack.enter_context(patch.object(
+                dyno,
+                "_defer_resize_for_retiring_dyno",
+                return_value=False,
+            ))
+            state = self._patch_downscale_race(stack, dyno, race)
+            api = self._enter_common(
+                stack, dyno, {"return_value": _mock_response(200)},
+            )
+            dyno.check_and_downscale_to_original_formation_size()
+
+        self.assertTrue(state["fired"])
+        api.assert_not_called()
+        self.assertIsNone(cache.get(dyno.downscale_cache_key))
+        self.assertEqual(cache.get(formation_key), "standard-2x")
+        self.assertEqual(
+            cache.get(dyno.original_size_cache_key),
+            replacement_baseline,
+        )
+        self._assert_timer_expiry_unchanged(dyno, inserted, observed)
 
 
 if __name__ == "__main__":

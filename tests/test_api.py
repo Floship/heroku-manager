@@ -7,10 +7,13 @@ direct Platform API transport must behave exactly as before.
 import json
 import os
 import unittest
-from unittest.mock import patch
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+from unittest.mock import patch, PropertyMock
 
 import requests
-from django.core.cache import cache
+from django.core.cache import cache, caches
+from django.test import override_settings
 
 from heroku_manager.heroku import HerokuDyno
 from heroku_manager.proxy import HerokuProxy, ProxyResponse
@@ -61,13 +64,60 @@ class TestAcquireRateLimitToken(BaseLockTestCase):
         self.assertFalse(result)
         mock_sleep.assert_not_called()
 
-    def test_key_expiry_between_get_and_incr_handled(self):
-        """ValueError from cache.incr when key expired mid-call must not raise."""
+    def test_expired_window_can_be_reopened(self):
         dyno = make_dyno()
-        cache.set(f"heroku:api_rate:{dyno.app_name}", 1, timeout=60)
-        with patch.object(cache, "incr", side_effect=ValueError("expired")):
-            result = dyno._acquire_rate_limit_token()
-        self.assertTrue(result)
+        key = f"heroku:api_rate:{dyno.app_name}"
+        cache.set(key, 50, timeout=0)
+        self.assertTrue(dyno._acquire_rate_limit_token())
+        self.assertEqual(cache.get(key), 1)
+
+    @override_settings(HEROKU_API_RATE_LIMIT_PER_MINUTE=1)
+    def test_concurrent_initializers_share_one_budget(self):
+        dyno = make_dyno()
+        key = f"heroku:api_rate:{dyno.app_name}"
+        backend_type = type(caches["default"])
+        real_get, real_add = backend_type.get, backend_type.add
+        both_missing = Barrier(2, timeout=2)
+
+        def get(backend, cache_key, *args, **kwargs):
+            value = real_get(backend, cache_key, *args, **kwargs)
+            if cache_key == key and value is None:
+                both_missing.wait()
+            return value
+
+        def add(backend, cache_key, *args, **kwargs):
+            if cache_key == key:
+                both_missing.wait()
+            return real_add(backend, cache_key, *args, **kwargs)
+
+        with patch.object(backend_type, "get", get), patch.object(backend_type, "add", add):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                admitted = list(pool.map(lambda _: dyno._acquire_rate_limit_token(), range(2)))
+        self.assertCountEqual(admitted, [True, False])
+        self.assertEqual(cache.get(key), 2)
+
+    @override_settings(HEROKU_API_RATE_LIMIT_PER_MINUTE=1)
+    def test_expiry_race_counts_against_the_other_callers_window(self):
+        dyno = make_dyno()
+        key = f"heroku:api_rate:{dyno.app_name}"
+        real_add = cache.add
+        real_incr = cache.incr
+
+        def open_window_first(*args, **kwargs):
+            self.assertTrue(real_add(key, 1, timeout=60))
+            return real_add(*args, **kwargs)
+
+        with patch.object(cache, "add", side_effect=open_window_first) as add:
+            with patch.object(cache, "incr", wraps=real_incr) as incr:
+                self.assertFalse(dyno._acquire_rate_limit_token())
+        add.assert_called_once_with(key, 1, timeout=60)
+        self.assertEqual(incr.call_count, 2)
+
+    @override_settings(HEROKU_API_RATE_LIMIT_PER_MINUTE=0)
+    def test_disabled_limit_does_not_open_a_window(self):
+        dyno = make_dyno()
+        self.assertFalse(dyno._acquire_rate_limit_token())
+        self.assertIsNone(cache.get(f"heroku:api_rate:{dyno.app_name}"))
 
 
 class TestCallHerokuApiDirect(BaseLockTestCase):
@@ -327,6 +377,91 @@ class TestCallHerokuApiProxy(BaseLockTestCase):
 
                 self.assertEqual(result.status_code, 503)
                 self.assertIn(f"status=503 error={error_id}", alerts.output[0])
+
+    def test_cooldown_logs_one_warning_without_an_error_event(self):
+        dyno = make_dyno(formation_size="standard-1x")
+        response = mock_response(
+            429, {"id": "cooldown"}, headers={"retry-after": "30"},
+        )
+        with patch("heroku_manager.proxy.requests.Session.send", return_value=response), \
+                patch.object(type(dyno), "remote_monitoring",
+                             new_callable=PropertyMock, return_value=True), \
+                patch("heroku_manager.heroku.logger") as logger:
+            dyno.upscale_formation_to_next_level()
+
+        self.assertEqual(logger.warning.call_count, 1)
+        self.assertIn("error=cooldown", logger.warning.call_args.args[0])
+        self.assertIn("retry_after", logger.warning.call_args.args[0])
+        logger.error.assert_not_called()
+
+    def test_cooldown_without_retry_after_keeps_error_handling(self):
+        dyno = make_dyno(formation_size="standard-1x")
+        response = mock_response(429, {"id": "cooldown"})
+        with patch("heroku_manager.proxy.requests.Session.send", return_value=response), \
+                patch.object(type(dyno), "remote_monitoring",
+                             new_callable=PropertyMock, return_value=True), \
+                patch("heroku_manager.heroku.logger") as logger:
+            dyno.upscale_formation_to_next_level()
+
+        self.assertEqual(logger.warning.call_count, 1)
+        self.assertIn("status", logger.warning.call_args.args[0])
+        self.assertEqual(logger.warning.call_args.args[3], 429)
+        logger.error.assert_called_once()
+        self.assertEqual(logger.error.call_args.args[3], "cooldown")
+
+    def test_non_ascii_retry_delay_keeps_error_cleanup(self):
+        dyno = make_dyno(formation_size="standard-1x")
+        response = mock_response(
+            429, {"id": "cooldown"}, headers={"retry-after": "\u00b2"},
+        )
+        with patch("heroku_manager.proxy.requests.Session.send", return_value=response), \
+                patch.object(type(dyno), "remote_monitoring",
+                             new_callable=PropertyMock, return_value=True), \
+                patch("heroku_manager.heroku.logger") as logger:
+            dyno.upscale_formation_to_next_level()
+
+        self.assertEqual(logger.warning.call_count, 1)
+        logger.error.assert_called_once()
+        self.assertEqual(logger.error.call_args.args[3], "cooldown")
+        self.assertFalse(dyno.is_upscaling)
+
+    def test_oversized_retry_delay_keeps_error_cleanup(self):
+        dyno = make_dyno(formation_size="standard-1x")
+        response = mock_response(
+            429, {"id": "cooldown"}, headers={"retry-after": "9" * 4500},
+        )
+        with patch("heroku_manager.proxy.requests.Session.send", return_value=response), \
+                patch.object(type(dyno), "remote_monitoring",
+                             new_callable=PropertyMock, return_value=True), \
+                patch("heroku_manager.heroku.logger") as logger:
+            dyno.upscale_formation_to_next_level()
+
+        self.assertEqual(logger.warning.call_count, 1)
+        logger.error.assert_called_once()
+        self.assertEqual(logger.error.call_args.args[3], "cooldown")
+        self.assertFalse(dyno.is_upscaling)
+
+    def test_cooldown_delay_parser_accepts_only_bounded_ascii_padding(self):
+        cases = (
+            (" \t30\t ", 30),
+            ("86400", 86400),
+            ("86401", None),
+            ("\u00a030", None),
+            ("\u200330", None),
+            ("0", None),
+            ("-1", None),
+        )
+        for header, expected in cases:
+            with self.subTest(header=header):
+                response = ProxyResponse(
+                    429,
+                    '{"id":"cooldown"}',
+                    headers={"retry-after": header},
+                )
+                self.assertEqual(
+                    HerokuDyno._proxy_cooldown_retry_after(response),
+                    expected,
+                )
 
     def test_alert_cache_failure_preserves_the_uncertain_response_and_pending_id(self):
         dyno = make_dyno()

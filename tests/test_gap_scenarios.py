@@ -14,6 +14,7 @@ Gaps covered:
 """
 
 import unittest
+import time
 from datetime import timedelta
 from unittest.mock import patch, MagicMock, PropertyMock
 
@@ -21,7 +22,8 @@ from django.core.cache import cache
 from django.core.cache.backends.locmem import LocMemCache
 from django.utils import timezone
 
-from tests.conftest import make_dyno, BaseLockTestCase
+from tests.conftest import make_dyno, BaseLockTestCase, patch_index_backend
+from heroku_manager.heroku import _DownscaleDecision, _DynoObservation
 
 
 def _mock_response(status=200):
@@ -29,6 +31,21 @@ def _mock_response(status=200):
     resp.status_code = status
     resp.text = "ok"
     return resp
+
+
+def _positive_downscale(dyno):
+    score = time.time()
+    return _DownscaleDecision(
+        True,
+        False,
+        (
+            ((dyno.dyno_name, score),),
+            {dyno.dyno_name: _DynoObservation(score, 200, False, 0.2)},
+            score,
+            {dyno.dyno_name: dyno._dyno_owner_token},
+        ),
+        dyno.previous_formation_size,
+    )
 
 
 # ─── Gap 1: expired-key safety-restore path ────────────────────────────────
@@ -55,7 +72,8 @@ class TestExpiredKeyRestoresTimer(BaseLockTestCase):
                             with patch.object(type(dyno), "no_tasks_in_queue",
                                               new_callable=PropertyMock, return_value=True):
                                 # This should NOT raise AttributeError
-                                dyno.check_and_downscale_to_original_formation_size()
+                                with patch_index_backend({}):
+                                    dyno.check_and_downscale_to_original_formation_size()
 
         # Timer must have been restored
         restored = cache.get(dyno.upscale_until_cache_key)
@@ -79,7 +97,8 @@ class TestExpiredKeyRestoresTimer(BaseLockTestCase):
                                           new_callable=PropertyMock, return_value=False):
                             with patch.object(type(dyno), "no_tasks_in_queue",
                                               new_callable=PropertyMock, return_value=True):
-                                dyno.check_and_downscale_to_original_formation_size()
+                                with patch_index_backend({}):
+                                    dyno.check_and_downscale_to_original_formation_size()
 
         restored = cache.get(dyno.upscale_until_cache_key)
         # Should be approximately now + 60s (DYNO_DOWNSCALE_CHECK_INTERVAL from conftest)
@@ -121,6 +140,12 @@ class TestR15HighMemoryNearExpiry(BaseLockTestCase):
     """Near TTL expiry, if allow_downscale is False and memory is still high
     with both R15 and high memory usage, the restart branch fires because
     of the `or is_still_high_memory_usage_for_downscale` clause."""
+
+    def setUp(self):
+        super().setUp()
+        self.index_backend = patch_index_backend({})
+        self.index_backend.start()
+        self.addCleanup(self.index_backend.stop)
 
     def test_r15_plus_high_memory_near_expiry_restarts(self):
         """R15=True + is_still_high_memory_usage=True + no_tasks=True near
@@ -203,7 +228,8 @@ class TestOriginalFormationR14Restart(BaseLockTestCase):
                                       new_callable=PropertyMock, return_value=True):
                         with patch.object(dyno, "restart_dyno") as mock_restart:
                             with patch.object(dyno, "downscale_formation_to_original_size") as mock_down:
-                                dyno.check_and_downscale_to_original_formation_size()
+                                with patch_index_backend({}):
+                                    dyno.check_and_downscale_to_original_formation_size()
 
         mock_restart.assert_called_once()
         mock_down.assert_not_called()
@@ -256,13 +282,30 @@ class TestDownscaleFailureLeavesFlag(BaseLockTestCase):
     """On API failure, the downscaling flag is NOT cleared — it must
     expire via TTL. This is intentional but should be explicitly tested."""
 
+    def setUp(self):
+        super().setUp()
+        self.index_backend = patch_index_backend({})
+        self.index_backend.start()
+        self.addCleanup(self.index_backend.stop)
+
     def test_downscale_api_error_keeps_downscaling_flag(self):
         dyno = make_dyno(formation_size="performance-m")
         cache.set(dyno.original_size_cache_key, {"size": "standard-2x"}, timeout=None)
 
         with patch.object(type(dyno), "remote_monitoring",
                           new_callable=PropertyMock, return_value=True):
-            with patch.object(dyno, "call_heroku_api", return_value=_mock_response(500)):
+            with patch.object(
+                        dyno, "_evaluate_downscale_snapshot",
+                        return_value=_positive_downscale(dyno),
+                    ), \
+                    patch.object(
+                        dyno,
+                        "_formation_observation_snapshot_current",
+                        return_value=True,
+                    ), \
+                    patch.object(
+                        dyno, "call_heroku_api", return_value=_mock_response(500),
+                    ):
                 dyno.downscale_formation_to_original_size()
 
         self.assertTrue(dyno.is_downscaling,
@@ -274,7 +317,18 @@ class TestDownscaleFailureLeavesFlag(BaseLockTestCase):
 
         with patch.object(type(dyno), "remote_monitoring",
                           new_callable=PropertyMock, return_value=True):
-            with patch.object(dyno, "call_heroku_api", return_value=None):
+            with patch.object(type(dyno.proxy), "enabled",
+                              new_callable=PropertyMock, return_value=False), \
+                    patch.object(
+                        dyno, "_evaluate_downscale_snapshot",
+                        return_value=_positive_downscale(dyno),
+                    ), \
+                    patch.object(
+                        dyno,
+                        "_formation_observation_snapshot_current",
+                        return_value=True,
+                    ), \
+                    patch.object(dyno, "call_heroku_api", return_value=None):
                 dyno.downscale_formation_to_original_size()
 
         self.assertTrue(dyno.is_downscaling,
