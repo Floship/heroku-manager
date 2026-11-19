@@ -1,6 +1,7 @@
 """
 Tests: log parsing, extract_latest_metric, metric helpers (memory, load, R14/R15).
 """
+import os
 import unittest
 from unittest.mock import patch, MagicMock
 from tests.conftest import make_dyno, BaseLockTestCase
@@ -30,7 +31,18 @@ def _make_log_sample():
 
 
 LOG_SAMPLE = _make_log_sample()
+SELF_DYNO_ID = "11111111-1111-4111-8111-111111111111"
+OLD_DYNO_ID = "22222222-2222-4222-8222-222222222222"
 BAD_TIMESTAMP_LOG = "2024-99-99T99:99:99.845449+00:00 heroku[normal_worker.1]: sample#memory_total=100.00MB\n"
+
+
+def _identified_log_sample(dyno_id=SELF_DYNO_ID, memory_mb=298.0):
+    ts = _recent_ts()
+    return (
+        f"{ts} heroku[normal_worker.1]: source=normal_worker.1 "
+        f"dyno=heroku.123.{dyno_id} sample#memory_total={memory_mb:.2f}MB "
+        f"sample#load_avg_1m=0.11\n"
+    )
 
 
 def _make_log_response(text):
@@ -80,6 +92,34 @@ class TestGetHerokuLogs(BaseLockTestCase):
         self.assertIn("timestamp", first)
         self.assertIn("message", first)
         self.assertIn("dyno_name", first)
+
+    def test_parses_the_source_dyno_identity(self):
+        dyno = make_dyno()
+        sample = _identified_log_sample()
+        with patch.object(dyno, "call_heroku_api", return_value=_make_log_response(sample)):
+            with patch("heroku_manager.heroku.requests.get",
+                       return_value=_make_logplex_response(sample)):
+                logs = dyno.get_heroku_logs()
+
+        self.assertEqual(logs[0]["source_dyno_name"], "normal_worker.1")
+        self.assertEqual(logs[0]["source_dyno_id"], SELF_DYNO_ID)
+
+    def test_raw_log_cache_is_scoped_to_the_current_incarnation(self):
+        dyno = make_dyno()
+        dyno.dyno_id = SELF_DYNO_ID
+        old_cache_key = f"heroku:logs:{dyno.app_name}:{dyno.dyno_name}:{OLD_DYNO_ID}"
+        cache.set(old_cache_key, "old incarnation logs", timeout=90)
+        sample = _identified_log_sample(memory_mb=392.0)
+
+        with patch.dict(os.environ, {"DYNO": dyno.dyno_name}), \
+                patch.object(dyno, "call_heroku_api", return_value=_make_log_response(sample)) as api, \
+                patch("heroku_manager.heroku.requests.get",
+                      return_value=_make_logplex_response(sample)):
+            logs = dyno.get_heroku_logs()
+
+        api.assert_called_once()
+        self.assertIn("392.00MB", logs[0]["message"])
+        self.assertEqual(logs[0]["source_dyno_id"], SELF_DYNO_ID)
 
     def test_returns_none_when_log_session_api_fails(self):
         dyno = make_dyno()

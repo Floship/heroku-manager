@@ -9,6 +9,7 @@ import threading
 import time
 import random
 import uuid
+from collections import namedtuple
 from datetime import datetime, timedelta
 from requests.exceptions import SSLError, ConnectionError, Timeout
 
@@ -22,6 +23,13 @@ import logging
 from .proxy import HerokuProxy, ProxyResponse
 
 logger = logging.getLogger(__name__)
+
+
+try:
+    from redis.exceptions import WatchError as _RedisWatchError
+except ImportError:
+    class _RedisWatchError(Exception):
+        pass
 
 
 def _index_ready(instance):
@@ -47,6 +55,14 @@ def _index_ready(instance):
             return False  # no raw client → cannot prove the index → fail closed
         if _registry_degraded(instance):
             return False  # a live sibling is missing from the member list
+        owner_key = cache.make_key(_dyno_owner_key(instance.app_name, instance.dyno_name))
+        current_owner = client.get(owner_key)
+        try:
+            expected_owner = adapter.encode(instance._dyno_owner_token)
+        except Exception:
+            return False
+        if current_owner != expected_owner:
+            return False
         own_score = client.zscore(adapter._index_key, instance.dyno_name)
         return own_score is not None and own_score > cutoff
     except Exception:
@@ -60,14 +76,14 @@ def _index_ready(instance):
 def _index_fail_closed(instance):
     """True when index readiness is uncertain: destructive actions (downscale,
     formation-idle authorization, zombie restart) are only authorized when the
-    current dyno proves a fresh index score.  Sibling readers read the same
-    index and yield nothing on an uncertain read.
+    current dyno proves a fresh index score. Sibling reads that authorize
+    downscale also require complete metrics from the primary.
 
     The failed-writer ledger is read here, uncached: ``index_ready`` lives for
     one autoscale cycle, and a sibling can report a failed registry write after
     that cache was filled.
     """
-    if _registry_degraded(instance):
+    if getattr(instance, '_dyno_owner_fenced', False) or _registry_degraded(instance):
         return True
     return not instance.index_ready
 
@@ -76,6 +92,101 @@ def _stale_cutoff():
     """Epoch-seconds cutoff for fresh index members, from DYNO_ZOMBIE_THRESHOLD."""
     threshold = int(getattr(settings, 'DYNO_ZOMBIE_THRESHOLD', 24 * 60 * 60))
     return time.time() - threshold
+
+
+_DynoObservation = namedtuple(
+    '_DynoObservation',
+    ('check_in_epoch', 'memory_mb', 'stable', 'load_1m'),
+)
+
+_MetricReading = namedtuple('_MetricReading', ('value', 'source_epoch'))
+
+_DownscaleDecision = namedtuple(
+    '_DownscaleDecision', ('normal', 'stability', 'snapshot', 'target_size'),
+)
+
+
+def _observation_key(app_name, dyno_name):
+    return f'heroku:dyno_observation:v1:{app_name}:{dyno_name}'
+
+
+def _dyno_owner_key(app_name, dyno_name):
+    """One current self-monitoring writer for an app-scoped dyno name."""
+    return f'heroku:dyno_owner:v1:{app_name}:{dyno_name}'
+
+
+def _dyno_contention_key(app_name, dyno_name):
+    """A competing incarnation that strict readers must fail closed on."""
+    return f'heroku:dyno_contention:v1:{app_name}:{dyno_name}'
+
+
+def _dyno_memory_veto_key(app_name, dyno_name):
+    """A coherent in-process memory-pressure veto for one dyno."""
+    return f'heroku:dyno_memory_veto:v1:{app_name}:{dyno_name}'
+
+
+def _dyno_owner_ttl():
+    """Lease duration that covers one check-in including a slow log fetch."""
+    interval = int(getattr(settings, 'DYNO_AUTOSCALE_INTERVAL', 30))
+    return max(60, interval * 3)
+
+
+def _dyno_alive_ttl(zombie_threshold):
+    """Keep the last heartbeat through one scheduled scan after staleness."""
+    return int(zombie_threshold) + _dyno_owner_ttl()
+
+
+def _memory_veto_ttl():
+    """Keep a pressure veto at least as long as its pre-nudge observation."""
+    return max(60, int(getattr(settings, 'DYNO_ZOMBIE_THRESHOLD', 24 * 60 * 60)))
+
+
+def _registry_degraded_grace():
+    """Fail closed while a first registration may not have written a heartbeat."""
+    return max(60, int(getattr(settings, 'DYNO_AUTOSCALE_INTERVAL', 30)) * 3)
+
+
+_STRICT_LOGS_UNSET = object()
+# Distinguishes "this caller did not bind a timer" from "expect no timer key".
+_UPSCALE_TIMER_UNBOUND = object()
+
+
+def _is_finite_number(value, *, positive=False):
+    """Return whether value is a real, finite number in the accepted range."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        finite = math.isfinite(value)
+    except (OverflowError, TypeError):
+        return False
+    return finite and (value > 0 if positive else value >= 0)
+
+
+def _canonical_uuid(value):
+    """Return a canonical lowercase UUID or None for malformed input."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(uuid.UUID(value))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+_LOG_DYNO_SOURCE_RE = re.compile(
+    r"\bsource=(?P<source_dyno_name>[^\s]+)\s+"
+    r"dyno=heroku\.(?P<source_dyno_scope>[^\s.]+)\.(?P<source_dyno_id>[^\s]+)",
+)
+
+
+def _log_dyno_identity(message):
+    """Extract the source dyno name and UUID from one runtime metric line."""
+    match = _LOG_DYNO_SOURCE_RE.search(message or "")
+    if not match:
+        return None, None
+    return (
+        match.group("source_dyno_name"),
+        _canonical_uuid(match.group("source_dyno_id")),
+    )
 
 
 class _IndexAdapter:
@@ -91,8 +202,9 @@ class _IndexAdapter:
         self._client = None
         self._index_key = None
         self._decoder = None
-        # Readiness reads through the primary; ordinary metric reads use the
-        # read client (a replica when the cache configures one).
+        self._encoder = None
+        # Readiness and downscale reads use the primary. Advisory upscale
+        # reads may use a replica when the cache configures one.
         self._primary = primary
 
     def _connect(self):
@@ -106,12 +218,16 @@ class _IndexAdapter:
                 decoder = getattr(cache.client, "decode", None)
                 if callable(decoder):
                     self._decoder = decoder
+                encoder = getattr(cache.client, "encode", None)
+                if callable(encoder):
+                    self._encoder = encoder
             except AttributeError:
                 # LocMem/unit-test backends expose no raw client; reads return
                 # uncertain (None) and destructive actions fail closed. There
                 # is no keys() fallback: KEYS is banned in production.
                 self._client = None
                 self._decoder = None
+                self._encoder = None
                 return None
             self._index_key = cache.make_key(f'heroku:dynos:v1:{self.app_name}')
         return self._client
@@ -139,6 +255,12 @@ class _IndexAdapter:
             )
             return None
 
+    def encode(self, value):
+        """Encode a high-level cache value for an atomic raw transaction."""
+        if self._encoder is None:
+            raise RuntimeError("cache encoder unavailable")
+        return self._encoder(value)
+
     def _zrange(self, min_score, max_score):
         """Bounded ZRANGEBYSCORE, normalized to dyno-name strings."""
         client = self._connect()
@@ -157,9 +279,1078 @@ class _IndexAdapter:
         """Bounded ZRANGEBYSCORE(cutoff, +inf); fresh members only."""
         return self._zrange(f'({cutoff}', '+inf')
 
+    def fresh_scored_members(self, cutoff):
+        """Bounded fresh members with their check-in scores."""
+        client = self._connect()
+        if client is None:
+            return None
+        members = client.zrangebyscore(
+            self._index_key, f'({cutoff}', '+inf', withscores=True,
+        )
+        if members is None:
+            return None
+        scored = []
+        for member, score in members:
+            name = member.decode('utf-8', errors='replace') if isinstance(member, bytes) else member
+            scored.append((name, score))
+        return scored
+
     def stale_members(self, cutoff):
         """Bounded ZRANGEBYSCORE(-inf, cutoff); stale members (score <= cutoff)."""
         return self._zrange('-inf', cutoff)
+
+    def get_raw_scalar(self, key):
+        """Return one raw cache value, preserving a genuine Redis miss as None."""
+        client = self._connect()
+        if client is None:
+            raise RuntimeError("cache client unavailable")
+        return client.get(cache.make_key(key))
+
+    def decode_required(self, raw):
+        """Decode a present value without turning corruption into a miss."""
+        if raw is None:
+            raise ValueError("cache value is absent")
+        if self._decoder is None:
+            raise RuntimeError("cache decoder unavailable")
+        try:
+            value = self._decoder(raw)
+        except Exception as exc:
+            raise ValueError("cache value could not be decoded") from exc
+        if value is None:
+            raise ValueError("cache value decoded to None")
+        return value
+
+    def _decode_watched_owner_batch(self, pipe, owner_keys, raw_owners):
+        """Decode a watched owner batch without hiding wrong-type entries.
+
+        ``MGET`` returns nil both for an absent key and for a key whose Redis
+        type is not a string. A normal owner read may identify a genuine miss,
+        but every nil slot needs a type-independent presence check before the
+        batch can be treated as an absent or invalid owner set.
+        """
+        if raw_owners is None or len(raw_owners) != len(owner_keys):
+            raise ValueError("owner batch is unavailable")
+        nil_keys = [
+            key
+            for key, raw_owner in zip(owner_keys, raw_owners)
+            if raw_owner is None
+        ]
+        if nil_keys:
+            present = pipe.exists(*nil_keys)
+            if (
+                not isinstance(present, int)
+                or isinstance(present, bool)
+                or present < 0
+                or present > len(nil_keys)
+            ):
+                raise ValueError("owner presence count is invalid")
+            if present:
+                raise ValueError("owner key has an invalid Redis type")
+        owners = tuple(self.decode(raw) for raw in raw_owners)
+        if any(
+            raw is not None
+            and (not isinstance(decoded, str) or not decoded)
+            for raw, decoded in zip(raw_owners, owners)
+        ):
+            raise ValueError("owner value is invalid")
+        return owners
+
+    def get_scalar(self, key):
+        """Read one decoded scalar through the selected Redis client.
+
+        ``None`` is a successful cache miss. A missing client, unavailable
+        decoder, or failed decode raises so callers never confuse uncertainty
+        with an empty value.
+        """
+        raw = self.get_raw_scalar(key)
+        if raw is None:
+            return None
+        return self.decode_required(raw)
+
+    def decode_original_formation_size(self, raw):
+        """Decode one present baseline record, rejecting every invalid shape."""
+        original = self.decode_required(raw)
+        if not isinstance(original, dict):
+            raise ValueError("original formation size is not a record")
+        size = original.get('size')
+        if not isinstance(size, str) or size not in DYNO_SIZES:
+            raise ValueError("original formation size is invalid")
+        return original
+
+    def decode_formation_size(self, raw, fallback_size):
+        """Decode one formation tier; only a raw miss uses the known tier."""
+        if raw is None:
+            return fallback_size
+        value = self.decode_required(raw)
+        if not isinstance(value, str) or value not in DYNO_SIZES:
+            raise ValueError("formation size is invalid")
+        return value
+
+    def decode_upscale_timer(self, raw):
+        """Decode a present upscale timer, which must be a datetime."""
+        if raw is None:
+            return None
+        value = self.decode_required(raw)
+        if not isinstance(value, datetime):
+            raise ValueError("upscale timer is invalid")
+        return value
+
+    def resolve_downscale_target(self, raw_original, formation_size):
+        """Resolve a baseline target with the shared strict raw-miss rule."""
+        if raw_original is None:
+            return DYNO_SIZES.get(formation_size, {}).get('previous')
+        return self.decode_original_formation_size(raw_original)['size']
+
+    def read_downscale_target(self, formation_name, fallback_formation_size):
+        """Read the current target and retain the raw value for later WATCH."""
+        try:
+            raw_original = self.get_raw_scalar(
+                f'heroku:original_formation_size:{formation_name}',
+            )
+            target_size = self.resolve_downscale_target(
+                raw_original, fallback_formation_size,
+            )
+        except Exception:
+            return 'unavailable', None, None
+        if target_size is None:
+            return 'missing', None, raw_original
+        return (
+            'miss' if raw_original is None else 'found',
+            target_size,
+            raw_original,
+        )
+
+    def read_formation_size_raw(self, formation_name, fallback_size):
+        """Read a primary tier and retain the raw value for exact WATCH checks."""
+        try:
+            raw_formation = self.get_raw_scalar(
+                f'heroku:formation_size:{self.app_name}:{formation_name}',
+            )
+            formation_size = self.decode_formation_size(
+                raw_formation, fallback_size,
+            )
+        except Exception:
+            return 'unavailable', None, None
+        return (
+            'miss' if raw_formation is None else 'found',
+            formation_size,
+            raw_formation,
+        )
+
+    def get_owner_and_score(self, dyno_name):
+        """Capture one dyno's current owner and reserved registry score.
+
+        WATCH plus a no-op transaction rejects an interleaving where a
+        replacement registers between the owner GET and the score ZSCORE.
+        """
+        client = self._connect()
+        if client is None:
+            return 'unavailable', None, None
+        owner_key = cache.make_key(_dyno_owner_key(self.app_name, dyno_name))
+        raw_owner = None
+        score = None
+        pipe = None
+        for attempt in range(2):
+            try:
+                pipe = client.pipeline(transaction=True)
+                pipe.watch(owner_key, self._index_key)
+                raw_owner = pipe.get(owner_key)
+                score = pipe.zscore(self._index_key, dyno_name)
+                pipe.multi()
+                pipe.ping()
+                pipe.execute()
+                break
+            except _RedisWatchError:
+                if attempt == 0:
+                    continue
+                return 'unavailable', None, None
+            except Exception:
+                return 'unavailable', None, None
+            finally:
+                if pipe is not None:
+                    pipe.reset()
+        if raw_owner is None or score is None:
+            return 'missing', None, None
+        if self._decoder is None:
+            return 'unavailable', None, None
+        try:
+            owner = self._decoder(raw_owner)
+        except Exception:
+            return 'unavailable', None, None
+        if not isinstance(owner, str) or not owner:
+            return 'unavailable', None, None
+        return 'found', owner, score
+
+    def reserve_owned_flag(
+        self, flag_key, dyno_name, owner_token, value, timeout,
+        *, formation_name, expected_formation_size,
+    ):
+        """Set one resize flag only for the current owner at the expected tier."""
+        client = self._connect()
+        if client is None:
+            return 'unavailable'
+        owner_key = cache.make_key(_dyno_owner_key(self.app_name, dyno_name))
+        physical_flag = cache.make_key(flag_key)
+        formation_key = cache.make_key(
+            f'heroku:formation_size:{self.app_name}:{formation_name}'
+        )
+        pipe = None
+        for attempt in range(2):
+            try:
+                pipe = client.pipeline(transaction=True)
+                pipe.watch(owner_key, physical_flag, formation_key)
+                current_owner = pipe.get(owner_key)
+                current_flag = pipe.get(physical_flag)
+                raw_formation_size = pipe.get(formation_key)
+                formation_size = self.decode(raw_formation_size)
+                if current_owner != self.encode(owner_token):
+                    return 'owner_mismatch'
+                if current_flag is not None:
+                    return 'flag_present'
+                if (
+                    raw_formation_size is not None
+                    and formation_size != expected_formation_size
+                ):
+                    return 'tier_changed'
+                pipe.multi()
+                pipe.set(
+                    physical_flag,
+                    self.encode(value),
+                    px=int(timeout * 1000),
+                )
+                pipe.execute()
+                return 'reserved'
+            except _RedisWatchError:
+                if attempt == 0:
+                    continue
+                return 'contended'
+            except Exception:
+                return 'unavailable'
+            finally:
+                if pipe is not None:
+                    pipe.reset()
+        return 'contended'
+
+    def publish_memory_pressure(
+        self, dyno_name, owner_token, source_epoch, memory_mb, timeout,
+    ):
+        """Write a memory-pressure veto and its legacy readers under one owner."""
+        if not _is_finite_number(source_epoch):
+            raise ValueError('memory-pressure epoch must be finite')
+        if not _is_finite_number(memory_mb, positive=True):
+            raise ValueError('memory pressure must be a positive number')
+        client = self._connect()
+        if client is None:
+            return 'unavailable'
+        owner_key = cache.make_key(_dyno_owner_key(self.app_name, dyno_name))
+        veto_key = cache.make_key(_dyno_memory_veto_key(self.app_name, dyno_name))
+        memory_key = cache.make_key(f'heroku:dyno_memory:{dyno_name}')
+        stable_key = cache.make_key(f'heroku:dyno_memory_stable:{dyno_name}')
+        for attempt in range(2):
+            pipe = None
+            try:
+                pipe = client.pipeline(transaction=True)
+                pipe.watch(owner_key, veto_key)
+                current_owner = pipe.get(owner_key)
+                if current_owner != self.encode(owner_token):
+                    return 'owner_mismatch'
+                raw_veto = pipe.get(veto_key)
+                if raw_veto is not None:
+                    current_veto = self.decode(raw_veto)
+                    if not (
+                        isinstance(current_veto, (tuple, list))
+                        and len(current_veto) == 3
+                        and isinstance(current_veto[0], str)
+                        and current_veto[0]
+                        and _is_finite_number(current_veto[1])
+                        and _is_finite_number(current_veto[2], positive=True)
+                    ):
+                        return 'unavailable'
+                    if current_veto[1] >= source_epoch:
+                        return 'superseded'
+                timeout_ms = int(timeout * 1000)
+                pipe.multi()
+                pipe.set(
+                    veto_key,
+                    self.encode((owner_token, source_epoch, memory_mb)),
+                    px=timeout_ms,
+                )
+                pipe.set(memory_key, self.encode(memory_mb), px=timeout_ms)
+                pipe.set(stable_key, self.encode(False), px=timeout_ms)
+                pipe.execute()
+                return 'published'
+            except _RedisWatchError:
+                if attempt == 0:
+                    continue
+                return 'contended'
+            except Exception:
+                return 'unavailable'
+            finally:
+                if pipe is not None:
+                    pipe.reset()
+        return 'contended'
+
+    def mark_owner_contention(self, dyno_name, contender_token):
+        """Leave a bounded primary marker while another owner is active."""
+        client = self._connect()
+        if client is None:
+            return False
+        key = cache.make_key(_dyno_contention_key(self.app_name, dyno_name))
+        try:
+            client.set(
+                key,
+                self.encode(contender_token),
+                px=_dyno_owner_ttl() * 1000,
+            )
+            return True
+        except Exception:
+            return False
+
+    def read_owned_liveness(self, dyno_name):
+        """Read one owner, score, and liveness value from the primary.
+
+        WATCH plus a no-op transaction keeps the values coherent. A
+        concurrent registration or cleanup fails the read instead of authorizing
+        a restart from mixed evidence. A missing owner returns owner_expired
+        with the score and alive value so the shorter write lease cannot erase
+        stale zombie evidence. A live contention marker blocks restart dispatch.
+        """
+        client = self._connect()
+        if client is None:
+            return 'unavailable', None, None, None
+        owner_key = cache.make_key(_dyno_owner_key(self.app_name, dyno_name))
+        alive_key = cache.make_key(f'heroku:dyno_alive:{dyno_name}')
+        contention_key = cache.make_key(_dyno_contention_key(self.app_name, dyno_name))
+        pipe = None
+        try:
+            pipe = client.pipeline(transaction=True)
+            pipe.watch(owner_key, self._index_key, alive_key, contention_key)
+            raw_owner = pipe.get(owner_key)
+            score = pipe.zscore(self._index_key, dyno_name)
+            raw_alive = pipe.get(alive_key)
+            raw_contention = pipe.get(contention_key)
+            pipe.multi()
+            pipe.ping()
+            pipe.execute()
+        except _RedisWatchError:
+            return 'contended', None, None, None
+        except Exception:
+            return 'unavailable', None, None, None
+        finally:
+            if pipe is not None:
+                pipe.reset()
+        if raw_contention is not None:
+            return 'contended', None, None, None
+        if score is None or raw_alive is None:
+            return 'missing', None, None, None
+        owner = None
+        try:
+            if raw_owner is not None:
+                owner = self.decode(raw_owner)
+            alive = self.decode(raw_alive)
+        except Exception:
+            return 'unavailable', None, None, None
+        if raw_owner is not None and (not isinstance(owner, str) or not owner):
+            return 'unavailable', None, None, None
+        if alive is None:
+            return 'unavailable', None, None, None
+        return ('found' if owner is not None else 'owner_expired', owner, score, alive)
+
+    def read_formation_validation_state(
+        self, prefix, cutoff, expected_roster,
+    ):
+        """Read a final roster, owner, contention, and degradation snapshot.
+
+        The index, owner, contention, reconvergence, and failed-writer keys are
+        watched before their values are read. A no-op transaction verifies none
+        changed during the read. The caller compares the exact roster and
+        decoded owner values with the observation batch already evaluated.
+        """
+        client = self._connect()
+        if client is None:
+            return 'unavailable', None, None, True
+        reconverging_key = cache.make_key(
+            _registry_reconverging_key(self.app_name),
+        )
+        degraded_key = cache.make_key(_registry_degraded_key(self.app_name))
+        for attempt in range(2):
+            pipe = None
+            try:
+                pipe = client.pipeline(transaction=True)
+                pipe.watch(self._index_key, reconverging_key, degraded_key)
+                current = pipe.zrangebyscore(
+                    self._index_key, f'({cutoff}', '+inf', withscores=True,
+                )
+                if current is None:
+                    return 'unavailable', None, None, True
+                current_roster = tuple(
+                    (member.decode('utf-8', errors='replace')
+                     if isinstance(member, bytes) else member, float(score))
+                    for member, score in current
+                    if (member.decode('utf-8', errors='replace')
+                        if isinstance(member, bytes) else member).startswith(prefix)
+                )
+                if current_roster != expected_roster:
+                    return 'changed', None, None, False
+                owner_keys = [
+                    cache.make_key(_dyno_owner_key(self.app_name, member))
+                    for member, _ in current_roster
+                ]
+                contention_keys = [
+                    cache.make_key(_dyno_contention_key(self.app_name, member))
+                    for member, _ in current_roster
+                ]
+                veto_keys = [
+                    cache.make_key(_dyno_memory_veto_key(self.app_name, member))
+                    for member, _ in current_roster
+                ]
+                pipe.watch(*owner_keys, *contention_keys, *veto_keys)
+                raw_owners = pipe.mget(owner_keys)
+                contention_count = pipe.exists(*contention_keys)
+                veto_count = pipe.exists(*veto_keys)
+                reconverging = pipe.get(reconverging_key)
+                degraded_entries = pipe.zrange(degraded_key, 0, 0)
+                if (
+                    raw_owners is None
+                    or not isinstance(contention_count, int)
+                    or isinstance(contention_count, bool)
+                    or contention_count < 0
+                    or not isinstance(veto_count, int)
+                    or isinstance(veto_count, bool)
+                    or veto_count < 0
+                    or degraded_entries is None
+                ):
+                    return 'unavailable', None, None, True
+                try:
+                    owners = self._decode_watched_owner_batch(
+                        pipe, owner_keys, raw_owners,
+                    )
+                except Exception:
+                    return 'unavailable', None, None, True
+                pipe.multi()
+                pipe.ping()
+                pipe.execute()
+                if veto_count:
+                    return 'memory_pressure', None, None, True
+                if contention_count:
+                    return 'contended', None, None, True
+                degraded = bool(reconverging is not None or degraded_entries)
+                if degraded:
+                    return 'degraded', owners, tuple(
+                        None for _ in current_roster
+                    ), True
+                return 'ok', owners, tuple(None for _ in current_roster), degraded
+            except _RedisWatchError:
+                if attempt == 0:
+                    continue
+                return 'contended', None, None, True
+            except Exception:
+                return 'unavailable', None, None, True
+            finally:
+                if pipe is not None:
+                    pipe.reset()
+        return 'contended', None, None, True
+
+    def reserve_downscale_if_current(
+        self, expected_snapshot, dyno_name, owner_token, flag_key, flag_value,
+        timeout, *, formation_name, expected_formation_size,
+        expected_target_size, cleanup_if_at_or_below=False,
+        expected_upscale_timer_raw=_UPSCALE_TIMER_UNBOUND,
+        expected_cleanup_capture=None,
+    ):
+        """Atomically revalidate a formation and reserve its downscale attempt."""
+        client = self._connect()
+        if client is None:
+            return 'unavailable'
+        roster, _, _, expected_owners = expected_snapshot
+        prefix = f'{formation_name}.'
+        physical_flag = cache.make_key(flag_key)
+        formation_key = cache.make_key(
+            f'heroku:formation_size:{self.app_name}:{formation_name}'
+        )
+        original_size_key = cache.make_key(
+            f'heroku:original_formation_size:{formation_name}'
+        )
+        upscale_until_key = cache.make_key(
+            f'heroku:keep_upscaled_formation_until:{formation_name}'
+        )
+        reconverging_key = cache.make_key(
+            _registry_reconverging_key(self.app_name),
+        )
+        degraded_key = cache.make_key(_registry_degraded_key(self.app_name))
+        owner_keys = [
+            cache.make_key(_dyno_owner_key(self.app_name, member))
+            for member, _ in roster
+        ]
+        contention_keys = [
+            cache.make_key(_dyno_contention_key(self.app_name, member))
+            for member, _ in roster
+        ]
+        veto_keys = [
+            cache.make_key(_dyno_memory_veto_key(self.app_name, member))
+            for member, _ in roster
+        ]
+        pipe = None
+        try:
+            pipe = client.pipeline(transaction=True)
+            pipe.watch(
+                self._index_key,
+                physical_flag,
+                formation_key,
+                original_size_key,
+                upscale_until_key,
+                reconverging_key,
+                degraded_key,
+                *owner_keys,
+                *contention_keys,
+                *veto_keys,
+            )
+            fresh_cutoff = _stale_cutoff()
+            current = pipe.zrangebyscore(
+                self._index_key, f'({fresh_cutoff}', '+inf', withscores=True,
+            )
+            if current is None:
+                return 'unavailable'
+            current_roster = tuple(
+                (
+                    member.decode('utf-8', errors='replace')
+                    if isinstance(member, bytes) else member,
+                    float(score),
+                )
+                for member, score in current
+                if (
+                    member.decode('utf-8', errors='replace')
+                    if isinstance(member, bytes) else member
+                ).startswith(prefix)
+            )
+            if current_roster != roster:
+                return 'changed'
+
+            raw_owners = pipe.mget(owner_keys)
+            contention_count = pipe.exists(*contention_keys)
+            veto_count = pipe.exists(*veto_keys)
+            current_flag = pipe.get(physical_flag)
+            raw_formation_size = pipe.get(formation_key)
+            raw_original_size = pipe.get(original_size_key)
+            raw_upscale_until = pipe.get(upscale_until_key)
+            reconverging = pipe.get(reconverging_key)
+            degraded_entries = pipe.zrange(degraded_key, 0, 0)
+            if (
+                raw_owners is None
+                or not isinstance(contention_count, int)
+                or isinstance(contention_count, bool)
+                or contention_count < 0
+                or not isinstance(veto_count, int)
+                or isinstance(veto_count, bool)
+                or veto_count < 0
+                or degraded_entries is None
+            ):
+                return 'unavailable'
+            try:
+                owners = self._decode_watched_owner_batch(
+                    pipe, owner_keys, raw_owners,
+                )
+            except Exception:
+                return 'unavailable'
+            if current_flag is not None:
+                return 'flag_present'
+            if expected_cleanup_capture is not None:
+                expected_cleanup_capture = tuple(expected_cleanup_capture)
+                if len(expected_cleanup_capture) != 3:
+                    return 'unavailable'
+                current_cleanup_capture = (
+                    raw_formation_size,
+                    raw_original_size,
+                    raw_upscale_until,
+                )
+                if current_cleanup_capture != expected_cleanup_capture:
+                    return 'changed'
+            if veto_count:
+                return 'memory_pressure'
+            if contention_count:
+                return 'contended'
+            if reconverging is not None or degraded_entries:
+                return 'degraded'
+
+            # A caller that evaluated the keep-upscaled timer binds the exact
+            # raw value it saw. WATCH then rejects a renewal, removal, or
+            # corruption written before this transaction started.
+            if expected_upscale_timer_raw is not _UPSCALE_TIMER_UNBOUND:
+                if raw_upscale_until != expected_upscale_timer_raw:
+                    return 'timer_changed'
+                try:
+                    self.decode_upscale_timer(raw_upscale_until)
+                except Exception:
+                    return 'unavailable'
+
+            if owners != tuple(
+                expected_owners.get(member) for member, _ in roster
+            ):
+                return 'owner_changed'
+            owners_by_member = {
+                member: owner for (member, _), owner in zip(roster, owners)
+            }
+            current_owner = owners_by_member.get(dyno_name)
+            if current_owner != owner_token:
+                return 'owner_changed'
+            try:
+                current_formation_size = self.decode_formation_size(
+                    raw_formation_size, expected_formation_size,
+                )
+                current_target_size = self.resolve_downscale_target(
+                    raw_original_size, current_formation_size,
+                )
+            except Exception:
+                return 'unavailable'
+            if current_formation_size != expected_formation_size:
+                return 'tier_changed'
+            if current_target_size is None:
+                return 'unavailable'
+            if current_target_size != expected_target_size:
+                return 'target_changed'
+
+            current_target_memory = DYNO_SIZES.get(
+                current_formation_size, {},
+            ).get('memory', 0)
+            expected_target_memory = DYNO_SIZES.get(
+                expected_target_size, {},
+            ).get('memory', 0)
+            if (
+                cleanup_if_at_or_below
+                and current_target_memory
+                and expected_target_memory
+                and current_target_memory <= expected_target_memory
+            ):
+                try:
+                    self.decode_upscale_timer(raw_upscale_until)
+                except Exception:
+                    return 'unavailable'
+                pipe.multi()
+                pipe.delete(original_size_key)
+                pipe.delete(upscale_until_key)
+                pipe.execute()
+                return 'already_at_target'
+
+            # The validation reads above and this flag write are covered by
+            # the same WATCH window. The first abort ends this invocation.
+            pipe.multi()
+            pipe.set(
+                physical_flag,
+                self.encode(flag_value),
+                px=int(timeout * 1000),
+            )
+            pipe.execute()
+            return 'reserved'
+        except _RedisWatchError:
+            return 'contended'
+        except Exception:
+            return 'unavailable'
+        finally:
+            if pipe is not None:
+                pipe.reset()
+
+    def reserve_remote_downscale_if_current(
+        self, flag_key, flag_value, timeout, *, formation_name,
+        expected_formation_raw, expected_formation_size,
+        expected_original_raw, expected_target_size,
+        expected_upscale_timer_raw=_UPSCALE_TIMER_UNBOUND,
+        expected_cleanup_capture=None,
+    ):
+        """Reserve a manual downscale only if its raw target state is stable."""
+        client = self._connect()
+        if client is None:
+            return 'unavailable'
+        physical_flag = cache.make_key(flag_key)
+        formation_key = cache.make_key(
+            f'heroku:formation_size:{self.app_name}:{formation_name}',
+        )
+        original_key = cache.make_key(
+            f'heroku:original_formation_size:{formation_name}',
+        )
+        upscale_until_key = cache.make_key(
+            f'heroku:keep_upscaled_formation_until:{formation_name}',
+        )
+        pipe = None
+        try:
+            pipe = client.pipeline(transaction=True)
+            watch_keys = [physical_flag, formation_key, original_key]
+            timer_bound = (
+                expected_upscale_timer_raw is not _UPSCALE_TIMER_UNBOUND
+                or expected_cleanup_capture is not None
+            )
+            if timer_bound:
+                watch_keys.append(upscale_until_key)
+            pipe.watch(*watch_keys)
+            current_flag = pipe.get(physical_flag)
+            current_formation_raw = pipe.get(formation_key)
+            current_original_raw = pipe.get(original_key)
+            current_upscale_raw = None
+            if timer_bound:
+                current_upscale_raw = pipe.get(upscale_until_key)
+            if current_flag is not None:
+                return 'flag_present'
+            if expected_cleanup_capture is not None:
+                expected_cleanup_capture = tuple(expected_cleanup_capture)
+                if len(expected_cleanup_capture) != 3:
+                    return 'unavailable'
+                current_cleanup_capture = (
+                    current_formation_raw,
+                    current_original_raw,
+                    current_upscale_raw,
+                )
+                if current_cleanup_capture != expected_cleanup_capture:
+                    return 'changed'
+            if current_formation_raw != expected_formation_raw:
+                return 'tier_changed'
+            if current_original_raw != expected_original_raw:
+                return 'target_changed'
+            if timer_bound:
+                if current_upscale_raw != expected_upscale_timer_raw:
+                    return 'timer_changed'
+                try:
+                    self.decode_upscale_timer(current_upscale_raw)
+                except Exception:
+                    return 'unavailable'
+            try:
+                current_formation_size = self.decode_formation_size(
+                    current_formation_raw, expected_formation_size,
+                )
+                current_target_size = self.resolve_downscale_target(
+                    current_original_raw, current_formation_size,
+                )
+            except Exception:
+                return 'unavailable'
+            if current_formation_size != expected_formation_size:
+                return 'tier_changed'
+            if current_target_size is None:
+                return 'unavailable'
+            if current_target_size != expected_target_size:
+                return 'target_changed'
+            pipe.multi()
+            pipe.set(
+                physical_flag,
+                self.encode(flag_value),
+                px=int(timeout * 1000),
+            )
+            pipe.execute()
+            return 'reserved'
+        except _RedisWatchError:
+            return 'contended'
+        except Exception:
+            return 'unavailable'
+        finally:
+            if pipe is not None:
+                pipe.reset()
+
+    def claim_and_register(
+        self, dyno_name, owner_token, score, alive_value, alive_ttl,
+        *, allow_new_claim=True,
+    ):
+        """Atomically claim this dyno name and publish its registry score."""
+        client = self._connect()
+        if client is None:
+            return 'unavailable'
+        owner_key = cache.make_key(_dyno_owner_key(self.app_name, dyno_name))
+        owner_value = self.encode(owner_token)
+        reconverging_key = cache.make_key(_registry_reconverging_key(self.app_name))
+        reconverging_ttl = max(60, int(getattr(settings, 'DYNO_AUTOSCALE_INTERVAL', 30)) * 2)
+        for attempt in range(2):
+            pipe = None
+            try:
+                pipe = client.pipeline(transaction=True)
+                pipe.watch(owner_key, self._index_key)
+                current_owner = pipe.get(owner_key)
+                if current_owner is None and not allow_new_claim:
+                    return 'owner_mismatch'
+                if current_owner is not None and current_owner != owner_value:
+                    return 'owner_mismatch'
+                registry_exists = pipe.exists(self._index_key)
+                pipe.multi()
+                pipe.set(owner_key, owner_value, px=_dyno_owner_ttl() * 1000)
+                if not registry_exists:
+                    pipe.set(reconverging_key, self.encode(True), px=reconverging_ttl * 1000)
+                pipe.zadd(self._index_key, {dyno_name: score})
+                pipe.set(
+                    cache.make_key(f'heroku:dyno_alive:{dyno_name}'),
+                    self.encode(alive_value),
+                    px=alive_ttl * 1000,
+                )
+                pipe.execute()
+                return 'claimed'
+            except _RedisWatchError:
+                if attempt == 0:
+                    continue
+                _mark_registry_degraded(self.app_name, dyno_name)
+                return 'contended'
+            except Exception:
+                _mark_registry_degraded(self.app_name, dyno_name)
+                return 'unavailable'
+            finally:
+                if pipe is not None:
+                    pipe.reset()
+        _mark_registry_degraded(self.app_name, dyno_name)
+        return 'contended'
+
+    def publish_owned_values(
+        self, dyno_name, owner_token, score, values, *,
+        observation_memory=None, observation_epoch=None,
+    ):
+        """Publish one sample only while its owner and reserved score still match."""
+        client = self._connect()
+        if client is None:
+            return 'unavailable'
+        owner_key = cache.make_key(_dyno_owner_key(self.app_name, dyno_name))
+        veto_key = cache.make_key(_dyno_memory_veto_key(self.app_name, dyno_name))
+        pipe = None
+        try:
+            pipe = client.pipeline(transaction=True)
+            pipe.watch(owner_key, self._index_key, veto_key)
+            current_owner = pipe.get(owner_key)
+            current_score = pipe.zscore(self._index_key, dyno_name)
+            if current_owner != self.encode(owner_token) or current_score != score:
+                return 'owner_mismatch'
+            raw_veto = pipe.get(veto_key)
+            clear_veto = False
+            if raw_veto is not None:
+                veto = self.decode(raw_veto)
+                if not (
+                    isinstance(veto, (tuple, list))
+                    and len(veto) == 3
+                    and isinstance(veto[0], str)
+                    and veto[0]
+                    and _is_finite_number(veto[1])
+                    and _is_finite_number(veto[2], positive=True)
+                ):
+                    return 'unavailable'
+                if (
+                    not _is_finite_number(observation_memory, positive=True)
+                    or not _is_finite_number(observation_epoch)
+                    or observation_epoch <= veto[1]
+                ):
+                    return 'memory_pressure'
+                clear_veto = True
+                adjusted_values = []
+                for key, value, timeout in values:
+                    if key == _observation_key(self.app_name, dyno_name):
+                        if isinstance(value, _DynoObservation):
+                            value = value._replace(stable=False)
+                    elif key == f'heroku:dyno_memory_stable:{dyno_name}':
+                        value = False
+                    adjusted_values.append((key, value, timeout))
+                values = adjusted_values
+            pipe.multi()
+            pipe.set(owner_key, self.encode(owner_token), px=_dyno_owner_ttl() * 1000)
+            for key, value, timeout in values:
+                physical_key = cache.make_key(key)
+                if value is None:
+                    pipe.delete(physical_key)
+                    continue
+                timeout_ms = None if timeout is None else int(timeout * 1000)
+                pipe.set(physical_key, self.encode(value), px=timeout_ms)
+            if clear_veto:
+                pipe.delete(veto_key)
+            pipe.execute()
+            return 'published'
+        except _RedisWatchError:
+            return 'contended'
+        except Exception:
+            return 'unavailable'
+        finally:
+            if pipe is not None:
+                pipe.reset()
+
+    def delete_owned_dyno(self, dyno_name, expected_owner, expected_score, keys):
+        """Delete one dyno only when its captured owner and score are unchanged."""
+        client = self._connect()
+        if client is None:
+            return 'unavailable'
+        owner_key = cache.make_key(_dyno_owner_key(self.app_name, dyno_name))
+        pipe = None
+        try:
+            pipe = client.pipeline(transaction=True)
+            pipe.watch(owner_key, self._index_key)
+            current_owner = pipe.get(owner_key)
+            current_score = pipe.zscore(self._index_key, dyno_name)
+            if current_owner != self.encode(expected_owner) or current_score != expected_score:
+                return 'owner_mismatch'
+            pipe.multi()
+            for key in keys:
+                pipe.delete(cache.make_key(key))
+            pipe.zrem(self._index_key, dyno_name)
+            pipe.delete(owner_key)
+            pipe.execute()
+            return 'deleted'
+        except _RedisWatchError:
+            return 'contended'
+        except Exception:
+            return 'unavailable'
+        finally:
+            if pipe is not None:
+                pipe.reset()
+
+    def compare_and_delete_scalar(self, key, expected_value):
+        """Delete one cache value only if an attempt token still owns it."""
+        client = self._connect()
+        if client is None:
+            return 'unavailable'
+        physical_key = cache.make_key(key)
+        pipe = None
+        try:
+            pipe = client.pipeline(transaction=True)
+            pipe.watch(physical_key)
+            if pipe.get(physical_key) != self.encode(expected_value):
+                return 'owner_mismatch'
+            pipe.multi()
+            pipe.delete(physical_key)
+            pipe.execute()
+            return 'deleted'
+        except _RedisWatchError:
+            return 'contended'
+        except Exception:
+            return 'unavailable'
+        finally:
+            if pipe is not None:
+                pipe.reset()
+
+    def _formation_cleanup_keys(self, formation_name):
+        """Return the physical keys cleared for an at-or-below baseline."""
+        return (
+            cache.make_key(
+                f'heroku:formation_size:{self.app_name}:{formation_name}',
+            ),
+            cache.make_key(
+                f'heroku:original_formation_size:{formation_name}',
+            ),
+            cache.make_key(
+                f'heroku:keep_upscaled_formation_until:{formation_name}',
+            ),
+        )
+
+    def capture_formation_cleanup_state(self, formation_name):
+        """Capture exact raw cleanup state before taking a writer lock.
+
+        Individual primary GETs keep a wrong-type key fail closed. Redis MGET
+        returns nil for a wrong-type member, which would turn an invalid tier
+        into a normal miss.
+        """
+        client = self._connect()
+        if client is None:
+            return None
+        try:
+            return tuple(
+                client.get(key)
+                for key in self._formation_cleanup_keys(formation_name)
+            )
+        except Exception:
+            return None
+
+    def clear_formation_if_at_or_below(
+        self, formation_name, fallback_formation_size, *, captured=None,
+        expected_upscale_timer_raw=_UPSCALE_TIMER_UNBOUND,
+    ):
+        """Delete one at-or-below baseline only if its full state is unchanged.
+
+        ``captured`` is the raw tier, baseline, and upscale timer obtained
+        before an outer mutation lock.  Callers without that lock capture the
+        same tuple here.  The watched transaction uses type-strict GETs to
+        compare those exact values before deleting either key, so a wrong-type
+        value or a writer that replaces the baseline or timer wins the race.
+
+        ``no_baseline`` means the primary holds no original baseline.  That
+        is a genuine miss, not corrupt state, so the scheduler can still use
+        its previous-tier fallback.  Nothing is deleted for that result.
+        """
+        client = self._connect()
+        if client is None:
+            return 'unavailable'
+        keys = self._formation_cleanup_keys(formation_name)
+        if captured is None:
+            captured = self.capture_formation_cleanup_state(formation_name)
+        if captured is None:
+            return 'unavailable'
+        captured = tuple(captured)
+        if len(captured) != len(keys):
+            return 'unavailable'
+
+        pipe = None
+        try:
+            pipe = client.pipeline(transaction=True)
+            pipe.watch(*keys)
+            current = tuple(pipe.get(key) for key in keys)
+            if current != captured:
+                return 'changed'
+            raw_formation, raw_original, raw_upscale_until = current
+            try:
+                self.decode_upscale_timer(raw_upscale_until)
+                current_size = self.decode_formation_size(
+                    raw_formation, fallback_formation_size,
+                )
+            except Exception:
+                return 'unavailable'
+            if raw_original is None:
+                # EXEC closes the WATCH window before the scheduler acts on
+                # the genuine baseline miss.
+                pipe.multi()
+                pipe.execute()
+                return 'no_baseline'
+            try:
+                original_size = self.decode_original_formation_size(
+                    raw_original,
+                )['size']
+            except Exception:
+                return 'unavailable'
+            current_memory = DYNO_SIZES.get(current_size, {}).get('memory', 0)
+            original_memory = DYNO_SIZES.get(original_size, {}).get('memory', 0)
+            if not current_memory or not original_memory:
+                return 'unavailable'
+            if current_memory > original_memory:
+                # A watched no-op keeps the caller's continuation bound to the
+                # exact tier, baseline, and timer it just compared.
+                pipe.multi()
+                pipe.execute()
+                return 'not_at_or_below'
+            if (
+                expected_upscale_timer_raw is not _UPSCALE_TIMER_UNBOUND
+                and current[2] != expected_upscale_timer_raw
+            ):
+                return 'timer_changed'
+            pipe.multi()
+            pipe.delete(keys[1])
+            pipe.delete(keys[2])
+            pipe.execute()
+            return 'cleared'
+        except _RedisWatchError:
+            return 'contended'
+        except Exception:
+            return 'unavailable'
+        finally:
+            if pipe is not None:
+                pipe.reset()
+
+    def clear_degraded_if_score(self, dyno_name, expected_failure_time):
+        """Remove one resolved failure without deleting a newer concurrent one."""
+        client = self._connect()
+        if client is None:
+            return 'unavailable'
+        ledger = cache.make_key(_registry_degraded_key(self.app_name))
+        pipe = None
+        try:
+            pipe = client.pipeline(transaction=True)
+            pipe.watch(ledger)
+            current = pipe.zscore(ledger, dyno_name)
+            if current != expected_failure_time:
+                return 'changed'
+            pipe.multi()
+            pipe.zrem(ledger, dyno_name)
+            pipe.execute()
+            return 'cleared'
+        except _RedisWatchError:
+            return 'contended'
+        except Exception:
+            return 'unavailable'
+        finally:
+            if pipe is not None:
+                pipe.reset()
 
     def mget(self, keys):
         """Batched metric reads via physical keys; never one round trip per dyno."""
@@ -171,6 +1362,24 @@ class _IndexAdapter:
         if raw_values is None:
             return None
         return [self.decode(value) for value in raw_values]
+
+    def exists(self, keys):
+        """Count present physical keys without decoding their values."""
+        client = self._connect()
+        if client is None:
+            return None
+        physical = [cache.make_key(key) for key in keys]
+        try:
+            count = client.exists(*physical)
+        except Exception:
+            return None
+        if (
+            not isinstance(count, int)
+            or isinstance(count, bool)
+            or count < 0
+        ):
+            return None
+        return count
 
     def zremrangebyscore(self, min_score, max_score):
         """Prune through a write client; never write via a read replica."""
@@ -217,17 +1426,19 @@ def _mark_registry_reconverging(app_name):
 
 
 def _registry_degraded_ttl():
-    """Ledger lifetime: two zombie windows after the last recorded failure."""
-    return 2 * int(getattr(settings, 'DYNO_ZOMBIE_THRESHOLD', 24 * 60 * 60))
+    """Ledger lifetime that covers the full registration grace."""
+    zombie_windows = 2 * int(
+        getattr(settings, 'DYNO_ZOMBIE_THRESHOLD', 24 * 60 * 60),
+    )
+    return max(zombie_windows, _registry_degraded_grace() + 1)
 
 
 def _mark_registry_degraded(app_name, dyno_name):
     """Record one failed registry write in the app's ledger (best effort).
 
-    The entry lives until that dyno registers again or its liveness key
-    expires, which is exactly as long as a live dyno can be missing from the
-    only member list; _registry_degraded does that bookkeeping on read.  The
-    ledger key itself expires two zombie windows after the last failure.
+    The entry lives until that dyno registers again, proves it is gone, or a
+    bounded first-registration grace expires. The ledger key lives for at least
+    the registration grace and two zombie windows after the last failure.
     """
     try:
         client = cache.client.get_client(write=True)
@@ -270,11 +1481,13 @@ def _registry_degraded(instance):
             member = raw_member.decode('utf-8', errors='replace') if isinstance(raw_member, bytes) else raw_member
             score = client.zscore(adapter._index_key, member)
             if score is not None and score > failure_time:
-                client.zrem(ledger, member)  # registered again after the failure
+                adapter.clear_degraded_if_score(member, failure_time)
                 continue
             if client.get(cache.make_key(f'heroku:dyno_alive:{member}')) is not None:
                 return True  # alive, but not registered since that failure
-            client.zrem(ledger, member)  # gone: its liveness key expired
+            if time.time() - failure_time <= _registry_degraded_grace():
+                return True  # first registration may have failed before its heartbeat
+            adapter.clear_degraded_if_score(member, failure_time)
         if len(entries) >= _DEGRADED_LEDGER_LIMIT:
             # A full batch cannot prove that no later entry names a live writer.
             return True
@@ -437,6 +1650,9 @@ class HerokuDyno:
         self._thread_lock = threading.Lock()
         self._last_file_cleaning = None
         self._formation_size_cached = None  # (size, timestamp) tuple for instance-level caching
+        self._dyno_owner_claimed = False
+        self._dyno_owner_fenced = False
+        self._last_registered_score = None
 
     @property
     def heroku_api_configured(self):
@@ -448,6 +1664,125 @@ class HerokuDyno:
         if self.proxy.enabled:
             return self.proxy.configured
         return bool(self.heroku_api_key)
+
+    @property
+    def _verified_self_dyno_id(self):
+        """Return the current process UUID only when it identifies this dyno."""
+        if self.remote_monitoring:
+            return None
+        if self.dyno_name != os.environ.get('DYNO'):
+            return None
+        return _canonical_uuid(self.dyno_id)
+
+    @property
+    def _dyno_owner_token(self):
+        """Stable ownership token for this process incarnation."""
+        override = self.__dict__.get('_dyno_owner_token_override')
+        if override:
+            return override
+        verified_id = self._verified_self_dyno_id
+        if verified_id:
+            return f'dyno:{verified_id}'
+        pid = os.getpid()
+        process_token = self.__dict__.get('_process_owner_token')
+        if process_token and process_token[0] == pid:
+            return process_token[1]
+        if process_token is not None:
+            self._dyno_owner_claimed = False
+            self._dyno_owner_fenced = False
+            self._last_registered_score = None
+        token = f'process:{uuid.uuid4()}:{pid}'
+        self.__dict__['_process_owner_token'] = (pid, token)
+        return token
+
+    @property
+    def local_dyno_size(self):
+        """Return the size this process booted with, from Heroku's DYNO_RAM."""
+        try:
+            dyno_memory = int(os.environ.get('DYNO_RAM', 0))
+        except (TypeError, ValueError):
+            return None
+        for size_name, details in DYNO_SIZES.items():
+            if details.get('memory') == dyno_memory:
+                return size_name
+        return None
+
+    def _read_primary_formation_size(self, adapter=None):
+        """Return primary tier state without confusing a miss with an error."""
+        adapter = adapter or _IndexAdapter(self.app_name, primary=True)
+        try:
+            value = adapter.get_scalar(
+                f'heroku:formation_size:{self.app_name}:{self.formation_name}'
+            )
+        except Exception:
+            logger.warning(
+                "Could not read the primary formation size for %s/%s.",
+                self.app_name, self.formation_name, exc_info=True,
+            )
+            return 'unavailable', None
+        if isinstance(value, str) and value in DYNO_SIZES:
+            return 'found', value
+        if value is None:
+            return 'miss', None
+        logger.warning(
+            "Primary formation size for %s/%s is invalid; deferring resize.",
+            self.app_name, self.formation_name,
+        )
+        return 'unavailable', None
+
+    def _defer_resize_for_retiring_dyno(self, operation):
+        """Block a resize unless this process owns the current dyno lease."""
+        if self.remote_monitoring:
+            return False
+
+        # Accessing the token first resets inherited ownership state after a
+        # fork, including a fence copied from the parent process.
+        owner_token = self._dyno_owner_token
+        adapter = None
+        if getattr(self, '_dyno_owner_fenced', False):
+            detail = 'fenced ownership'
+        else:
+            adapter = _IndexAdapter(self.app_name, primary=True)
+            status, current_owner, _ = adapter.get_owner_and_score(self.dyno_name)
+            if status != 'found' or current_owner != owner_token:
+                detail = 'current owner unavailable or replaced'
+            else:
+                detail = None
+
+        local_size = self.local_dyno_size
+        if local_size is None:
+            if detail is None:
+                return False
+            logger.info(
+                "Skipping %s for %s/%s: local dyno size unknown, %s.",
+                operation, self.app_name, self.dyno_name, detail,
+            )
+            return True
+
+        if detail is None:
+            state, primary_size = self._read_primary_formation_size(adapter)
+            if state == 'unavailable':
+                detail = 'primary formation read unavailable'
+            else:
+                current_size = primary_size if state == 'found' else self.formation_size
+                if current_size == local_size:
+                    # Primary state is authoritative even when the instance cache
+                    # still holds the predecessor tier after a restart overlap.
+                    previous_size = (
+                        self._formation_size_cached[0]
+                        if self._formation_size_cached else None
+                    )
+                    self._formation_size_cached = (current_size, time.time())
+                    if previous_size != current_size:
+                        self._invalidate_formation_dependent_cache()
+                    return False
+                detail = f'primary formation size {current_size}'
+
+        logger.info(
+            "Skipping %s for retiring %s/%s: local dyno size %s, %s.",
+            operation, self.app_name, self.dyno_name, local_size, detail,
+        )
+        return True
 
     # Per-dyno cache key prefixes — published in check_in_dyno, cleaned in
     # remove_dyno_from_alive_cache.  Add new metrics here to publish/clean
@@ -548,6 +1883,38 @@ class HerokuDyno:
             return exact_memory or 0
 
     @property
+    def memory_reading_for_observation(self):
+        """Return a validated memory reading with its source epoch."""
+        patterns = [
+            r"sample#memory_total=(\d+\.\d+)MB",
+            r"Process running mem=(\d+)M\(\d+\.\d+%\)",
+        ]
+        reading = self._extract_latest_metric_reading(
+            patterns,
+            cache_key="heroku:memory_total",
+            result_type=float,
+            require_fresh_source=True,
+        )
+        if reading is not None and _is_finite_number(reading.value, positive=True):
+            return reading
+        if self.remote_monitoring:
+            return None
+        try:
+            from utils.process import get_total_memory_usage
+            value = get_total_memory_usage()
+        except ImportError:
+            return None
+        if _is_finite_number(value, positive=True):
+            return _MetricReading(value, time.time())
+        return None
+
+    @property
+    def memory_mb_for_observation(self):
+        """Return a real memory sample, preserving an unavailable reading as None."""
+        reading = self.memory_reading_for_observation
+        return reading.value if reading is not None else None
+
+    @property
     def current_memory_usage_percentage(self):
         cur_mem = self.current_memory_usage
         if cur_mem and self.available_memory:
@@ -576,34 +1943,46 @@ class HerokuDyno:
             or self.detected_r15
         )
 
+    def _evaluate_downscale_snapshot(self, *, queue_allowed, stability_ignores_queue=False):
+        """Evaluate both memory paths from one roster and one observation batch."""
+        if _index_fail_closed(self) or self.requires_upscale:
+            return _DownscaleDecision(False, False, None, None)
+        if not queue_allowed and not stability_ignores_queue:
+            return _DownscaleDecision(False, False, None, None)
+        snapshot = self._formation_observation_snapshot()
+        if snapshot is None:
+            return _DownscaleDecision(False, False, None, None)
+        target_size = self._downscale_target_size
+        threshold = self._downscale_threshold_for_target(target_size)
+        normal = queue_allowed and self._normal_memory_snapshot_allows_downscale(
+            snapshot, threshold,
+        )
+        stability = (
+            (queue_allowed or stability_ignores_queue)
+            and self._stability_snapshot_allows_downscale(snapshot, threshold)
+        )
+        if not normal and not stability:
+            return _DownscaleDecision(False, False, snapshot, target_size)
+        if not self._formation_observation_snapshot_current(snapshot):
+            return _DownscaleDecision(False, False, snapshot, target_size)
+        return _DownscaleDecision(normal, stability, snapshot, target_size)
+
     @property
     def allow_downscale(self):
         # Phase B: downscale is destructive; it requires the indexed registry
-        # to be runtime-ready.  Flag false/absent or uncertain readiness blocks
-        # the resize — a partially populated index could undercount hot
-        # siblings.
-        if _index_fail_closed(self):
+        # to be runtime-ready. Flag false/absent or uncertain readiness blocks
+        # the resize because a partial index can undercount hot siblings.
+        if _index_fail_closed(self) or self.requires_upscale:
             return False
-        queue_ok = self.downscale_on_non_empty_queue or self.no_tasks_in_queue
-
-        # Normal path: memory is below the downscale threshold for all dynos.
-        if not self.requires_upscale and \
-                not self.is_still_high_memory_usage_for_downscale and \
-                not self.any_sibling_still_high_memory and \
-                queue_ok:
-            return True
-
-        # Stability override: RSS plateau + idle formation = work is done,
-        # only a restart will reclaim memory.
-        if self._is_stability_eligible and queue_ok:
+        queue_allowed = self.downscale_on_non_empty_queue or self.no_tasks_in_queue
+        decision = self._evaluate_downscale_snapshot(queue_allowed=queue_allowed)
+        if decision.stability and not decision.normal:
             logger.info(
                 f"[{self.formation_name}] Memory stabilized at "
                 f"{self.current_memory_usage:.0f}MB and load settled — allowing downscale "
                 f"(RSS plateau detected; restart will reclaim memory)."
             )
-            return True
-
-        return False
+        return decision.normal or decision.stability
             
     @property
     def allow_downscale_on_shutdown(self):
@@ -613,18 +1992,8 @@ class HerokuDyno:
         removes this dyno's memory key before the formation resize, which would
         otherwise leave hot siblings vulnerable to an unexpected downscale.
         """
-        if _index_fail_closed(self):
-            return False
-        if not self.requires_upscale and \
-                not self.is_still_high_memory_usage_for_downscale and \
-                not self.any_sibling_still_high_memory:
-            return True
-
-        # Stability override.
-        if self._is_stability_eligible:
-            return True
-
-        return False
+        decision = self._evaluate_downscale_snapshot(queue_allowed=True)
+        return decision.normal or decision.stability
 
     @property
     def detected_r15(self):
@@ -639,17 +2008,33 @@ class HerokuDyno:
         return self.get_load_1min_avg()
 
     @property
-    def _downscale_memory_threshold(self):
-        """Memory (MB) above which a dyno is considered too hot to downscale.
+    def load_1min_for_observation(self):
+        """Return a real load sample, preserving an unavailable reading as None."""
+        patterns = [r"sample#load_avg_1m=(\d+\.\d+)"]
+        return self.extract_latest_metric(
+            patterns, cache_key="heroku:load_avg_1m", result_type=float,
+            require_fresh_source=True,
+        )
 
-        Uses the *original* (target) formation size so that the guard reflects
-        the quota the formation will actually run on after downscaling.  Using
-        the intermediate ``previous_formation_size`` produced a threshold that
-        was too high (e.g. Standard-2X = 1075 MB instead of Standard-1X = 537 MB
-        when going from Performance-M → Standard-1X), allowing a downscale while
-        memory was still 1034 MB and causing immediate R14 errors.
-        """
-        target_size = self.original_formation_size or self.previous_formation_size
+    @property
+    def _downscale_target_size(self):
+        """Return the effective baseline target for this decision."""
+        adapter = _IndexAdapter(self.app_name, primary=True)
+        status, target_size, _ = adapter.read_downscale_target(
+            self.formation_name, self.formation_size,
+        )
+        if status in ('found', 'miss'):
+            return target_size
+        if status == 'unavailable':
+            logger.warning(
+                "Could not read a usable downscale baseline for %s/%s; "
+                "blocking the decision.",
+                self.app_name, self.formation_name,
+            )
+        return None
+
+    def _downscale_threshold_for_target(self, target_size):
+        """Memory threshold for one captured downscale target."""
         if not target_size:
             logger.warning(
                 f"[{self.formation_name}] Cannot compute downscale threshold: "
@@ -664,6 +2049,13 @@ class HerokuDyno:
             )
             return float('inf')
         return target_memory * settings.DOWNSCALE_PERCENTAGE_HIGH_MEM_USE / 100
+
+    @property
+    def _downscale_memory_threshold(self):
+        """Memory (MB) above which a dyno is too hot for the current target."""
+        return self._downscale_threshold_for_target(
+            self._downscale_target_size,
+        )
 
     @property
     def is_still_high_memory_usage_for_downscale(self):
@@ -682,26 +2074,63 @@ class HerokuDyno:
         - All dynos in the formation are idle (load avg < threshold)
         - No sibling is still actively hot (unless also stabilized)
         """
-        return (
-            not self.requires_upscale
-            and not self.is_on_original_formation_size_or_lower
-            and self.is_memory_stabilized
-            and self.is_formation_idle
-            and not self.any_sibling_still_high_memory
+        decision = self._evaluate_downscale_snapshot(
+            queue_allowed=False,
+            stability_ignores_queue=True,
         )
+        return decision.stability
 
-    def record_memory_reading(self, mem=None):
-        """Record current memory usage for RSS plateau detection."""
-        if mem is None:
-            mem = self.current_memory_usage
-        if not mem:
-            return
-        now = time.time()
+    def _normalized_memory_history(self, history, now):
+        """Prune, validate, and deduplicate history by source epoch."""
         window = getattr(settings, 'DYNO_MEMORY_STABILITY_WINDOW', 300)
-        history = cache.get(self.memory_history_cache_key) or []
-        history = [(t, m) for t, m in history if now - t <= window]
-        history.append((now, mem))
+        by_epoch = {}
+        for item in history or []:
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                continue
+            source_epoch, memory_mb = item
+            if not _is_finite_number(source_epoch) or not _is_finite_number(memory_mb, positive=True):
+                continue
+            if source_epoch > now + 1 or now - source_epoch > window:
+                continue
+            by_epoch[float(source_epoch)] = float(memory_mb)
+        return sorted(by_epoch.items())
+
+    def record_memory_reading(self, mem=None, source_epoch=None):
+        """Record one source reading and return stability for that exact history."""
+        if mem is None:
+            reading = self.memory_reading_for_observation
+            if reading is not None:
+                mem = reading.value
+                source_epoch = reading.source_epoch
+        elif source_epoch is None:
+            source_epoch = time.time()
+        if not _is_finite_number(mem, positive=True):
+            return False
+
+        now = time.time()
+        if not _is_finite_number(source_epoch) or source_epoch > now + 1:
+            return False
+        history = self._normalized_memory_history(
+            cache.get(self.memory_history_cache_key) or [], now,
+        )
+        latest_epoch = history[-1][0] if history else None
+        window = getattr(settings, 'DYNO_MEMORY_STABILITY_WINDOW', 300)
+        if (
+            latest_epoch is not None
+            and source_epoch < latest_epoch
+        ) or now - source_epoch > window:
+            cache.set(
+                self.memory_history_cache_key,
+                history,
+                timeout=window + 120,
+            )
+            return False
+
+        by_epoch = dict(history)
+        by_epoch[float(source_epoch)] = float(mem)
+        history = sorted(by_epoch.items())
         cache.set(self.memory_history_cache_key, history, timeout=window + 120)
+        return self._history_is_stabilized(history)
 
     @property
     def is_memory_stabilized(self):
@@ -720,7 +2149,12 @@ class HerokuDyno:
         Readings must also span at least half the stability window to prevent
         a burst of readings in a few seconds from being mistaken for a plateau.
         """
-        history = cache.get(self.memory_history_cache_key) or []
+        history = self._normalized_memory_history(
+            cache.get(self.memory_history_cache_key) or [], time.time(),
+        )
+        return self._history_is_stabilized(history)
+
+    def _history_is_stabilized(self, history):
         min_readings = getattr(settings, 'DYNO_MEMORY_STABILITY_MIN_READINGS', 6)
         if len(history) < min_readings:
             return False
@@ -737,40 +2171,26 @@ class HerokuDyno:
         return all(abs(m - avg) <= tolerance for m in readings)
 
     def _acquire_rate_limit_token(self):
-        """
-        Acquire a token from the shared Redis-based rate limiter.
-        Coordinates across all dynos to stay within Heroku's 4,500 calls/hour limit.
-        Blocks (with back-off) if the per-minute budget is exhausted; returns False
-        after 3 consecutive waits.
-        """
+        """Reserve one request in the app's shared 60-second window."""
         rate_limit = int(getattr(settings, 'HEROKU_API_RATE_LIMIT_PER_MINUTE', 50))
+        if rate_limit <= 0:
+            return False
         cache_key = f'heroku:api_rate:{self.app_name}'
-
-        current = cache.get(cache_key)
-        if current is None:
-            cache.set(cache_key, 1, timeout=60)
-            return True
-        if current < rate_limit:
+        for _ in range(2):
             try:
-                new_count = cache.incr(cache_key)
+                count = cache.incr(cache_key)
             except ValueError:
-                # Key expired between get and incr
-                cache.set(cache_key, 1, timeout=60)
+                if cache.add(cache_key, 1, timeout=60):
+                    return True
+                # Another caller opened the window. Count against its reservation.
+                continue
+            if count <= rate_limit:
                 return True
-            if new_count > rate_limit:
-                # Lost the TOCTOU race — another dyno incremented past the limit
-                logger.warning(
-                    f"[{self.formation_name}] Heroku API rate limit exceeded "
-                    f"({new_count}/{rate_limit}/min). Skipping cycle."
-                )
-                return False
-            return True
-
-        # Budget exhausted — skip this cycle instead of blocking the autoscale thread
-        logger.warning(
-            f"[{self.formation_name}] Heroku API rate limit reached "
-            f"({current}/{rate_limit}/min). Skipping API call this cycle."
-        )
+            logger.warning("[%s] Heroku API rate limit reached (%s/min). Skipping API call.",
+                           self.formation_name, rate_limit)
+            return False
+        logger.warning("[%s] Heroku API rate limit counter unavailable. Skipping API call.",
+                       self.formation_name)
         return False
 
     def _proxy_pending_key(self, method, url, data):
@@ -861,8 +2281,16 @@ class HerokuDyno:
                 response = ProxyResponse(502, '{"id":"proxy_outcome_unknown"}', request_id=request_id)
             return self._report_proxy_reconciliation(pending_key, response, original_attempt=True)
         if response is not None and response.status_code >= 400:
-            logger.warning("Heroku proxy rejected %s for formation %s, status %s",
-                           method, self.formation_name, response.status_code)
+            cooldown_retry = self._proxy_cooldown_retry_after(response)
+            if cooldown_retry is not None:
+                logger.warning(
+                    "Heroku proxy cooldown for %s %s, status=429, "
+                    "error=cooldown, retry_after=%ss",
+                    method, self.formation_name, cooldown_retry,
+                )
+            else:
+                logger.warning("Heroku proxy rejected %s for formation %s, status %s",
+                               method, self.formation_name, response.status_code)
         return response
 
     def _report_proxy_reconciliation(self, pending_key, response, *, original_attempt=False):
@@ -885,14 +2313,52 @@ class HerokuDyno:
         return response
 
     @staticmethod
+    def _proxy_cooldown_retry_after(response):
+        """Return a valid cooldown Retry-After, or None for every other response."""
+        if (
+            not isinstance(response, ProxyResponse)
+            or response.status_code != 429
+            or response.error_id != "cooldown"
+        ):
+            return None
+        value = response.headers.get("retry-after")
+        if not isinstance(value, str):
+            return None
+        stripped = value.strip(" \t")
+        if not re.fullmatch(r"[0-9]+", stripped):
+            return None
+        # Bound the meaningful digits before int(). Python rejects extreme lengths.
+        digits = stripped.lstrip("0") or "0"
+        if len(digits) > 5:
+            return None
+        retry_after = int(digits)
+        return retry_after if 0 < retry_after <= 86400 else None
+
+    @staticmethod
     def _log_api_failure(operation, response):
         if response is None:
             logger.error("%s. API call was rate-limited or failed.", operation)
         elif isinstance(response, ProxyResponse):
             if not response.reconciliation_required:
+                if HerokuDyno._proxy_cooldown_retry_after(response) is not None:
+                    return
                 logger.error("%s. HTTP %s, error=%s.", operation, response.status_code, response.error_id)
         else:
             logger.error("%s. HTTP %s.", operation, response.status_code)
+
+    def _definite_resize_rejection(self, response):
+        """Return True only when the provider definitely did not apply a mutation."""
+        if response is None:
+            # The pinned proxy returns None before dispatch. Direct transport
+            # cannot distinguish pre-dispatch exhaustion from an ambiguous send.
+            return self.proxy.enabled
+        if isinstance(response, ProxyResponse):
+            if response.reconciliation_required:
+                return False
+            return 400 <= response.status_code < 500
+        # Direct transport may retry a timed-out request. A later 4xx does not
+        # prove the earlier attempts were rejected before reaching Heroku.
+        return False
 
     def _call_heroku_api_direct(self, method, url, custom_headers=None, data=None):
         """
@@ -937,7 +2403,7 @@ class HerokuDyno:
                     )
                     time.sleep(wait)
                     continue
-                logger.error(
+                logger.warning(
                     f"[{self.formation_name}] Heroku API {method} {url} "
                     f"failed after {max_attempts} attempts: {exc}",
                     exc_info=True,
@@ -1082,9 +2548,11 @@ class HerokuDyno:
     def clear_upscaling(self):
         cache.delete(self.upscaling_cache_key)
 
-    @cached_property
+    @property
     def memory_history_cache_key(self):
-        return f'heroku:memory_history:{self.app_name}:{self.dyno_name}'
+        key = f'heroku:memory_history:{self.app_name}:{self.dyno_name}'
+        identity = self._verified_self_dyno_id or self._dyno_owner_token
+        return f'{key}:{identity}'
 
     @cached_property
     def downscale_cache_key(self):
@@ -1092,10 +2560,31 @@ class HerokuDyno:
 
     @property
     def is_downscaling(self):
-        return cache.get(self.downscale_cache_key)
+        return bool(cache.get(self.downscale_cache_key))
 
     def set_downscaling(self):
-        cache.set(self.downscale_cache_key, True, timeout=settings.DYNO_TIME_BETWEEN_SCALES)
+        attempt_token = str(uuid.uuid4())
+        cache.set(
+            self.downscale_cache_key,
+            attempt_token,
+            timeout=settings.DYNO_TIME_BETWEEN_SCALES,
+        )
+        return attempt_token
+
+    def clear_downscaling(self, attempt_token):
+        """Clear only the downscale flag still owned by this attempt."""
+        if not attempt_token:
+            return False
+        status = _IndexAdapter(self.app_name, primary=True).compare_and_delete_scalar(
+            self.downscale_cache_key,
+            attempt_token,
+        )
+        if status == 'unavailable':
+            logger.warning(
+                "Could not clear the failed downscale flag for %s.",
+                self.formation_name,
+            )
+        return status == 'deleted'
 
     @cached_property
     def threads_used_cache_key(self):
@@ -1114,33 +2603,32 @@ class HerokuDyno:
             cache.set(self.threads_used_cache_key, threads_used, timeout=ttl)
         return threads_used
 
-    def autoscale(self, continuous=True):
+    def autoscale(self, continuous=True, *, r15_only=False):
         """
         Autoscale the dyno based on current requirements.
 
         Args:
             continuous (bool): Whether to run autoscaling continuously.
+            r15_only (bool): Limit this tick to an emergency upscale.
         """
 
-        # If continuous mode, return stats
-        if continuous:
-            logger.debug(f"Dyno {self.dyno_name} stats: "
-                         f"Formation Size: {self.formation_size}, "
-                         f"Memory Usage: {self.current_memory_usage} / {self.available_memory} MB, "
-                         f"Load Avg (1min): {self.avg_load_1min}, "
-                         f"Tasks in Queue: {self.tasks_in_queue}, "
-                         f"Threads Used: {self.threads_used}, "
-                         f"Detected R14: {self.detected_r14}, "
-                         f"Detected R15: {self.detected_r15}, "
-                    )
-
-        # ignore beatworker if settings.DYNO_AUTOSCALE_ENABLED_FOR_BEATWORKER is False
         if 'beatworker' == self.formation_name and not getattr(settings, 'DYNO_AUTOSCALE_ENABLED_FOR_BEATWORKER', True):
             return
 
+        if self._defer_resize_for_retiring_dyno('autoscale'):
+            return
+
         try:
-            if getattr(settings, 'DYNO_LOG_THREADS_USED', False):
-                self.set_threads_used()
+            if r15_only:
+                if self.detected_r15:
+                    self.upscale_formation_to_next_level()
+                return
+
+            thread_count = None
+            if getattr(settings, 'DYNO_LOG_THREADS_USED', False) and not self.remote_monitoring:
+                thread_count = self.set_threads_used()
+            if continuous and logger.isEnabledFor(logging.DEBUG):
+                self._log_autoscale_stats(thread_count)
 
             if self.requires_upscale or self.any_sibling_requires_upscale:
                 self.upscale_formation_to_next_level()
@@ -1148,6 +2636,22 @@ class HerokuDyno:
                 self.check_and_downscale_to_original_formation_size()
         except Exception as e:
             logger.error(f"Failed to autoscale dyno {self.dyno_name}. Error: {e}", exc_info=True)
+
+    def _log_autoscale_stats(self, thread_count):
+        try:
+            if self.remote_monitoring:
+                thread_count = cache.get(self.threads_used_cache_key)
+            elif thread_count is None:
+                thread_count = threading.active_count()
+            logger.debug(
+                "Dyno %s stats: Formation Size: %s, Memory Usage: %s / %s MB, "
+                "Load Avg (1min): %s, Tasks in Queue: %s, Threads Used: %s, "
+                "Detected R14: %s, Detected R15: %s",
+                self.dyno_name, self.formation_size, self.current_memory_usage, self.available_memory,
+                self.avg_load_1min, self.tasks_in_queue, thread_count, self.detected_r14, self.detected_r15,
+            )
+        except Exception:
+            logger.debug("Could not read autoscale diagnostics for %s.", self.dyno_name, exc_info=True)
 
     def _check_formation_on_startup(self):
         """
@@ -1208,9 +2712,12 @@ class HerokuDyno:
         self._check_formation_on_startup()
 
         while not self._stop_autoscale_event.is_set():
-            self.check_in_dyno()
-            self.check_for_sibling_zombie_dynos()
-            self.autoscale(continuous=True)
+            status = self._check_in_dyno_status()
+            if status == 'published':
+                self.check_for_sibling_zombie_dynos()
+                self.autoscale(continuous=True)
+            elif status == 'memory_pressure':
+                self.autoscale(continuous=True, r15_only=True)
 
             # Jitter ±20 % to prevent thundering-herd across dynos
             base = settings.DYNO_AUTOSCALE_INTERVAL
@@ -1338,64 +2845,423 @@ class HerokuDyno:
                 logger.error(f"File cleaning thread for {self.dyno_name} crashed. Restarting... Error: {e}", exc_info=True)
                 time.sleep(15)  # Short delay before restarting
 
-    # Registers dyno as alive in redis cache table so other workers can check if it's alive and restart it if it doesn't respond for a while
+    def _claim_current_dyno(self, check_in_epoch, alive_ttl):
+        """Claim or renew this incarnation before any telemetry read."""
+        if self.remote_monitoring:
+            logger.debug(
+                "Remote monitoring does not claim dyno ownership for %s/%s.",
+                self.app_name, self.dyno_name,
+            )
+            return False, None
+        owner_token = self._dyno_owner_token
+        if getattr(self, '_dyno_owner_fenced', False):
+            return False, None
+        if not self.app_name or not self.dyno_name:
+            return False, None
+        adapter = _IndexAdapter(self.app_name, primary=True)
+        status = adapter.claim_and_register(
+            self.dyno_name,
+            owner_token,
+            check_in_epoch,
+            timezone.now(),
+            alive_ttl,
+            allow_new_claim=not getattr(self, '_dyno_owner_claimed', False),
+        )
+        if status == 'claimed':
+            self._dyno_owner_claimed = True
+            self._last_registered_score = check_in_epoch
+            return True, check_in_epoch
+        if status in ('owner_mismatch', 'contended'):
+            owner_status, current_owner, _ = adapter.get_owner_and_score(self.dyno_name)
+            lost_or_replaced = (
+                owner_status == 'missing'
+                or (owner_status == 'found' and current_owner != owner_token)
+            )
+            if lost_or_replaced:
+                adapter.mark_owner_contention(self.dyno_name, owner_token)
+            if lost_or_replaced and getattr(self, '_dyno_owner_claimed', False):
+                self._dyno_owner_fenced = True
+                logger.warning(
+                    "Dyno ownership for %s/%s was lost or replaced; this process is fenced until restart.",
+                    self.app_name, self.dyno_name,
+                )
+            else:
+                logger.debug(
+                    "Dyno ownership for %s/%s is held by another process; automatic mutations are paused.",
+                    self.app_name, self.dyno_name,
+                )
+            return False, None
+        logger.warning(
+            "Dyno ownership for %s/%s is unavailable; automatic mutations are paused for this tick.",
+            self.app_name, self.dyno_name,
+        )
+        return False, None
+
+    def record_memory_pressure(self, mem_mb):
+        """Nudge this dyno into a fail-closed state during an immediate memory spike."""
+        if not _is_finite_number(mem_mb, positive=True):
+            raise ValueError('memory pressure must be a positive number')
+        source_epoch = time.time()
+        self.record_memory_reading(mem_mb, source_epoch)
+        if self.remote_monitoring or not self.app_name or not self.dyno_name:
+            return False
+        status = _IndexAdapter(
+            self.app_name, primary=True,
+        ).publish_memory_pressure(
+            self.dyno_name,
+            self._dyno_owner_token,
+            source_epoch,
+            float(mem_mb),
+            _memory_veto_ttl(),
+        )
+        if status != 'published':
+            logger.warning(
+                "Failed to publish memory-pressure veto for %s/%s: %s.",
+                self.app_name, self.dyno_name, status,
+            )
+            return False
+        return True
+
+    def _current_memory_pressure_veto(self):
+        """Return one validated nudge tuple, or fail closed on corrupt state."""
+        value = _IndexAdapter(self.app_name, primary=True).get_scalar(
+            _dyno_memory_veto_key(self.app_name, self.dyno_name),
+        )
+        if value is None:
+            return None
+        if not (
+            isinstance(value, (tuple, list))
+            and len(value) == 3
+            and isinstance(value[0], str)
+            and value[0]
+            and _is_finite_number(value[1])
+            and _is_finite_number(value[2], positive=True)
+        ):
+            raise ValueError('memory-pressure veto is malformed')
+        return value
+
     def check_in_dyno(self):
+        """Return whether the current process published a new observation."""
+        return self._check_in_dyno_status() == 'published'
+
+    def _check_in_dyno_status(self):
+        """Claim this dyno, sample it, and publish one owner-bound observation."""
         now = timezone.now()
         # Reset per-cycle readiness so the own-member ZSCORE is recomputed once
         # per autoscale cycle, not per reader.
         self.__dict__.pop('index_ready', None)
-        # Use DYNO_ZOMBIE_THRESHOLD as the TTL so crashed dynos auto-expire before
-        # the zombie detector fires — prevents stale memory keys from blocking downscale.
         ttl = int(getattr(settings, 'DYNO_ZOMBIE_THRESHOLD', 24 * 60 * 60))
-        cache.set(f'heroku:dyno_alive:{self.dyno_name}', now, timeout=ttl)
-        _update_dyno_registry(self.app_name, self.dyno_name, now.timestamp())
+        alive_ttl = _dyno_alive_ttl(ttl)
+        check_in_epoch = now.timestamp()
+        claimed, score = self._claim_current_dyno(check_in_epoch, alive_ttl)
+        if not claimed:
+            return 'claim_failed'
 
-        # Publish per-dyno metrics so siblings can gate formation-wide decisions.
-        mem = self.current_memory_usage
-        if mem is not None:
-            cache.set(f'heroku:dyno_memory:{self.dyno_name}', mem, timeout=ttl)
-            self.record_memory_reading(mem)
-            cache.set(
-                f'heroku:dyno_memory_stable:{self.dyno_name}',
-                self.is_memory_stabilized, timeout=ttl,
+        self.__dict__['_strict_observation_logs'] = _STRICT_LOGS_UNSET
+        memory_reading = None
+        load = None
+        try:
+            try:
+                memory_reading = self.memory_reading_for_observation
+            except Exception:
+                logger.warning(
+                    "Failed to read memory telemetry for %s/%s; leaving memory unknown.",
+                    self.app_name, self.dyno_name, exc_info=True,
+                )
+            mem = memory_reading.value if memory_reading is not None else None
+            if not _is_finite_number(mem, positive=True):
+                mem = None
+            stable = False
+            if mem is not None:
+                try:
+                    stable = self.record_memory_reading(
+                        mem=mem,
+                        source_epoch=memory_reading.source_epoch,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to update memory history for %s/%s; publishing an unstable sample.",
+                        self.app_name, self.dyno_name, exc_info=True,
+                    )
+
+            try:
+                load = self.load_1min_for_observation
+            except Exception:
+                logger.warning(
+                    "Failed to read load telemetry for %s/%s; leaving load unknown.",
+                    self.app_name, self.dyno_name, exc_info=True,
+                )
+            if not _is_finite_number(load):
+                load = None
+        finally:
+            self.__dict__.pop('_strict_observation_logs', None)
+
+        try:
+            memory_veto = self._current_memory_pressure_veto()
+        except Exception:
+            memory_veto = True
+            logger.warning(
+                "Could not read the memory-pressure veto for %s/%s; publishing unstable.",
+                self.app_name, self.dyno_name, exc_info=True,
             )
-        load = self.avg_load_1min
-        if load is not None:
-            cache.set(f'heroku:dyno_load:{self.dyno_name}', load, timeout=ttl)
+        if memory_veto is not None:
+            stable = False
 
-    def remove_dyno_from_alive_cache(self, dyno_name=None):
-        dyno_name = dyno_name or self.dyno_name
-        for prefix in self._DYNO_CACHE_PREFIXES:
-            cache.delete(f'heroku:dyno_{prefix}:{dyno_name}')
-        _update_dyno_registry(self.app_name, dyno_name)
-
-    def _iter_sibling_values(self, metric):
-        """Yield ``(dyno_name, value)`` for each sibling's published metric.
-
-        ``metric`` is the cache key infix, e.g. ``'memory'`` or ``'load'``.
-        Only siblings of the same formation are returned (own dyno is skipped).
-
-        Phase C: the app ZSET is the only member list.  Members come from one
-        bounded ZRANGEBYSCORE and values are batched with MGET; an uncertain
-        read yields nothing, because a reader that cannot list the fleet must
-        not present a partial answer as a full one.
-        """
-        cutoff = _stale_cutoff()
-        adapter = _IndexAdapter(self.app_name)
-        members = adapter.fresh_members(cutoff)
-        if members is None:
-            return  # uncertain member read → yield nothing, never a partial fleet
-        members = [
-            m for m in members
-            if m.startswith(f'{self.formation_name}.') and m != self.dyno_name
+        values = [
+            (_observation_key(self.app_name, self.dyno_name), _DynoObservation(
+                check_in_epoch, mem, stable, load,
+            ), ttl),
+            (f'heroku:dyno_alive:{self.dyno_name}', now, alive_ttl),
+            (f'heroku:dyno_memory:{self.dyno_name}', mem, ttl),
+            (f'heroku:dyno_memory_stable:{self.dyno_name}', stable if mem is not None else None, ttl),
+            (f'heroku:dyno_load:{self.dyno_name}', load, ttl),
         ]
-        keys = [f'heroku:dyno_{metric}:{m}' for m in members]
-        values = adapter.mget(keys) if keys else []
-        if values is None:
-            return
-        for member, value in zip(members, values):
-            if value is not None:
-                yield member, value
+        adapter = _IndexAdapter(self.app_name, primary=True)
+        status = adapter.publish_owned_values(
+            self.dyno_name,
+            self._dyno_owner_token,
+            score,
+            values,
+            observation_memory=mem,
+            observation_epoch=(
+                memory_reading.source_epoch
+                if memory_reading is not None else None
+            ),
+        )
+        if status == 'published':
+            return status
+        if status in ('owner_mismatch', 'contended'):
+            owner_status, current_owner, _ = adapter.get_owner_and_score(self.dyno_name)
+            if (
+                owner_status == 'missing'
+                or (owner_status == 'found' and current_owner != self._dyno_owner_token)
+            ):
+                self._dyno_owner_fenced = True
+                logger.warning(
+                    "Dyno ownership for %s/%s changed during sampling; this process is fenced until restart.",
+                    self.app_name, self.dyno_name,
+                )
+            else:
+                logger.warning(
+                    "Observation publication for %s/%s did not win its ownership check; strict readers remain closed.",
+                    self.app_name, self.dyno_name,
+                )
+        elif status == 'memory_pressure':
+            logger.warning(
+                "Memory-pressure veto remains for %s/%s; the pre-nudge observation was not replaced.",
+                self.app_name, self.dyno_name,
+            )
+        else:
+            logger.warning(
+                "Failed to publish the observation for %s/%s; strict readers remain closed.",
+                self.app_name, self.dyno_name,
+            )
+        return status
+
+    def remove_dyno_from_alive_cache(self, dyno_name=None, expected_owner=None, expected_score=None):
+        """Remove only the dyno incarnation that still matches the captured owner."""
+        dyno_name = dyno_name or self.dyno_name
+        if not self.app_name or not dyno_name:
+            return False
+        if self.remote_monitoring and dyno_name == self.dyno_name:
+            return False
+        if dyno_name == self.dyno_name:
+            owner = expected_owner or self._dyno_owner_token
+            score = expected_score if expected_score is not None else getattr(self, '_last_registered_score', None)
+        else:
+            owner = expected_owner
+            score = expected_score
+            if owner is None or score is None:
+                status, owner, score = _IndexAdapter(
+                    self.app_name, primary=True,
+                ).get_owner_and_score(dyno_name)
+                if status != 'found':
+                    return False
+        if owner is None or score is None:
+            return False
+        keys = [_observation_key(self.app_name, dyno_name)]
+        keys.extend(f'heroku:dyno_{prefix}:{dyno_name}' for prefix in self._DYNO_CACHE_PREFIXES)
+        keys.append(_dyno_memory_veto_key(self.app_name, dyno_name))
+        status = _IndexAdapter(self.app_name, primary=True).delete_owned_dyno(
+            dyno_name, owner, score, keys,
+        )
+        if status == 'deleted':
+            return True
+        if status == 'unavailable':
+            logger.warning(
+                "Could not remove the owned dyno record for %s/%s.",
+                self.app_name, dyno_name, exc_info=True,
+            )
+        return False
+
+    def _sibling_values(self, metric, *, primary=False):
+        """Read a formation's sibling metrics. None means the read is uncertain."""
+        adapter = _IndexAdapter(self.app_name, primary=primary)
+        try:
+            members = adapter.fresh_members(_stale_cutoff())
+            if members is None or (primary and self.dyno_name not in members):
+                return None
+            prefix = f'{self.formation_name}.'
+            siblings = [member for member in members if member.startswith(prefix) and member != self.dyno_name]
+            if not siblings:
+                return []
+            values = adapter.mget([f'heroku:dyno_{metric}:{member}' for member in siblings])
+            if values is None or len(values) != len(siblings):
+                return None
+            readings = []
+            for member, value in zip(siblings, values):
+                if _is_finite_number(value):
+                    readings.append((member, value))
+                elif primary:
+                    return None
+            return readings
+        except Exception:
+            logger.warning("Could not read sibling %s metrics for %s.", metric, self.formation_name, exc_info=True)
+            return None
+
+    def _formation_observation_snapshot(self):
+        """Read one scored formation roster and one consistent observation batch."""
+        adapter = _IndexAdapter(self.app_name, primary=True)
+        cutoff = _stale_cutoff()
+        try:
+            scored_members = adapter.fresh_scored_members(cutoff)
+            if scored_members is None:
+                return None
+            prefix = f'{self.formation_name}.'
+            roster = tuple(
+                (member, float(score))
+                for member, score in scored_members
+                if member.startswith(prefix)
+            )
+            if not roster or self.dyno_name not in {member for member, _ in roster}:
+                return None
+            owner_keys = []
+            observation_keys = []
+            contention_keys = []
+            veto_keys = []
+            for member, _ in roster:
+                owner_keys.append(_dyno_owner_key(self.app_name, member))
+                observation_keys.append(
+                    _observation_key(self.app_name, member),
+                )
+                contention_keys.append(
+                    _dyno_contention_key(self.app_name, member),
+                )
+                veto_keys.append(_dyno_memory_veto_key(self.app_name, member))
+            keys = []
+            for owner_key, observation_key in zip(
+                owner_keys, observation_keys,
+            ):
+                keys.extend([owner_key, observation_key])
+            values = adapter.mget(keys)
+            if values is None or len(values) != len(keys):
+                return None
+            contention_count = adapter.exists(contention_keys)
+            veto_count = adapter.exists(veto_keys)
+            if (
+                contention_count is None
+                or veto_count is None
+                or contention_count
+                or veto_count
+            ):
+                return None
+            observations = {}
+            owners = {}
+            for index, (member, score) in enumerate(roster):
+                owner = values[index * 2]
+                value = values[index * 2 + 1]
+                if not isinstance(owner, str) or not owner:
+                    return None
+                if not isinstance(value, (tuple, list)) or len(value) != 4:
+                    return None
+                epoch, memory_mb, stable, load_1m = value
+                if (
+                    not _is_finite_number(epoch)
+                    or epoch != score
+                    or not isinstance(stable, bool)
+                ):
+                    return None
+                observations[member] = _DynoObservation(
+                    epoch,
+                    memory_mb if _is_finite_number(memory_mb, positive=True) else None,
+                    stable,
+                    load_1m if _is_finite_number(load_1m) else None,
+                )
+                owners[member] = owner
+            return roster, observations, cutoff, owners
+        except Exception:
+            logger.warning(
+                "Could not read scored formation observations for %s.",
+                self.formation_name, exc_info=True,
+            )
+            return None
+
+    def _formation_observation_snapshot_current(self, snapshot):
+        """Re-read membership and degradation state before a destructive resize."""
+        roster, _, cutoff, expected_owners = snapshot
+        if _registry_degraded(self):
+            return False
+        adapter = _IndexAdapter(self.app_name, primary=True)
+        try:
+            status, current_owners, contentions, degraded = (
+                adapter.read_formation_validation_state(
+                    f'{self.formation_name}.', _stale_cutoff(), roster,
+                )
+            )
+            if status != 'ok' or degraded:
+                return False
+            return all(
+                isinstance(owner, str)
+                and owner
+                and owner == expected_owners.get(member)
+                and contention is None
+                for (member, _), owner, contention in zip(
+                    roster, current_owners, contentions,
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Could not re-read scored formation observations for %s.",
+                self.formation_name, exc_info=True,
+            )
+            return False
+
+    def _normal_memory_snapshot_allows_downscale(self, snapshot, threshold):
+        if not threshold or math.isinf(threshold):
+            return False
+        _, observations, _, _ = snapshot
+        own = observations[self.dyno_name]
+        if own.memory_mb is None or own.memory_mb >= threshold:
+            return False
+        for member, observation in observations.items():
+            if observation.memory_mb is None:
+                return False
+            if (member != self.dyno_name and observation.memory_mb >= threshold
+                    and not observation.stable):
+                return False
+        return True
+
+    def _stability_snapshot_allows_downscale(self, snapshot, threshold):
+        if (
+            self.is_on_original_formation_size_or_lower
+            or not threshold
+            or math.isinf(threshold)
+        ):
+            return False
+        _, observations, _, _ = snapshot
+        own = observations[self.dyno_name]
+        if own.memory_mb is None or own.load_1m is None or not own.stable:
+            return False
+        load_threshold = getattr(settings, 'DYNO_STABILITY_LOAD_THRESHOLD', 1.0)
+        for member, observation in observations.items():
+            if observation.memory_mb is None or observation.load_1m is None:
+                return False
+            if observation.load_1m >= load_threshold:
+                return False
+            if (member != self.dyno_name and observation.memory_mb >= threshold
+                    and not observation.stable):
+                return False
+        return True
 
     @property
     def any_sibling_still_high_memory(self):
@@ -1405,26 +3271,21 @@ class HerokuDyno:
         whole formation while a sibling is still running hot.
         """
         threshold = self._downscale_memory_threshold
-        if not threshold:
+        if not threshold or math.isinf(threshold):
             return False
-        for sibling_name, sibling_mem in self._iter_sibling_values('memory'):
-            if sibling_mem >= threshold:
-                # If the sibling's memory has also stabilized (RSS plateau),
-                # it won't drop further — only a restart will reclaim it.
-                # Don't block formation downscale in that case.
-                sibling_stable = cache.get(f'heroku:dyno_memory_stable:{sibling_name}')
-                if sibling_stable:
-                    logger.debug(
-                        f"Sibling {sibling_name} at {sibling_mem:.0f}MB >= "
-                        f"{threshold:.0f}MB but memory stabilized; not blocking downscale."
-                    )
-                    continue
-                logger.debug(
-                    f"Sibling {sibling_name} at {sibling_mem:.0f}MB >= "
-                    f"{threshold:.0f}MB threshold; blocking {self.formation_name} downscale."
-                )
-                return True
-        return False
+        snapshot = self._formation_observation_snapshot()
+        if snapshot is None:
+            return True
+        _, observations, _, _ = snapshot
+        if any(observation.memory_mb is None for observation in observations.values()):
+            return True
+        hot_siblings = [
+            observation for member, observation in observations.items()
+            if member != self.dyno_name and observation.memory_mb >= threshold
+        ]
+        if any(not observation.stable for observation in hot_siblings):
+            return True
+        return not self._formation_observation_snapshot_current(snapshot)
 
     @property
     def any_sibling_requires_upscale(self):
@@ -1433,7 +3294,7 @@ class HerokuDyno:
         on behalf of a hot sibling whose autoscale thread may have stalled."""
         upscale_pct = getattr(settings, 'UPSCALE_PERCENTAGE_HIGH_MEM_USE', 80)
         threshold_mb = self.available_memory * upscale_pct / 100
-        for sibling_name, sibling_mem in self._iter_sibling_values('memory'):
+        for sibling_name, sibling_mem in self._sibling_values('memory') or ():
             if sibling_mem > threshold_mb:
                 logger.info(
                     f"Sibling {sibling_name} at {sibling_mem:.0f}MB > "
@@ -1453,28 +3314,23 @@ class HerokuDyno:
         (formation resize restarts all dynos).  Gate the stability-based
         downscale on this check to let heavy tasks finish first.
         """
-        # Phase B: formation-idle authorizes a destructive downscale, so it
-        # requires runtime index readiness; flag false/absent fails closed.
         if _index_fail_closed(self):
             return False
-        threshold = getattr(settings, 'DYNO_STABILITY_LOAD_THRESHOLD', 1.0)
-        # Check own load
-        own_load = self.avg_load_1min
-        if own_load is not None and own_load >= threshold:
-            logger.debug(
-                f"[{self.formation_name}] Own load {own_load:.2f} >= "
-                f"{threshold:.1f}; formation not idle."
-            )
+        snapshot = self._formation_observation_snapshot()
+        if snapshot is None:
             return False
-        # Check sibling loads
-        for sibling_name, sibling_load in self._iter_sibling_values('load'):
-            if sibling_load >= threshold:
+        threshold = getattr(settings, 'DYNO_STABILITY_LOAD_THRESHOLD', 1.0)
+        _, observations, _, _ = snapshot
+        for member, observation in observations.items():
+            if observation.load_1m is None:
+                return False
+            if observation.load_1m >= threshold:
                 logger.debug(
-                    f"[{self.formation_name}] Sibling {sibling_name} load "
-                    f"{sibling_load:.2f} >= {threshold:.1f}; formation not idle."
+                    f"[{self.formation_name}] {member} load "
+                    f"{observation.load_1m:.2f} >= {threshold:.1f}; formation not idle."
                 )
                 return False
-        return True
+        return self._formation_observation_snapshot_current(snapshot)
 
     def check_for_sibling_zombie_dynos(self):
         """
@@ -1485,27 +3341,31 @@ class HerokuDyno:
         one; no compatibility SCAN remains.  Stale members are evaluated for
         zombie restart BEFORE the one
         bounded ZREMRANGEBYSCORE prune, which runs only when that evaluation
-        completes; uncertain stale reads skip the prune.  One cutoff is shared
-        by the stale evaluation and the prune, so no member at the boundary is
-        pruned unevaluated.
+        completes; uncertain stale reads skip the prune. Restart evaluation
+        uses the zombie threshold, while pruning waits for the longer heartbeat
+        grace so a contested restart survives for the next scan.
         Gracefully removed dynos stay absent (ZREM); missing alive values are
         skipped.  Destructive restart requires readiness; otherwise the check
         prunes once and returns.
         """
         # Make sure only one dyno is checking for zombie dynos at a time
-        zombie_threshold = getattr(settings, 'DYNO_ZOMBIE_THRESHOLD', 24 * 60 * 60)
+        zombie_threshold = int(
+            getattr(settings, 'DYNO_ZOMBIE_THRESHOLD', 24 * 60 * 60)
+        )
         try:
             with cache.lock('heroku:lock:dyno_alive_check', expire=30):
-                cutoff = _stale_cutoff()
+                now_epoch = time.time()
+                cutoff = now_epoch - zombie_threshold
+                prune_cutoff = now_epoch - _dyno_alive_ttl(zombie_threshold)
                 if _index_fail_closed(self):
-                    self.prune_stale_index_members(cutoff)
+                    self.prune_stale_index_members(prune_cutoff)
                     return
                 adapter = self._zombie_adapter()
                 if not self._evaluate_zombies(
                     adapter, adapter.stale_members(cutoff), zombie_threshold,
                 ):
                     return  # uncertain stale read: no restart, no prune
-                self.prune_stale_index_members(cutoff)
+                self.prune_stale_index_members(prune_cutoff)
                 self._evaluate_zombies(adapter, adapter.fresh_members(cutoff), zombie_threshold)
         except _LockExpiryErrors:
             logger.warning("Lock 'heroku:lock:dyno_alive_check' expired before release.")
@@ -1533,11 +3393,11 @@ class HerokuDyno:
                 continue
             last_checkin_seconds_ago = (timezone.now() - last_checkin).total_seconds()
             if last_checkin_seconds_ago > zombie_threshold:
-                logger.error(
+                logger.warning(
                     f"Zombie dyno detected: {member}. Last check-in: "
-                    f"{last_checkin_seconds_ago // 60:.0f} minutes ago. Restarting..."
+                    f"{last_checkin_seconds_ago // 60:.0f} minutes ago."
                 )
-                self.restart_zombie_dyno(member)
+                self.restart_zombie_dyno(member, zombie_threshold)
         return True
 
     def prune_stale_index_members(self, cutoff=None):
@@ -1546,9 +3406,8 @@ class HerokuDyno:
         Must run under the zombie-check lock (callers hold it).  Never prunes
         member-by-member; a single range removal keeps cleanup O(log N).
         ``cutoff`` defaults to a fresh ``_stale_cutoff()`` when not supplied,
-        preserving all other callers; the zombie check passes the same cutoff
-        used for stale-member evaluation so boundary members are never pruned
-        unevaluated.
+        preserving all other callers; the zombie check passes the longer
+        heartbeat cutoff so a contested member survives the next retry scan.
         """
         try:
             _IndexAdapter(self.app_name).zremrangebyscore('-inf', cutoff if cutoff is not None else _stale_cutoff())
@@ -1558,14 +3417,39 @@ class HerokuDyno:
                 self.app_name, exc_info=True,
             )
 
-    def restart_zombie_dyno(self, dyno_name):
-        self.restart_dyno(dyno_name)
+    def restart_zombie_dyno(self, dyno_name, zombie_threshold=None):
+        """Revalidate stale liveness on the primary before restart dispatch."""
+        threshold = (
+            getattr(settings, 'DYNO_ZOMBIE_THRESHOLD', 24 * 60 * 60)
+            if zombie_threshold is None else zombie_threshold
+        )
+        if self._stale_zombie_evidence(dyno_name, threshold) is None:
+            return False
+        return self.restart_dyno(
+            dyno_name,
+            zombie_threshold=threshold,
+        )
+
+    def _stale_zombie_evidence(self, dyno_name, threshold):
+        """Return owner and score when bounded stale-heartbeat evidence remains."""
+        status, owner, score, alive = _IndexAdapter(
+            self.app_name, primary=True,
+        ).read_owned_liveness(dyno_name)
+        if status not in ('found', 'owner_expired') or not isinstance(alive, datetime):
+            return None
+        seconds_ago = (timezone.now() - alive).total_seconds()
+        if seconds_ago <= threshold:
+            return None
+        return owner, score
 
 
     def upscale_formation_to_next_level(self):
         '''
         Upscale the dyno to the next level in the hierarchy for a period of X hours
         '''
+        if self._defer_resize_for_retiring_dyno('upscale'):
+            return
+
         # Check if not already at max_dyno_size
         if self.formation_size == self.max_dyno_size:
             logger.debug(f"Formation {self.formation_name} is already at max size {self.max_dyno_size}.")
@@ -1595,23 +3479,58 @@ class HerokuDyno:
                 f"allowing chain upscale to next tier."
             )
 
+        diagnostic_message = None
+        if not self.remote_monitoring:
+            memory_usage = self.current_memory_usage
+            available_memory = self.available_memory
+            memory_percentage = (
+                round(memory_usage / available_memory * 100, 2)
+                if memory_usage and available_memory else 0.0
+            )
+            diagnostic_message = (
+                f"Memory usage is greater than {memory_percentage:.2f}% of "
+                f"available RAM ({available_memory}MB). Current memory usage: "
+                f"{memory_usage:.2f}MB. Triggered by dyno {self.dyno_name}"
+            )
+
         # Ensure upscale is only executed once every settings.DYNO_TIME_BETWEEN_SCALES seconds for this dyno type
         _lock_proceed = True
         try:
             with cache.lock(self.upscaling_cache_key, expire=30):
-                if self.is_upscaling:
+                if self._defer_resize_for_retiring_dyno('upscale'):
+                    _lock_proceed = False
+                elif self.is_upscaling:
                     logger.debug(f"Upscaling formation {self.formation_name} is already in progress.")
                     _lock_proceed = False
                 else:
-                    self.set_upscaling()
+                    if self.remote_monitoring:
+                        self.set_upscaling()
+                    else:
+                        status = _IndexAdapter(
+                            self.app_name, primary=True,
+                        ).reserve_owned_flag(
+                            self.upscaling_cache_key,
+                            self.dyno_name,
+                            self._dyno_owner_token,
+                            True,
+                            settings.DYNO_TIME_BETWEEN_SCALES + 150,
+                            formation_name=self.formation_name,
+                            expected_formation_size=self.formation_size,
+                        )
+                        if status != 'reserved':
+                            logger.info(
+                                "Skipping upscale for %s/%s without a current owner reservation: %s.",
+                                self.app_name, self.dyno_name, status,
+                            )
+                            _lock_proceed = False
         except _LockExpiryErrors:
             logger.warning(f"Lock '{self.upscaling_cache_key}' expired before release.")
+            _lock_proceed = False
         if not _lock_proceed:
             return
 
-        if not self.remote_monitoring:
-            logger.warning(f"Memory usage is greater than {self.current_memory_usage_percentage:.2f}% of available RAM ({self.available_memory}MB). "
-                            f"Current memory usage: {self.current_memory_usage:.2f}MB. Triggered by dyno {self.dyno_name}")
+        if diagnostic_message is not None:
+            logger.warning(diagnostic_message)
 
         next_level = self.next_formation_size
         if not next_level:
@@ -1645,46 +3564,93 @@ class HerokuDyno:
             self.clear_upscaling()
             self._log_api_failure(f"Failed to upscale formation {self.formation_name}", response)
 
+    def downscale_formation_if_allowed(self, *, on_shutdown=False):
+        """Evaluate one policy decision and carry its snapshot into the mutation."""
+        if _index_fail_closed(self) or self.requires_upscale:
+            return False
+        queue_allowed = (
+            True if on_shutdown
+            else (self.downscale_on_non_empty_queue or self.no_tasks_in_queue)
+        )
+        decision = self._evaluate_downscale_snapshot(queue_allowed=queue_allowed)
+        if decision.snapshot is None or not (decision.normal or decision.stability):
+            return False
+        self.downscale_formation_to_original_size(decision=decision)
+        return True
+
     def check_and_downscale_to_original_formation_size(self):
         """
         Checks if formation should be downscaled by checking memory usage and downscale if necessary
         """
         # Check if formation is upscaled and if it should be downscaled
         check_interval = getattr(settings, 'DYNO_DOWNSCALE_CHECK_INTERVAL', 300)
-        upscaled_until = cache.get(self.upscale_until_cache_key)
-        if upscaled_until:
+        adapter = _IndexAdapter(self.app_name, primary=True)
+        captured = adapter.capture_formation_cleanup_state(self.formation_name)
+        if captured is None:
+            logger.warning(
+                "Skipping downscale check for %s/%s without a readable "
+                "primary formation state.",
+                self.app_name, self.formation_name,
+            )
+            return
+        try:
+            upscaled_until = adapter.decode_upscale_timer(captured[2])
+        except Exception:
+            logger.warning(
+                "Skipping downscale check for %s/%s with an invalid upscale "
+                "timer.",
+                self.app_name, self.formation_name,
+            )
+            return
+        if captured[2] is not None:
             # If the formation is already back at (or below) its original size,
             # any upscale_until key is a phantom artifact — e.g. from a sibling
             # that downscaled in the gap between an upscale API call and its
             # cache.set().  Clear it so the autoscaler can resume normal
             # R14/R15 detection instead of looping in the "Extending..." path.
-            if self.is_on_original_formation_size_or_lower:
+            cleanup_status = adapter.clear_formation_if_at_or_below(
+                self.formation_name,
+                self.formation_size,
+                captured=captured,
+            )
+            if cleanup_status == 'cleared':
                 logger.info(
                     f"Cleared phantom upscale state for {self.formation_name}: "
                     f"formation is already at original size {self.formation_size}."
                 )
-                self.clear_original_formation_size()
                 # Fall through to the R14 restart check below
-            else:
+            elif cleanup_status in ('not_at_or_below', 'no_baseline'):
+                if cleanup_status == 'no_baseline':
+                    logger.info(
+                        "No recorded baseline for %s/%s; keeping the live "
+                        "upscale timer and using the previous tier.",
+                        self.app_name, self.formation_name,
+                    )
                 current_ttl = cache.ttl(self.upscale_until_cache_key)
                 # Only allow downscale once we are within the final check_interval window.
                 # Before that, keep the formation upscaled regardless of current memory —
                 # this prevents an immediate downscale after an R15 restart clears memory.
                 if current_ttl < check_interval:
-                    if self.allow_downscale:
-                        self.downscale_formation_to_original_size()
-                        return
-                    # Near expiry and not safe to downscale.
-                    # If stability-eligible, downscale directly — a restart alone
-                    # won't free RSS; the formation resize triggers a fresh
-                    # restart on the smaller tier.
-                    if self._is_stability_eligible:
-                        logger.info(
-                            f"[{self.formation_name}] Memory stabilized at "
-                            f"{self.current_memory_usage:.0f}MB near timer expiry — "
-                            f"forcing downscale (restart alone won't reclaim RSS)."
+                    if _index_fail_closed(self) or self.requires_upscale:
+                        decision = _DownscaleDecision(False, False, None, None)
+                    else:
+                        queue_allowed = self.downscale_on_non_empty_queue or self.no_tasks_in_queue
+                        decision = self._evaluate_downscale_snapshot(
+                            queue_allowed=queue_allowed,
+                            stability_ignores_queue=True,
                         )
-                        self.downscale_formation_to_original_size()
+                    if decision.normal or decision.stability:
+                        if decision.stability and not decision.normal:
+                            logger.info(
+                                f"[{self.formation_name}] Memory stabilized at "
+                                f"{self.current_memory_usage:.0f}MB near timer expiry — "
+                                f"forcing downscale (restart alone won't reclaim RSS)."
+                            )
+                        self.downscale_formation_to_original_size(
+                            decision=decision,
+                            expected_upscale_timer_raw=captured[2],
+                            expected_cleanup_capture=captured,
+                        )
                         return
                     # Otherwise restart if hot, or extend the timer
                     if ((self.detected_r14 and not self.detected_r15) or self.is_still_high_memory_usage_for_downscale) and self.no_tasks_in_queue:
@@ -1702,6 +3668,13 @@ class HerokuDyno:
                         new_until = upscaled_until + timedelta(seconds=check_interval)
                         new_timeout = current_ttl + check_interval
                         cache.set(self.upscale_until_cache_key, new_until, timeout=new_timeout)
+                return
+            else:
+                logger.warning(
+                    "Skipping phantom cleanup for %s/%s without a stable "
+                    "primary state: %s.",
+                    self.app_name, self.formation_name, cleanup_status,
+                )
                 return
 
         # if on original formation size and memory usage is high, restart the dyno
@@ -1723,52 +3696,348 @@ class HerokuDyno:
             not self.is_on_original_formation_size_or_lower
             and not (self.previous_formation_size is None and not self.original_formation_size)
         )
-        if can_be_upscaled and not self.allow_downscale:
-            delta = getattr(settings, 'DYNO_DOWNSCALE_CHECK_INTERVAL', 300)
-            new_until = timezone.now() + timedelta(seconds=delta)
-            cache.set(self.upscale_until_cache_key, new_until, timeout=delta)
-            logger.warning(
-                f"upscale_until key expired for {self.formation_name} but allow_downscale "
-                f"is False (memory still high or R14 active). Restoring upscale timer for "
-                f"{delta}s. Memory: {self.current_memory_usage:.0f}MB."
+        if can_be_upscaled:
+            queue_allowed = self.downscale_on_non_empty_queue or self.no_tasks_in_queue
+            decision = self._evaluate_downscale_snapshot(queue_allowed=queue_allowed)
+            if not (decision.normal or decision.stability):
+                delta = getattr(settings, 'DYNO_DOWNSCALE_CHECK_INTERVAL', 300)
+                new_until = timezone.now() + timedelta(seconds=delta)
+                cache.set(self.upscale_until_cache_key, new_until, timeout=delta)
+                logger.warning(
+                    f"upscale_until key expired for {self.formation_name} but allow_downscale "
+                    f"is False (memory still high or R14 active). Restoring upscale timer for "
+                    f"{delta}s. Memory: {self.current_memory_usage:.0f}MB."
+                )
+                return
+            self.downscale_formation_to_original_size(
+                decision=decision,
+                expected_upscale_timer_raw=captured[2],
+                expected_cleanup_capture=captured,
             )
             return
 
-        # Downscale formation to original size as there is no need to keep it upscaled
-        self.downscale_formation_to_original_size()
+        # Preserve the existing no-op cleanup when the formation is already at
+        # or below its recorded original size.
+        self.downscale_formation_to_original_size(
+            expected_cleanup_capture=captured,
+        )
 
-    def downscale_formation_to_original_size(self):
+    def downscale_formation_to_original_size(
+        self, *, decision=None,
+        expected_upscale_timer_raw=_UPSCALE_TIMER_UNBOUND,
+        expected_cleanup_capture=None,
+    ):
+        if self._defer_resize_for_retiring_dyno('downscale'):
+            return
+
         if self.previous_formation_size is None:
             return
 
-        original_formation_size = self.original_formation_size
-
-        # If original size is not set, fall back to previous tier so the
-        # formation can still recover from a lost baseline (e.g. Redis eviction).
-        if not original_formation_size:
-            original_formation_size = self.previous_formation_size
-            if not original_formation_size:
+        adapter = _IndexAdapter(self.app_name, primary=True)
+        if decision is None and expected_cleanup_capture is not None:
+            cleanup_capture = tuple(expected_cleanup_capture)
+            if len(cleanup_capture) != 3:
+                logger.warning(
+                    "Skipping scheduled cleanup for %s/%s without a "
+                    "complete primary capture.",
+                    self.app_name, self.formation_name,
+                )
                 return
-            logger.info(
-                f"No original formation size for {self.formation_name}, "
-                f"using previous tier {original_formation_size} as downscale target."
+            try:
+                with cache.lock(self.downscale_cache_key, expire=30):
+                    if self._defer_resize_for_retiring_dyno('downscale'):
+                        return
+                    if self.is_downscaling:
+                        logger.debug(
+                            "Downscale for %s is already reserved.",
+                            self.formation_name,
+                        )
+                        return
+                    cleanup_status = adapter.clear_formation_if_at_or_below(
+                        self.formation_name,
+                        self.formation_size,
+                        captured=cleanup_capture,
+                    )
+                    if cleanup_status == 'cleared':
+                        logger.debug(
+                            "Formation %s is already at or below its "
+                            "original size.", self.formation_name,
+                        )
+                    elif cleanup_status == 'no_baseline':
+                        logger.info(
+                            "Skipping scheduled cleanup for %s/%s after a "
+                            "genuine baseline miss.",
+                            self.app_name, self.formation_name,
+                        )
+                    else:
+                        logger.warning(
+                            "Skipping scheduled cleanup for %s/%s without "
+                            "an unchanged primary state: %s.",
+                            self.app_name, self.formation_name, cleanup_status,
+                        )
+            except _LockExpiryErrors:
+                logger.warning(
+                    f"Lock '{self.downscale_cache_key}' expired before release."
+                )
+            return
+
+        raw_target = None
+        target_from_decision = (
+            decision is not None and decision.target_size is not None
+        )
+        if target_from_decision:
+            original_formation_size = decision.target_size
+        else:
+            target_status, original_formation_size, raw_target = (
+                adapter.read_downscale_target(
+                    self.formation_name, self.formation_size,
+                )
             )
+            if target_status not in ('found', 'miss'):
+                logger.warning(
+                    "Skipping downscale for %s/%s without a usable baseline: %s.",
+                    self.app_name, self.formation_name, target_status,
+                )
+                return
+            if target_status == 'miss':
+                logger.info(
+                    f"No original formation size for {self.formation_name}, "
+                    f"using previous tier {original_formation_size} as downscale target."
+                )
+
+        if target_from_decision and self.remote_monitoring:
+            # The remote reservation compares the raw baseline. A carried
+            # decision must re-read it and prove it still resolves to the
+            # target the decision used.
+            baseline_status, baseline_target, raw_target = (
+                adapter.read_downscale_target(
+                    self.formation_name, self.formation_size,
+                )
+            )
+            if (
+                baseline_status not in ('found', 'miss')
+                or baseline_target != original_formation_size
+            ):
+                logger.warning(
+                    "Skipping remote downscale for %s/%s without a current "
+                    "baseline target: %s.",
+                    self.app_name, self.formation_name,
+                    baseline_status,
+                )
+                return
+
+        remote_formation_raw = None
+        effective_current_size = self.formation_size
+        if self.remote_monitoring:
+            tier_status, effective_current_size, remote_formation_raw = (
+                adapter.read_formation_size_raw(
+                    self.formation_name, self.formation_size,
+                )
+            )
+            if tier_status == 'unavailable':
+                logger.warning(
+                    "Skipping remote downscale for %s/%s without a usable "
+                    "primary formation tier.",
+                    self.app_name, self.formation_name,
+                )
+                return
+
+        current_memory = DYNO_SIZES.get(effective_current_size, {}).get(
+            'memory', 0,
+        )
+        target_memory = DYNO_SIZES.get(original_formation_size, {}).get(
+            'memory', 0,
+        )
+        at_or_below_target = bool(
+            current_memory and target_memory and current_memory <= target_memory
+        )
+
+        # Managed local direct calls still get a fresh conservative decision.
+        # A remote operator keeps the prior explicit downscale entry point.
+        if (
+            decision is None
+            and not self.remote_monitoring
+            and not at_or_below_target
+        ):
+            queue_allowed = self.downscale_on_non_empty_queue or self.no_tasks_in_queue
+            decision = self._evaluate_downscale_snapshot(queue_allowed=queue_allowed)
+            if decision.snapshot is None or not (decision.normal or decision.stability):
+                return
+        if decision is not None and decision.target_size is not None:
+            original_formation_size = decision.target_size
+
+        requires_cleanup_capture = (
+            expected_cleanup_capture is not None
+            or (not self.remote_monitoring and decision is None)
+            or (self.remote_monitoring and at_or_below_target)
+        )
+        cleanup_capture = None
+        if requires_cleanup_capture:
+            if expected_cleanup_capture is not None:
+                cleanup_capture = tuple(expected_cleanup_capture)
+            else:
+                cleanup_capture = adapter.capture_formation_cleanup_state(
+                    self.formation_name,
+                )
+            if cleanup_capture is None:
+                logger.warning(
+                    "Skipping cleanup for %s/%s without a readable primary "
+                    "formation state.",
+                    self.app_name, self.formation_name,
+                )
+                return
+            if len(cleanup_capture) != 3:
+                logger.warning(
+                    "Skipping cleanup for %s/%s without a complete primary "
+                    "formation state.",
+                    self.app_name, self.formation_name,
+                )
+                return
+            if self.remote_monitoring and at_or_below_target:
+                if (
+                    cleanup_capture[0] != remote_formation_raw
+                    or cleanup_capture[1] != raw_target
+                ):
+                    logger.warning(
+                        "Skipping remote cleanup for %s/%s after the tier or "
+                        "baseline changed before capture.",
+                        self.app_name, self.formation_name,
+                    )
+                    return
 
         _lock_proceed = True
+        attempt_token = None
         try:
             with cache.lock(self.downscale_cache_key, expire=30):
-                # Check if formation is on lower size than original size and skip downscale
-                if self.is_on_original_formation_size_or_lower:
-                    logger.debug(f"Formation {self.formation_name} is already at original or lower size than the original size.")
-                    self.clear_original_formation_size()
+                if self._defer_resize_for_retiring_dyno('downscale'):
                     _lock_proceed = False
                 elif self.is_downscaling:
-                    # logger.info(f"Downscaling formation {self.formation_name} is already in progress.")
+                    logger.debug(
+                        "Downscale for %s is already reserved.", self.formation_name,
+                    )
+                    _lock_proceed = False
+                elif self.remote_monitoring:
+                    cleanup_status = 'not_at_or_below'
+                    if at_or_below_target:
+                        cleanup_status = adapter.clear_formation_if_at_or_below(
+                            self.formation_name,
+                            self.formation_size,
+                            captured=cleanup_capture,
+                            expected_upscale_timer_raw=(
+                                expected_upscale_timer_raw
+                            ),
+                        )
+                    if at_or_below_target:
+                        if cleanup_status == 'cleared':
+                            logger.debug(
+                                "Formation %s is already at or below its "
+                                "original size.", self.formation_name,
+                            )
+                        elif cleanup_status == 'no_baseline':
+                            logger.info(
+                                "Skipping remote scheduled downscale for "
+                                "%s/%s after a genuine baseline miss.",
+                                self.app_name, self.formation_name,
+                            )
+                        else:
+                            logger.warning(
+                                "Skipping remote scheduled downscale for "
+                                "%s/%s without an unchanged primary state: "
+                                "%s.", self.app_name, self.formation_name,
+                                cleanup_status,
+                            )
+                        _lock_proceed = False
+                    elif cleanup_status == 'not_at_or_below':
+                        attempt_token = str(uuid.uuid4())
+                        reservation_status = (
+                            adapter.reserve_remote_downscale_if_current(
+                                self.downscale_cache_key,
+                                attempt_token,
+                                settings.DYNO_TIME_BETWEEN_SCALES,
+                                formation_name=self.formation_name,
+                                expected_formation_raw=remote_formation_raw,
+                                expected_formation_size=effective_current_size,
+                                expected_original_raw=raw_target,
+                                expected_target_size=original_formation_size,
+                                expected_upscale_timer_raw=(
+                                    expected_upscale_timer_raw
+                                ),
+                                expected_cleanup_capture=(
+                                    expected_cleanup_capture
+                                ),
+                            )
+                        )
+                        if reservation_status != 'reserved':
+                            logger.info(
+                                "Skipping remote downscale for %s/%s without "
+                                "a current authorization: %s.",
+                                self.app_name, self.dyno_name,
+                                reservation_status,
+                            )
+                            _lock_proceed = False
+                    else:
+                        if cleanup_status == 'cleared':
+                            logger.debug(
+                                "Formation %s is already at or below its "
+                                "original size.", self.formation_name,
+                            )
+                        elif cleanup_status != 'not_at_or_below':
+                            logger.warning(
+                                "Skipping remote downscale for %s/%s without "
+                                "a stable at-or-below state: %s.",
+                                self.app_name, self.formation_name,
+                                cleanup_status,
+                            )
+                        _lock_proceed = False
+                elif decision is None:
+                    cleanup_status = adapter.clear_formation_if_at_or_below(
+                        self.formation_name,
+                        self.formation_size,
+                        captured=cleanup_capture,
+                    )
+                    if cleanup_status == 'cleared':
+                        logger.debug(
+                            "Formation %s is already at or below its original "
+                            "size.", self.formation_name,
+                        )
+                    elif cleanup_status != 'not_at_or_below':
+                        logger.warning(
+                            "Skipping cleanup for %s/%s without a stable "
+                            "at-or-below state: %s.",
+                            self.app_name, self.formation_name, cleanup_status,
+                        )
+                    _lock_proceed = False
+                elif decision.snapshot is None:
                     _lock_proceed = False
                 else:
-                    self.set_downscaling()
+                    attempt_token = str(uuid.uuid4())
+                    status = adapter.reserve_downscale_if_current(
+                        decision.snapshot,
+                        self.dyno_name,
+                        self._dyno_owner_token,
+                        self.downscale_cache_key,
+                        attempt_token,
+                        settings.DYNO_TIME_BETWEEN_SCALES,
+                        formation_name=self.formation_name,
+                        expected_formation_size=self.formation_size,
+                        expected_target_size=original_formation_size,
+                        cleanup_if_at_or_below=True,
+                        expected_upscale_timer_raw=(
+                            expected_upscale_timer_raw
+                        ),
+                        expected_cleanup_capture=expected_cleanup_capture,
+                    )
+                    if status == 'already_at_target':
+                        _lock_proceed = False
+                    elif status != 'reserved':
+                        logger.info(
+                            "Skipping downscale for %s/%s without a current authorization: %s.",
+                            self.app_name, self.dyno_name, status,
+                        )
+                        _lock_proceed = False
         except _LockExpiryErrors:
             logger.warning(f"Lock '{self.downscale_cache_key}' expired before release.")
+            _lock_proceed = False
         if not _lock_proceed:
             return
 
@@ -1785,8 +4054,13 @@ class HerokuDyno:
                 self.stop_continuous_autoscale()
         else:
             self._log_api_failure(f"Failed to downscale formation {self.formation_name}", response)
+            if self._definite_resize_rejection(response):
+                self.clear_downscaling(attempt_token)
 
-    def restart_dyno(self, dyno_name=None):
+    def restart_dyno(
+        self, dyno_name=None, *, expected_owner=None, expected_score=None,
+        zombie_threshold=None,
+    ):
         if not self.app_name or (not self.dyno_name and not dyno_name):
             return
 
@@ -1801,7 +4075,29 @@ class HerokuDyno:
                     logger.debug(f"Restarting dyno {dyno_name} is already in progress.")
                     _lock_proceed = False
                 else:
-                    cache.set(restart_cache_key, True, timeout=getattr(settings, 'DYNO_TIME_BETWEEN_RESTARTS', 300))
+                    if zombie_threshold is not None and dyno_name != self.dyno_name:
+                        evidence = self._stale_zombie_evidence(
+                            dyno_name, zombie_threshold,
+                        )
+                        if evidence is None:
+                            _lock_proceed = False
+                        else:
+                            expected_owner, expected_score = evidence
+                    elif dyno_name != self.dyno_name and (
+                        expected_owner is None or expected_score is None
+                    ):
+                        status, expected_owner, expected_score = _IndexAdapter(
+                            self.app_name, primary=True,
+                        ).get_owner_and_score(dyno_name)
+                        if status != 'found':
+                            expected_owner = None
+                            expected_score = None
+                    if _lock_proceed:
+                        cache.set(
+                            restart_cache_key,
+                            True,
+                            timeout=getattr(settings, 'DYNO_TIME_BETWEEN_RESTARTS', 300),
+                        )
         except _LockExpiryErrors:
             logger.warning(f"Lock '{restart_cache_key}' expired before release.")
         if not _lock_proceed:
@@ -1815,8 +4111,12 @@ class HerokuDyno:
 
             if dyno_name == self.dyno_name:
                 self.stop_continuous_autoscale()
-            else:
-                self.remove_dyno_from_alive_cache(dyno_name)
+            elif expected_owner is not None and expected_score is not None:
+                self.remove_dyno_from_alive_cache(
+                    dyno_name,
+                    expected_owner=expected_owner,
+                    expected_score=expected_score,
+                )
             return True
         self._log_api_failure(f"Failed to restart dyno {dyno_name}", response)
         return False
@@ -1867,7 +4167,9 @@ class HerokuDyno:
 
         return counter
 
-    def get_heroku_logs(self, source="heroku", date_from=None):
+    def get_heroku_logs(
+        self, source="heroku", date_from=None, *, strict_observation=False,
+    ):
         if not self.heroku_api_configured:
             if self.proxy.enabled:
                 logger.error("Cannot retrieve Heroku logs: proxy configuration is invalid (%s).",
@@ -1875,6 +4177,11 @@ class HerokuDyno:
             return None
 
         cache_key = f'heroku:logs:{self.app_name}:{self.dyno_name}'
+        dyno_id = self._verified_self_dyno_id
+        if dyno_id:
+            cache_key = f'{cache_key}:{dyno_id}'
+        if strict_observation:
+            cache_key = f'{cache_key}:strict:v1'
         logs = cache.get(cache_key)
         if not logs:
             try:
@@ -1915,6 +4222,16 @@ class HerokuDyno:
 
                         logs = log_response.text or "\n" # Ensure logs is not empty to not overload API
                         log_cache_ttl = getattr(settings, 'DYNO_LOGS_CACHE_DURATION', 90)
+                        if strict_observation:
+                            log_cache_ttl = min(
+                                int(log_cache_ttl),
+                                max(1, int(getattr(
+                                    settings, 'DYNO_GENERAL_CACHE_DURATION', 300,
+                                ))),
+                                max(1, int(getattr(
+                                    settings, 'DYNO_AUTOSCALE_INTERVAL', 30,
+                                ))),
+                            )
                         cache.set(cache_key, logs, timeout=log_cache_ttl)
             except _LockExpiryErrors:
                 logger.warning(f"Lock '{cache_key}' expired before release. Logs may already be cached.")
@@ -1941,15 +4258,33 @@ class HerokuDyno:
                     logger.error(f"Timestamp parsing failed: {e}")
                     continue
 
+                message = match.group("message")
+                source_dyno_name, source_dyno_id = _log_dyno_identity(message)
                 logs_parsed.append({
                     "timestamp": timestamp,
                     "dyno_name": match.group("dyno_name"),
-                    "message": match.group("message")
+                    "message": message,
+                    "source_dyno_name": source_dyno_name,
+                    "source_dyno_id": source_dyno_id,
                 })
 
         return logs_parsed
 
-    def extract_latest_metric(self, patterns, cache_key, timeout=None, result_type=float):
+    def extract_latest_metric(
+        self, patterns, cache_key, timeout=None, result_type=float,
+        require_fresh_source=False,
+    ):
+        """Return the latest metric value while preserving the scalar API."""
+        reading = self._extract_latest_metric_reading(
+            patterns, cache_key, timeout=timeout, result_type=result_type,
+            require_fresh_source=require_fresh_source,
+        )
+        return reading.value if reading is not None else None
+
+    def _extract_latest_metric_reading(
+        self, patterns, cache_key, timeout=None, result_type=float,
+        require_fresh_source=False,
+    ):
         """
         Generic helper to extract the latest occurrence of a specified metric from Heroku logs.
         Handles multiple patterns and ensures there is some value at all times.
@@ -1959,6 +4294,9 @@ class HerokuDyno:
             cache_key (str): The cache key to store the latest value.
             timeout (int): Cache timeout in seconds. Defaults to 24 hours.
             result_type (type): The desired return type for the metric value (e.g., float, str).
+            require_fresh_source (bool): Use a separate timestamped cache and
+                reject old log entries or cached values. Strict observation
+                readers use this mode.
 
         Returns:
             float or str: The extracted metric value, converted to the specified result_type.
@@ -1970,31 +4308,100 @@ class HerokuDyno:
         else:
             cache_refresh_interval = timeout
 
-        cache_key = f'{cache_key}:{self.app_name}:{self.dyno_name}'
+        scoped_cache_key = f'{cache_key}:{self.app_name}:{self.dyno_name}'
+        verified_dyno_id = self._verified_self_dyno_id
+        if verified_dyno_id:
+            scoped_cache_key = f'{scoped_cache_key}:{verified_dyno_id}'
+        if require_fresh_source:
+            max_source_age = getattr(settings, 'DYNO_GENERAL_CACHE_DURATION', 300)
+            cache_refresh_interval = min(
+                max_source_age,
+                max(1, int(getattr(settings, 'DYNO_AUTOSCALE_INTERVAL', 30))),
+            )
+            timeout = max_source_age
+            cache_key = f'{scoped_cache_key}:source-timestamped:v1'
+        else:
+            max_source_age = None
+            cache_key = scoped_cache_key
 
-        # Fetch from cache; ttl > 0 means the key exists and has time remaining
-        cached_value = cache.get(cache_key)
-        ttl = cache.ttl(cache_key)
-        cache_is_fresh = ttl is not None and ttl > 0 and (timeout - ttl) < cache_refresh_interval
+        # Fetch from cache. Strict observations derive freshness from the
+        # source timestamp, so only the legacy path needs a separate TTL read.
+        cached_entry = cache.get(cache_key)
+        if require_fresh_source:
+            cache_is_fresh = False
+        else:
+            ttl = cache.ttl(cache_key)
+            cache_is_fresh = ttl is not None and ttl > 0 and (timeout - ttl) < cache_refresh_interval
+        cached_value = cached_entry
+        cached_source_epoch = None
+        if require_fresh_source:
+            cached_value = None
+            if isinstance(cached_entry, (tuple, list)) and len(cached_entry) == 2:
+                value, source_epoch = cached_entry
+                if _is_finite_number(source_epoch):
+                    cached_value = value
+                    cached_source_epoch = source_epoch
+                    now_epoch = time.time()
+                    cache_is_fresh = (
+                        source_epoch <= now_epoch
+                        and now_epoch - source_epoch <= max_source_age
+                        and now_epoch - source_epoch < cache_refresh_interval
+                    )
+            if cached_source_epoch is None:
+                cache_is_fresh = False
 
         if cache_is_fresh and cached_value is not None:
-            return cached_value
+            return _MetricReading(cached_value, cached_source_epoch)
 
-        # Fetch and parse logs
-        logs_parsed = self.get_heroku_logs()
+        # Fetch and parse logs. One check-in memoizes the strict fetch, including
+        # failure, so memory and load cannot issue duplicate log-session calls.
+        if require_fresh_source:
+            check_in_active = '_strict_observation_logs' in self.__dict__
+            if check_in_active:
+                logs_parsed = self.__dict__['_strict_observation_logs']
+            else:
+                logs_parsed = _STRICT_LOGS_UNSET
+            if logs_parsed is _STRICT_LOGS_UNSET:
+                try:
+                    logs_parsed = self.get_heroku_logs(strict_observation=True)
+                except Exception:
+                    logs_parsed = None
+                if check_in_active:
+                    self.__dict__['_strict_observation_logs'] = logs_parsed
+        else:
+            logs_parsed = self.get_heroku_logs()
         if not logs_parsed:
-            return cached_value
+            if require_fresh_source or cached_value is None:
+                return None
+            return _MetricReading(cached_value, None)
 
         # Compile all patterns
         compiled_patterns = [re.compile(pattern) for pattern in patterns]
         latest_value = None
+        sample_epoch = None
 
         # Search for matches in reverse order to find the most recent occurrence
         for log_entry in reversed(logs_parsed):
             message = log_entry.get("message", "")
             timestamp = log_entry.get("timestamp")
             seconds_ago = (timezone.now() - timestamp).total_seconds() if timestamp else None
-            if seconds_ago is not None and seconds_ago > timeout:
+            if result_type is not bool and (require_fresh_source or verified_dyno_id):
+                if (
+                    verified_dyno_id is None
+                    or log_entry.get("source_dyno_name") != self.dyno_name
+                    or log_entry.get("source_dyno_id") != verified_dyno_id
+                ):
+                    continue
+            if require_fresh_source:
+                if (
+                    timestamp is None
+                    or seconds_ago is None
+                    or seconds_ago < 0
+                    or seconds_ago > max_source_age
+                ):
+                    continue
+                sample_epoch = timestamp.timestamp()
+            elif seconds_ago is not None and seconds_ago > timeout:
                 continue
             for pattern in compiled_patterns:
                 match = pattern.search(message)
@@ -2009,14 +4416,23 @@ class HerokuDyno:
             # Explicit False when no recent match found — prevents cached True from latching forever
             latest_value = bool(latest_value)
             cache.set(cache_key, latest_value, timeout=timeout)
-            return latest_value
+            return _MetricReading(latest_value, None)
 
         if latest_value is not None:
-            cache.set(cache_key, latest_value, timeout=timeout)
+            cached_result = (
+                (latest_value, sample_epoch)
+                if require_fresh_source
+                else latest_value
+            )
+            cache.set(cache_key, cached_result, timeout=timeout)
 
-        return latest_value if latest_value is not None else cached_value
+        if latest_value is not None:
+            return _MetricReading(latest_value, sample_epoch if require_fresh_source else None)
+        if require_fresh_source or cached_value is None:
+            return None
+        return _MetricReading(cached_value, None)
 
-    def get_memory_usage_from_logs(self):
+    def get_memory_usage_from_logs(self, require_fresh=False):
         """
         Retrieves the most recent total memory usage of a specified dyno by parsing Heroku logs.
 
@@ -2027,7 +4443,10 @@ class HerokuDyno:
             r"sample#memory_total=(\d+\.\d+)MB",          # Pattern for memory_total in MB
             r"Process running mem=(\d+)M\(\d+\.\d+%\)"    # Pattern for memory in megabytes
         ]
-        return self.extract_latest_metric(patterns, cache_key="heroku:memory_total", result_type=float)
+        return self.extract_latest_metric(
+            patterns, cache_key="heroku:memory_total", result_type=float,
+            require_fresh_source=require_fresh,
+        )
 
     def get_total_available_memory_from_logs(self):
         """

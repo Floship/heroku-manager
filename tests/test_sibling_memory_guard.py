@@ -7,7 +7,7 @@ Covers:
   - any_sibling_still_high_memory (excludes self, hot/cool siblings, formation name isolation)
   - allow_downscale (R14, R15, sibling guard, tasks in queue)
   - allow_downscale_on_shutdown (R14, R15, sibling guard)
-  - check_in_dyno (memory + alive published, TTL uses DYNO_ZOMBIE_THRESHOLD)
+  - check_in_dyno (memory uses the zombie TTL; heartbeat adds one scan grace)
   - remove_dyno_from_alive_cache (deletes both alive + memory keys)
   - Stale/None memory edge cases
 """
@@ -18,6 +18,7 @@ import unittest
 from unittest.mock import ANY, MagicMock, patch, PropertyMock
 import django
 from django.conf import settings as django_settings
+from django.test import override_settings
 from django.utils import timezone
 
 # ── Minimal Django setup ──────────────────────────────────────────────────────
@@ -39,7 +40,16 @@ if not django_settings.configured:
 from django.core.cache import cache
 from tests.conftest import TEST_PROXY_CREDENTIAL, TEST_PROXY_MANAGER_ID
 from tests.conftest import patch_index_backend, real_decoder
-from heroku_manager.heroku import HerokuDyno, DYNO_SIZES, _update_dyno_registry
+import heroku_manager.heroku as heroku_module
+from heroku_manager.heroku import (
+    HerokuDyno,
+    DYNO_SIZES,
+    _IndexAdapter,
+    _MetricReading,
+    _dyno_owner_ttl,
+    _registry_degraded,
+    _update_dyno_registry,
+)
 
 
 def make_dyno(dyno_name="normal_worker.1", formation_size="standard-2x"):
@@ -79,6 +89,34 @@ def _restore_real_index_ready(dyno):
     descriptor runs the runtime predicate (no production-class mutation)."""
     dyno.__dict__.pop("index_ready", None)
     return dyno
+
+
+def _seed_owned_dyno(dyno, dyno_name=None, owner_token=None, score=None):
+    """Create a matching owner, registry score, and alive lease in the fixture."""
+    dyno_name = dyno_name or dyno.dyno_name
+    owner_token = owner_token or dyno._dyno_owner_token
+    score = time.time() if score is None else score
+    status = _IndexAdapter(dyno.app_name, primary=True).claim_and_register(
+        dyno_name,
+        owner_token,
+        score,
+        timezone.now(),
+        django_settings.DYNO_ZOMBIE_THRESHOLD,
+    )
+    if status != 'claimed':
+        raise AssertionError(f"fixture ownership claim failed: {status}")
+    if dyno_name == dyno.dyno_name:
+        dyno._dyno_owner_claimed = True
+        dyno._last_registered_score = score
+    return owner_token, score
+
+
+def _owned_values(observations):
+    """Expand observations into owner and observation tuple order."""
+    values = []
+    for observation in observations:
+        values.extend(["owner", observation])
+    return values
 
 
 _real_decoder = real_decoder
@@ -130,6 +168,11 @@ class TestDynoRegistryWrites(unittest.TestCase):
 class TestDownscaleMemoryThreshold(unittest.TestCase):
     """_downscale_memory_threshold returns previous_size_memory * DOWNSCALE_% / 100."""
 
+    def setUp(self):
+        self.index_patch = _patch_index_backend({})
+        self.index_patch.start()
+        self.addCleanup(self.index_patch.stop)
+
     def test_standard_2x_previous_is_standard_1x(self):
         # standard-2x previous = standard-1x (512 MB), threshold = 512 * 105 / 100 = 537.6
         dyno = make_dyno(formation_size="standard-2x")
@@ -146,6 +189,11 @@ class TestDownscaleMemoryThreshold(unittest.TestCase):
 
 class TestIsStillHighMemoryUsageForDownscale(unittest.TestCase):
     """is_still_high_memory_usage_for_downscale delegates to _downscale_memory_threshold."""
+
+    def setUp(self):
+        self.index_patch = _patch_index_backend({})
+        self.index_patch.start()
+        self.addCleanup(self.index_patch.stop)
 
     def _dyno_with_memory(self, current_mb, formation_size="standard-2x"):
         dyno = make_dyno(formation_size=formation_size)
@@ -219,7 +267,7 @@ class TestAnySiblingStillHighMemory(unittest.TestCase):
     def test_excludes_self_even_if_self_is_hot(self):
         dyno = self._dyno("normal_worker.2")
         self._set_sibling_memory("normal_worker.2", 1013)
-        with self._patch_keys({}):
+        with patch_index_backend(self._memory_store, own_dyno=dyno.dyno_name):
             self.assertFalse(dyno.any_sibling_still_high_memory)
 
     def test_no_previous_formation_size_returns_false(self):
@@ -265,6 +313,7 @@ class TestAllowDownscaleWithSiblingGuard(unittest.TestCase):
         type(dyno).detected_r15 = PropertyMock(return_value=False)
         type(dyno).no_tasks_in_queue = PropertyMock(return_value=True)
         type(dyno).downscale_on_non_empty_queue = PropertyMock(return_value=False)
+        self._set_sibling_memory(dyno.dyno_name, own_memory)
         if sibling_memory is not None:
             self._set_sibling_memory("normal_worker.2", sibling_memory)
         return dyno
@@ -289,70 +338,104 @@ class TestCheckInDynoPublishesMemory(unittest.TestCase):
 
     def setUp(self):
         cache.clear()
+        self._env_patch = patch.dict(os.environ, {"DYNO": "normal_worker.3"})
+        self._env_patch.start()
+        self._backend_patch = patch_index_backend({})
+        self._backend_patch.start()
 
     def tearDown(self):
+        self._backend_patch.stop()
+        self._env_patch.stop()
         cache.clear()
 
     def test_check_in_dyno_writes_memory_key(self):
         dyno = make_dyno("normal_worker.3")
-        type(dyno).current_memory_usage = PropertyMock(return_value=512)
-        dyno.check_in_dyno()
+        with patch.object(type(dyno), "memory_reading_for_observation",
+                          new_callable=PropertyMock,
+                          return_value=_MetricReading(512, time.time())), \
+                patch.object(type(dyno), "load_1min_for_observation",
+                             new_callable=PropertyMock, return_value=0.2):
+            dyno.check_in_dyno()
         self.assertEqual(cache.get("heroku:dyno_memory:normal_worker.3"), 512)
 
-    def test_check_in_dyno_stores_zero_memory(self):
-        """P1-7: if mem is not None means 0 is a valid reading and must be stored."""
+    def test_check_in_dyno_does_not_publish_missing_memory_as_zero(self):
+        """A missing memory source stays None in the strict observation."""
         dyno = make_dyno("normal_worker.3")
-        type(dyno).current_memory_usage = PropertyMock(return_value=0)
-        dyno.check_in_dyno()
-        self.assertEqual(cache.get("heroku:dyno_memory:normal_worker.3"), 0)
+        with patch.object(type(dyno), "memory_reading_for_observation",
+                          new_callable=PropertyMock, return_value=None), \
+                patch.object(type(dyno), "load_1min_for_observation",
+                             new_callable=PropertyMock, return_value=None):
+            dyno.check_in_dyno()
+        observation = cache.get("heroku:dyno_observation:v1:floship:normal_worker.3")
+        self.assertIsNone(observation.memory_mb)
+        self.assertIsNone(observation.load_1m)
+        self.assertIsNone(cache.get("heroku:dyno_memory:normal_worker.3"))
 
     def test_check_in_dyno_still_writes_alive_key(self):
         dyno = make_dyno("normal_worker.3")
-        type(dyno).current_memory_usage = PropertyMock(return_value=0)
-        dyno.check_in_dyno()
+        with patch.object(type(dyno), "memory_reading_for_observation",
+                          new_callable=PropertyMock, return_value=None), \
+                patch.object(type(dyno), "load_1min_for_observation",
+                             new_callable=PropertyMock, return_value=None):
+            dyno.check_in_dyno()
         self.assertIsNotNone(cache.get("heroku:dyno_alive:normal_worker.3"))
 
-    @patch("heroku_manager.heroku._update_dyno_registry")
-    def test_check_in_dyno_adds_registry_member(self, update_registry):
+    def test_check_in_dyno_adds_registry_member(self):
         dyno = make_dyno("normal_worker.3")
-        type(dyno).current_memory_usage = PropertyMock(return_value=0)
+        with patch.object(type(dyno), "memory_reading_for_observation",
+                          new_callable=PropertyMock, return_value=None), \
+                patch.object(type(dyno), "load_1min_for_observation",
+                             new_callable=PropertyMock, return_value=None), \
+                patch.object(_IndexAdapter, "claim_and_register",
+                             autospec=True,
+                             wraps=_IndexAdapter.claim_and_register) as claim:
+            dyno.check_in_dyno()
 
-        dyno.check_in_dyno()
-
-        update_registry.assert_called_once_with("floship", "normal_worker.3", ANY)
+        self.assertEqual(claim.call_args.args[1], "normal_worker.3")
 
 
 class TestRemoveDynoFromAliveCache(unittest.TestCase):
 
     def setUp(self):
         cache.clear()
+        self._env_patch = patch.dict(os.environ, {"DYNO": "normal_worker.1"})
+        self._env_patch.start()
+        self._backend_patch = patch_index_backend({})
+        self._backend_patch.start()
 
     def tearDown(self):
+        self._backend_patch.stop()
+        self._env_patch.stop()
         cache.clear()
 
     def test_removes_both_alive_and_memory_keys(self):
+        dyno = make_dyno("normal_worker.1")
+        _seed_owned_dyno(dyno)
         cache.set("heroku:dyno_alive:normal_worker.1", "now", timeout=60)
         cache.set("heroku:dyno_memory:normal_worker.1", 512, timeout=60)
-        dyno = make_dyno("normal_worker.1")
         dyno.remove_dyno_from_alive_cache()
         self.assertIsNone(cache.get("heroku:dyno_alive:normal_worker.1"))
         self.assertIsNone(cache.get("heroku:dyno_memory:normal_worker.1"))
 
     def test_removes_named_dyno_keys(self):
+        dyno = make_dyno("normal_worker.1")
+        _seed_owned_dyno(dyno, "normal_worker.5", owner_token="sibling-owner")
         cache.set("heroku:dyno_alive:normal_worker.5", "now", timeout=60)
         cache.set("heroku:dyno_memory:normal_worker.5", 999, timeout=60)
-        dyno = make_dyno("normal_worker.1")
         dyno.remove_dyno_from_alive_cache("normal_worker.5")
         self.assertIsNone(cache.get("heroku:dyno_alive:normal_worker.5"))
         self.assertIsNone(cache.get("heroku:dyno_memory:normal_worker.5"))
 
-    @patch("heroku_manager.heroku._update_dyno_registry")
-    def test_removes_named_dyno_from_registry(self, update_registry):
+    def test_removes_named_dyno_from_registry(self):
         dyno = make_dyno("normal_worker.1")
+        _seed_owned_dyno(dyno, "normal_worker.5", owner_token="sibling-owner")
 
         dyno.remove_dyno_from_alive_cache("normal_worker.5")
 
-        update_registry.assert_called_once_with("floship", "normal_worker.5")
+        status, _, _ = _IndexAdapter(
+            dyno.app_name, primary=True,
+        ).get_owner_and_score("normal_worker.5")
+        self.assertEqual(status, "missing")
 
 
 # ── Helpers shared by new test classes ───────────────────────────────────────
@@ -370,6 +453,8 @@ def _make_full_dyno(dyno_name="normal_worker.1", formation_size="standard-2x",
     type(dyno).detected_r15 = PropertyMock(return_value=r15)
     type(dyno).no_tasks_in_queue = PropertyMock(return_value=no_tasks)
     type(dyno).downscale_on_non_empty_queue = PropertyMock(return_value=downscale_on_non_empty)
+    cache.set(f"heroku:dyno_memory:{dyno_name}", own_memory, timeout=60)
+    cache.set(f"heroku:dyno_load:{dyno_name}", 0.0, timeout=60)
     return dyno
 
 
@@ -461,48 +546,76 @@ class TestAllowDownscaleOnShutdownSiblingGuard(unittest.TestCase):
 class TestStaleSiblingMemoryKeys(unittest.TestCase):
     """
     Crashed dynos (no graceful shutdown) leave stale memory keys.
-    TTL must equal DYNO_ZOMBIE_THRESHOLD so they expire before causing permanent
-    downscale blocks.
+    Metric keys expire at DYNO_ZOMBIE_THRESHOLD. The heartbeat adds one bounded
+    scan grace so the next detector can still see the stale evidence.
     """
 
     def setUp(self):
         cache.clear()
+        self._env_patch = patch.dict(os.environ, {"DYNO": "normal_worker.1"})
+        self._env_patch.start()
 
     def tearDown(self):
+        self._env_patch.stop()
         cache.clear()
 
     def test_check_in_dyno_uses_zombie_threshold_as_ttl(self):
         """Memory key TTL must match DYNO_ZOMBIE_THRESHOLD, not a hardcoded 24h."""
         dyno = make_dyno("normal_worker.1")
-        type(dyno).current_memory_usage = PropertyMock(return_value=512)
-
         expected_ttl = django_settings.DYNO_ZOMBIE_THRESHOLD
+        published = []
+        original_publish = _IndexAdapter.publish_owned_values
 
-        with patch.object(cache, "set") as mock_set:
+        def capture_publish(
+            adapter, dyno_name, owner_token, score, values, **kwargs,
+        ):
+            published.extend(values)
+            return original_publish(
+                adapter, dyno_name, owner_token, score, values, **kwargs,
+            )
+
+        with patch_index_backend({}), \
+                patch.object(type(dyno), "memory_reading_for_observation",
+                             new_callable=PropertyMock,
+                             return_value=_MetricReading(512, time.time())), \
+                patch.object(type(dyno), "load_1min_for_observation",
+                             new_callable=PropertyMock, return_value=0.2), \
+                patch.object(_IndexAdapter, "publish_owned_values", new=capture_publish):
             dyno.check_in_dyno()
 
         # Both alive and memory keys must use the same zombie TTL
-        memory_calls = [c for c in mock_set.call_args_list
-                        if "dyno_memory:" in str(c) and "dyno_memory_stable" not in str(c)]
+        memory_calls = [c for c in published
+                        if "dyno_memory:" in c[0] and "dyno_memory_stable" not in c[0]]
         self.assertEqual(len(memory_calls), 1)
-        _, kwargs = memory_calls[0]
-        ttl_used = kwargs.get("timeout") or memory_calls[0][0][2]  # positional or keyword
-        self.assertEqual(ttl_used, expected_ttl)
+        self.assertEqual(memory_calls[0][2], expected_ttl)
 
-    def test_alive_key_uses_zombie_threshold_as_ttl(self):
+    def test_alive_key_survives_through_the_next_scan_after_threshold(self):
         dyno = make_dyno("normal_worker.1")
-        type(dyno).current_memory_usage = PropertyMock(return_value=0)
-        expected_ttl = django_settings.DYNO_ZOMBIE_THRESHOLD
+        threshold = django_settings.DYNO_ZOMBIE_THRESHOLD
+        expected_ttl = threshold + _dyno_owner_ttl()
+        published = []
+        original_publish = _IndexAdapter.publish_owned_values
 
-        with patch.object(cache, "set") as mock_set:
+        def capture_publish(
+            adapter, dyno_name, owner_token, score, values, **kwargs,
+        ):
+            published.extend(values)
+            return original_publish(
+                adapter, dyno_name, owner_token, score, values, **kwargs,
+            )
+
+        with patch_index_backend({}), \
+                patch.object(type(dyno), "memory_reading_for_observation",
+                             new_callable=PropertyMock, return_value=None), \
+                patch.object(type(dyno), "load_1min_for_observation",
+                             new_callable=PropertyMock, return_value=None), \
+                patch.object(_IndexAdapter, "publish_owned_values", new=capture_publish):
             dyno.check_in_dyno()
 
-        alive_calls = [c for c in mock_set.call_args_list
-                       if "dyno_alive" in str(c)]
+        alive_calls = [c for c in published if "dyno_alive" in c[0]]
         self.assertEqual(len(alive_calls), 1)
-        _, kwargs = alive_calls[0]
-        ttl_used = kwargs.get("timeout") or alive_calls[0][0][2]
-        self.assertEqual(ttl_used, expected_ttl)
+        self.assertEqual(alive_calls[0][2], expected_ttl)
+        self.assertGreater(alive_calls[0][2], threshold)
 
 
 class TestNullMemoryEdgeCases(unittest.TestCase):
@@ -527,18 +640,12 @@ class TestNullMemoryEdgeCases(unittest.TestCase):
             result = dyno.allow_downscale
             self.assertIsInstance(result, bool)
 
-    def test_sibling_none_memory_in_cache_is_treated_as_absent(self):
-        # cache.get returns None for missing key → sibling treated as "not hot"
+    def test_indexed_sibling_with_missing_memory_blocks_downscale(self):
         dyno = _make_full_dyno("normal_worker.1", own_memory=200)
         store = {"heroku:dyno_memory:normal_worker.2": None}
-        cache.set("heroku:dyno_memory:normal_worker.2", None, timeout=60)
-
-        def _keys(pattern):
-            return ["heroku:dyno_memory:normal_worker.2"]
-
-        with patch.object(cache, "keys", side_effect=_keys, create=True):
-            # None memory must not block downscale (treated as absent/cool)
-            self.assertFalse(dyno.any_sibling_still_high_memory)
+        with patch_index_backend(store):
+            self.assertTrue(dyno.any_sibling_still_high_memory)
+            self.assertFalse(dyno.allow_downscale)
 
 
 class TestFormationNameIsolation(unittest.TestCase):
@@ -556,20 +663,13 @@ class TestFormationNameIsolation(unittest.TestCase):
         'normal_worker_extra.1' (underscore, not dot).
         """
         dyno = _make_full_dyno("normal_worker.1", own_memory=200)
-        # Simulate what cache.keys returns for the correct pattern
         all_keys = {
             "heroku:dyno_memory:normal_worker.2": 300,          # same formation ✓
             "heroku:dyno_memory:normal_worker_extra.1": 9999,   # different formation — should NOT match
         }
 
-        def _keys(pattern):
-            prefix = pattern.replace(".*", ".") if ".*" in pattern else pattern
-            return [k for k in all_keys if k.startswith(prefix)]
-
-        with patch.object(cache, "keys", side_effect=_keys, create=True):
-            with patch.object(cache, "get", side_effect=lambda k: all_keys.get(k)):
-                # normal_worker_extra.1 at 9999MB must not block normal_worker downscale
-                self.assertFalse(dyno.any_sibling_still_high_memory)
+        with patch_index_backend(all_keys):
+            self.assertFalse(dyno.any_sibling_still_high_memory)
 
     def test_hot_sibling_in_same_formation_is_detected(self):
         dyno = _make_full_dyno("normal_worker.1", own_memory=200)
@@ -627,6 +727,9 @@ class TestThresholdBoundary(unittest.TestCase):
 
     def setUp(self):
         cache.clear()
+        self.index_patch = _patch_index_backend({})
+        self.index_patch.start()
+        self.addCleanup(self.index_patch.stop)
 
     def tearDown(self):
         cache.clear()
@@ -774,12 +877,25 @@ class TestIndexedDynoReadiness(unittest.TestCase):
         backend = MagicMock()
         client = MagicMock()
         client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
-        client.get.return_value = None  # degraded marker absent unless the test sets it
+        owner_value = object()
+        backend.client.encode.return_value = owner_value
+        client.get.side_effect = lambda key: owner_value if "dyno_owner" in str(key) else None
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
         backend.client.get_client.return_value = client
+        backend.client.decode.side_effect = lambda value: value
         backend.make_key.side_effect = lambda key: key
         backend.get.return_value = None
+        pipeline = MagicMock()
+        pipeline.watch.return_value = pipeline
+        pipeline.multi.return_value = pipeline
+        pipeline.ping.return_value = pipeline
+        pipeline.zrangebyscore.side_effect = lambda *args, **kwargs: client.zrangebyscore(*args, **kwargs)
+        pipeline.mget.side_effect = lambda keys: client.mget(keys)
+        pipeline.get.side_effect = client.get
+        pipeline.zrange.return_value = []
+        pipeline.execute.return_value = True
+        client.pipeline.return_value = pipeline
         for name, value in (backend_attrs or {}).items():
             setattr(backend, name, value)
         self._cache_patcher = patch("heroku_manager.heroku.cache", backend)
@@ -805,6 +921,14 @@ class TestIndexedDynoReadiness(unittest.TestCase):
         self.assertTrue(dyno.index_ready)
         # Phase C: readiness is the own score alone - no SCAN, no flag.
         client.scan.assert_not_called()
+
+    def test_matching_owner_is_required_for_readiness(self):
+        dyno = self._dyno("normal_worker.1")
+        _, client = self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=time.time()),
+            "get": MagicMock(side_effect=lambda key: b"replacement-owner" if "dyno_owner" in str(key) else None),
+        })
+        self.assertFalse(dyno.index_ready)
 
     def test_env_flag_no_longer_gates_readiness(self):
         # The rollout flag is gone: a fresh own score is ready even when the
@@ -836,7 +960,7 @@ class TestIndexedDynoReadiness(unittest.TestCase):
             })
             # Both paths run so both cutoffs are observed, never asserted
             # against a never-called mock.
-            list(dyno._iter_sibling_values("memory"))
+            dyno._sibling_values("memory")
             dyno.prune_stale_index_members()
             # zremrangebyscore(key, min, max): the prune cutoff is the MAX bound.
             lower = client.zrangebyscore.call_args[0][1]
@@ -845,7 +969,7 @@ class TestIndexedDynoReadiness(unittest.TestCase):
 
 
 class TestIndexedSiblingValues(unittest.TestCase):
-    """Phase C: _iter_sibling_values reads the app index only; never SCAN, never
+    """Phase C: _sibling_values reads the app index only; never SCAN, never
     KEYS; exact formation prefix; own dyno excluded; missing values skipped;
     batched MGET; an uncertain member read yields nothing."""
 
@@ -866,7 +990,9 @@ class TestIndexedSiblingValues(unittest.TestCase):
         backend = MagicMock()
         client = MagicMock()
         client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
-        client.get.return_value = None  # degraded marker absent unless the test sets it
+        owner_value = object()
+        backend.client.encode.return_value = owner_value
+        client.get.side_effect = lambda key: owner_value if "dyno_owner" in str(key) else None
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
         backend.client.get_client.return_value = client
@@ -891,14 +1017,13 @@ class TestIndexedSiblingValues(unittest.TestCase):
         client.scan.side_effect = AssertionError("SCAN removed in Phase C")
         backend.keys = MagicMock(side_effect=AssertionError("KEYS forbidden"))
         backend.client.decode = _real_decoder()
-        values = list(dyno._iter_sibling_values("memory"))
+        values = dyno._sibling_values("memory")
         self.assertEqual(values, [("normal_worker.2", 300)])
         backend.keys.assert_not_called()
         client.scan.assert_not_called()
 
-    def test_uncertain_index_read_yields_no_siblings(self):
-        # None from ZRANGEBYSCORE means the member list is unknown: yield
-        # nothing rather than a partial fleet, and never fall back to SCAN.
+    def test_uncertain_index_read_is_distinct_from_a_healthy_empty_list(self):
+        # An unknown member list never falls back to SCAN.
         dyno = self._dyno("normal_worker.1")
         backend, client = self._patch_backend(client_attrs={
             "zscore": MagicMock(return_value=None),
@@ -906,7 +1031,7 @@ class TestIndexedSiblingValues(unittest.TestCase):
         })
         client.scan.side_effect = AssertionError("SCAN removed in Phase C")
         backend.get.return_value = 300
-        self.assertEqual(list(dyno._iter_sibling_values("memory")), [])
+        self.assertIsNone(dyno._sibling_values("memory"))
         client.scan.assert_not_called()
         client.mget.assert_not_called()
 
@@ -918,10 +1043,10 @@ class TestIndexedSiblingValues(unittest.TestCase):
         backend, _ = self._patch_backend(client_attrs={
             "zscore": MagicMock(return_value=time.time()),
             "zrangebyscore": MagicMock(return_value=members),
-            "mget": MagicMock(return_value=[pickle.dumps(400), pickle.dumps(9999)]),
+            "mget": MagicMock(return_value=[pickle.dumps(400)]),
         })
         backend.client.decode = _real_decoder()
-        values = list(dyno._iter_sibling_values("memory"))
+        values = dyno._sibling_values("memory")
         names = [n for n, _ in values]
         self.assertNotIn("normal_worker_extra.1", names)
         self.assertEqual(names, ["normal_worker.2"])
@@ -934,10 +1059,10 @@ class TestIndexedSiblingValues(unittest.TestCase):
         backend, _ = self._patch_backend(client_attrs={
             "zscore": MagicMock(return_value=time.time()),
             "zrangebyscore": MagicMock(return_value=["normal_worker.1", "normal_worker.2"]),
-            "mget": MagicMock(return_value=[pickle.dumps(300), pickle.dumps(9999)]),
+            "mget": MagicMock(return_value=[pickle.dumps(300)]),
         })
         backend.client.decode = _real_decoder()
-        values = list(dyno._iter_sibling_values("memory"))
+        values = dyno._sibling_values("memory")
         self.assertEqual(values, [("normal_worker.1", 300)])
 
     def test_missing_metric_values_skipped(self):
@@ -950,7 +1075,7 @@ class TestIndexedSiblingValues(unittest.TestCase):
             "mget": MagicMock(return_value=[None, pickle.dumps(300)]),
         })
         backend.client.decode = _real_decoder()
-        values = list(dyno._iter_sibling_values("memory"))
+        values = dyno._sibling_values("memory")
         self.assertEqual(values, [("normal_worker.3", 300)])
 
     def test_batched_mget_used(self):
@@ -963,7 +1088,7 @@ class TestIndexedSiblingValues(unittest.TestCase):
             "mget": MagicMock(return_value=[pickle.dumps(300), pickle.dumps(400)]),
         })
         backend.client.decode = _real_decoder()
-        list(dyno._iter_sibling_values("memory"))
+        dyno._sibling_values("memory")
         client.mget.assert_called_once()
         args = client.mget.call_args[0][0]
         self.assertIn("heroku:dyno_memory:normal_worker.2", args)
@@ -991,12 +1116,27 @@ class TestIndexedFailClosed(unittest.TestCase):
         backend = MagicMock()
         client = MagicMock()
         client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
-        client.get.return_value = None  # degraded marker absent unless the test sets it
+        owner_value = object()
+        backend.client.encode.return_value = owner_value
+        client.get.side_effect = lambda key: owner_value if "dyno_owner" in str(key) else None
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
         backend.client.get_client.return_value = client
+        backend.client.decode.side_effect = lambda value: value
         backend.make_key.side_effect = lambda key: key
         backend.get.return_value = None
+        pipeline = MagicMock()
+        pipeline.watch.return_value = pipeline
+        pipeline.multi.return_value = pipeline
+        pipeline.ping.return_value = pipeline
+        pipeline.zrangebyscore.side_effect = lambda *args, **kwargs: client.zrangebyscore(*args, **kwargs)
+        pipeline.mget.side_effect = lambda keys: client.mget(keys)
+        client.exists.side_effect = lambda *keys: 0
+        pipeline.exists.side_effect = lambda *keys: client.exists(*keys)
+        pipeline.get.return_value = None
+        pipeline.zrange.return_value = []
+        pipeline.execute.return_value = True
+        client.pipeline.return_value = pipeline
         for name, value in (backend_attrs or {}).items():
             setattr(backend, name, value)
         self._cache_patcher = patch("heroku_manager.heroku.cache", backend)
@@ -1044,13 +1184,115 @@ class TestIndexedFailClosed(unittest.TestCase):
 
     def test_fresh_own_score_allows_shutdown_downscale_when_cool(self):
         dyno = self._cool_full_dyno()
-        self._patch_backend(client_attrs={"zscore": MagicMock(return_value=time.time())})
+        score = time.time()
+        observations = _owned_values([(score, 200, False, 0.2)])
+
+        def read_values(keys):
+            if all("dyno_owner" in str(key) for key in keys):
+                return ["owner"] * len(keys)
+            if all("dyno_contention" in str(key) for key in keys):
+                return [None] * len(keys)
+            if all("dyno_memory_veto" in str(key) for key in keys):
+                return [None] * len(keys)
+            return observations
+
+        self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=score),
+            "zrangebyscore": MagicMock(return_value=[(dyno.dyno_name, score)]),
+            "mget": MagicMock(side_effect=read_values),
+        })
         self.assertTrue(dyno.allow_downscale_on_shutdown)
 
     def test_fresh_own_score_allows_downscale(self):
         dyno = self._cool_full_dyno()
-        self._patch_backend(client_attrs={"zscore": MagicMock(return_value=time.time())})
+        score = time.time()
+        observations = _owned_values([(score, 200, False, 0.2)])
+
+        def read_values(keys):
+            if all("dyno_owner" in str(key) for key in keys):
+                return ["owner"] * len(keys)
+            if all("dyno_contention" in str(key) for key in keys):
+                return [None] * len(keys)
+            if all("dyno_memory_veto" in str(key) for key in keys):
+                return [None] * len(keys)
+            return observations
+
+        self._patch_backend(client_attrs={
+            "zscore": MagicMock(return_value=score),
+            "zrangebyscore": MagicMock(return_value=[(dyno.dyno_name, score)]),
+            "mget": MagicMock(side_effect=read_values),
+        })
         self.assertTrue(dyno.allow_downscale)
+
+    def test_uncertain_sibling_samples_block_destructive_decisions(self):
+        dyno = self._cool_full_dyno()
+        backend, client = self._patch_backend()
+        backend.client.decode.side_effect = lambda value: value
+        client.zscore.return_value = time.time()
+        sibling = "normal_worker.2"
+        score = time.time()
+        healthy = (score, 200, False, 0.2)
+        fleet = [(dyno.dyno_name, score), (sibling, score)]
+        cases = (
+            (None, [healthy]),
+            ([], []),
+            ([(sibling, score)], [healthy]),
+            (fleet, None),
+            (fleet, []),
+            (fleet, [None]),
+            (fleet, [healthy, "not numeric"]),
+            (fleet, [(score + 1, 200, False, 0.2), healthy]),
+            (fleet, [(score, None, False, 0.2), healthy]),
+        )
+        client.zscore.return_value = score
+        for members, batch in cases:
+            with self.subTest(members=members, batch=batch):
+                client.zrangebyscore.return_value = members
+                client.mget.return_value = None if batch is None else _owned_values(batch)
+                self.assertFalse(dyno.allow_downscale)
+                self.assertFalse(dyno.allow_downscale_on_shutdown)
+        client.zrangebyscore.return_value = fleet
+        client.mget.side_effect = TimeoutError("batch timed out")
+        with self.subTest(batch="timeout"):
+            self.assertFalse(dyno.allow_downscale)
+            self.assertFalse(dyno.allow_downscale_on_shutdown)
+
+    def test_only_primary_stability_can_exempt_a_hot_sibling(self):
+        dyno = self._cool_full_dyno()
+        score = time.time()
+        backend, primary = self._patch_backend()
+        backend.client.decode.side_effect = lambda value: value
+        primary.zscore.return_value = score
+        primary.zrangebyscore.return_value = [
+            (dyno.dyno_name, score), ("normal_worker.2", score),
+        ]
+        batches = [
+            [(score, 200, False, 0.2), (score, 700, False, 0.2)],
+            [(score, 200, False, 0.2), (score, 700, True, 0.2)],
+        ]
+
+        def read_values(keys):
+            if all("dyno_owner" in str(key) for key in keys):
+                return ["owner"] * len(keys)
+            if all("dyno_contention" in str(key) for key in keys):
+                return [None] * len(keys)
+            if all("dyno_memory_veto" in str(key) for key in keys):
+                return [None] * len(keys)
+            return _owned_values(batches.pop(0))
+
+        primary.mget.side_effect = read_values
+
+        self.assertTrue(dyno.any_sibling_still_high_memory)
+        self.assertFalse(dyno.any_sibling_still_high_memory)
+        self.assertEqual(
+            primary.mget.call_args_list[0].args[0],
+            [
+                "heroku:dyno_owner:v1:floship:normal_worker.1",
+                "heroku:dyno_observation:v1:floship:normal_worker.1",
+                "heroku:dyno_owner:v1:floship:normal_worker.2",
+                "heroku:dyno_observation:v1:floship:normal_worker.2",
+            ],
+        )
 
     def test_missing_own_score_blocks_zombie_restart(self):
         # Zombie restart is destructive and requires a proven own score: without
@@ -1102,7 +1344,7 @@ class TestIndexedFailClosed(unittest.TestCase):
         backend.client.decode = _real_decoder()
         with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
             dyno.check_for_sibling_zombie_dynos()
-        mock_restart.assert_called_once_with("normal_worker.2")
+        mock_restart.assert_called_once_with("normal_worker.2", 300)
 
     def test_absent_index_member_never_authorizes_zombie_restart(self):
         dyno = self._dyno("normal_worker.1")
@@ -1154,7 +1396,9 @@ class TestIndexedPrune(unittest.TestCase):
         backend = MagicMock()
         client = MagicMock()
         client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
-        client.get.return_value = None  # degraded marker absent unless the test sets it
+        owner_value = object()
+        backend.client.encode.return_value = owner_value
+        client.get.side_effect = lambda key: owner_value if "dyno_owner" in str(key) else None
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
         backend.client.get_client.return_value = client
@@ -1239,7 +1483,9 @@ class TestIndexedPhysicalKeyContract(unittest.TestCase):
         backend = MagicMock()
         client = MagicMock()
         client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
-        client.get.return_value = None  # degraded marker absent unless the test sets it
+        owner_value = object()
+        backend.client.encode.return_value = owner_value
+        client.get.side_effect = lambda key: owner_value if "dyno_owner" in str(key) else None
         for name, value in (client_attrs or {}).items():
             setattr(client, name, value)
         backend.client.get_client.return_value = client
@@ -1259,7 +1505,7 @@ class TestIndexedPhysicalKeyContract(unittest.TestCase):
         _, client = self._patch_backend(client_attrs={
             "zrangebyscore": MagicMock(return_value=["normal_worker.1"]),
         })
-        list(dyno._iter_sibling_values("memory"))
+        dyno._sibling_values("memory")
         args = client.zrangebyscore.call_args[0]
         self.assertEqual(args[0], "prefix:1:heroku:dynos:v1:floship")
         self.assertEqual(args[1], f'({_stale_cutoff()}')
@@ -1274,7 +1520,7 @@ class TestIndexedPhysicalKeyContract(unittest.TestCase):
             "mget": MagicMock(return_value=[pickle.dumps(300)]),
         })
         backend.client.decode = _real_decoder()
-        values = list(dyno._iter_sibling_values("memory"))
+        values = dyno._sibling_values("memory")
         self.assertEqual(values, [("normal_worker.2", 300)])
         self.assertEqual(
             client.mget.call_args[0][0],
@@ -1295,7 +1541,7 @@ class TestIndexedPhysicalKeyContract(unittest.TestCase):
             "mget": MagicMock(return_value=[pickle.dumps(300)]),
         })
         backend.client.decode = _real_decoder()
-        values = list(dyno._iter_sibling_values("memory"))
+        values = dyno._sibling_values("memory")
         self.assertEqual(values, [("normal_worker.2", 300)])
         self.assertEqual(
             client.mget.call_args[0][0],
@@ -1317,14 +1563,14 @@ class TestIndexedPhysicalKeyContract(unittest.TestCase):
             "zrangebyscore": MagicMock(return_value=[
                 "normal_worker.1", "normal_worker.2",
             ]),
-            "mget": MagicMock(return_value=[raw, None]),
+            "mget": MagicMock(return_value=[raw]),
         })
         # The production adapter captures the decoder from cache.client
         # (the django-redis DefaultClient); give the mock backend a real
         # DefaultClient.decode and wrap it to prove the decode path runs.
         with patch.object(DefaultClient, "decode", wraps=DefaultClient.decode) as decode:
             backend.client.decode = real_decoder()
-            values = list(dyno._iter_sibling_values("memory"))
+            values = dyno._sibling_values("memory")
         self.assertEqual(values, [("normal_worker.2", 300)])
         self.assertGreaterEqual(decode.call_count, 1)
 
@@ -1353,8 +1599,8 @@ class TestIndexedPhysicalKeyContract(unittest.TestCase):
             "zremrangebyscore": MagicMock(return_value=0),
         })
         dyno.index_ready
-        list(dyno._iter_sibling_values("memory"))
-        list(dyno._iter_sibling_values("load"))
+        dyno._sibling_values("memory")
+        dyno._sibling_values("load")
         with patch.object(dyno, "restart_zombie_dyno") as mock_restart:
             dyno.check_for_sibling_zombie_dynos()
         self.assertEqual(client.zscore.call_count, 1)
@@ -1414,6 +1660,32 @@ class TestRegistryDegradedLedger(unittest.TestCase):
             setattr(client, name, value)
         backend.client.get_client.return_value = client
         backend.make_key.side_effect = lambda key: key
+        backend.client.decode.side_effect = lambda value: value
+        backend.client.encode.side_effect = lambda value: value
+        pipeline = MagicMock()
+        pipeline.watch.return_value = pipeline
+        pipeline.multi.return_value = pipeline
+        cleared = set()
+
+        def read_score(key, member):
+            if "degraded" in str(key):
+                for raw_name, score in client.zrange.return_value:
+                    name = raw_name.decode() if isinstance(raw_name, bytes) else raw_name
+                    if name == member and member not in cleared:
+                        return score
+                return None
+            return client.zscore(key, member)
+
+        def remove_member(key, member):
+            if "degraded" in str(key):
+                cleared.add(member)
+            return 1
+
+        pipeline.zscore.side_effect = read_score
+        pipeline.zrem.side_effect = remove_member
+        pipeline.execute.return_value = True
+        client.pipeline.return_value = pipeline
+        client.pipeline_instance = pipeline
         patcher = patch("heroku_manager.heroku.cache", backend)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -1431,6 +1703,26 @@ class TestRegistryDegradedLedger(unittest.TestCase):
         ledger = _registry_degraded_key("floship")
         self.assertEqual(client.zadd.call_args_list[-1][0], (ledger, {"web.1": ANY}))
         client.expire.assert_called_once_with(ledger, _registry_degraded_ttl())
+
+    @override_settings(DYNO_ZOMBIE_THRESHOLD=40, DYNO_AUTOSCALE_INTERVAL=30)
+    def test_ledger_ttl_and_entry_cover_the_full_registration_grace(self):
+        from heroku_manager.heroku import _registry_degraded_key
+
+        _, client = self._patch_backend()
+        heroku_module._mark_registry_degraded("floship", "normal_worker.2")
+        client.expire.assert_called_once_with(
+            _registry_degraded_key("floship"), 91,
+        )
+
+        failure_time = time.time() - 85
+        self._patch_backend({
+            "zrange": MagicMock(
+                return_value=[(b"normal_worker.2", failure_time)],
+            ),
+            "zscore": MagicMock(return_value=None),
+            "get": MagicMock(return_value=None),
+        })
+        self.assertTrue(_registry_degraded(self._dyno()))
 
     def test_ledger_entry_of_a_live_missing_writer_is_degraded(self):
         from heroku_manager.heroku import _registry_degraded
@@ -1461,7 +1753,9 @@ class TestRegistryDegradedLedger(unittest.TestCase):
             "zscore": MagicMock(return_value=2000.0),
         })
         self.assertFalse(_registry_degraded(self._dyno()))
-        client.zrem.assert_called_once_with(_registry_degraded_key("floship"), "web.1")
+        client.pipeline_instance.zrem.assert_called_once_with(
+            _registry_degraded_key("floship"), "web.1",
+        )
 
     def test_ledger_drops_a_dyno_that_is_gone(self):
         from heroku_manager.heroku import _registry_degraded
@@ -1471,7 +1765,7 @@ class TestRegistryDegradedLedger(unittest.TestCase):
             "get": MagicMock(return_value=None),
         })
         self.assertFalse(_registry_degraded(self._dyno()))
-        client.zrem.assert_called_once()
+        client.pipeline_instance.zrem.assert_called_once()
 
     def test_full_ledger_batch_fails_closed(self):
         from heroku_manager.heroku import _registry_degraded, _DEGRADED_LEDGER_LIMIT
@@ -1483,7 +1777,77 @@ class TestRegistryDegradedLedger(unittest.TestCase):
         # Every inspected entry recovered, but a full batch cannot prove that
         # no later entry names a live missing writer.
         self.assertTrue(_registry_degraded(self._dyno()))
-        self.assertEqual(client.zrem.call_count, _DEGRADED_LEDGER_LIMIT)
+        self.assertEqual(
+            client.pipeline_instance.zrem.call_count,
+            _DEGRADED_LEDGER_LIMIT,
+        )
+
+    def _fail_registration(self, exc):
+        from heroku_manager.heroku import _IndexAdapter
+
+        incumbent = self._dyno("normal_worker.1")
+        with patch_index_backend({}):
+            _seed_owned_dyno(incumbent)
+            backend = heroku_module.cache
+            pipeline = MagicMock()
+            pipeline.watch.return_value = pipeline
+            pipeline.get.return_value = None
+            pipeline.exists.return_value = 1
+            pipeline.multi.return_value = pipeline
+            pipeline.execute.side_effect = exc
+            with patch.object(backend._client, "pipeline", return_value=pipeline):
+                adapter = _IndexAdapter(incumbent.app_name, primary=True)
+                status = adapter.claim_and_register(
+                    "normal_worker.2",
+                    "joining-owner",
+                    time.time(),
+                    timezone.now(),
+                    300,
+                )
+            self.assertIn(status, {"unavailable", "contended"})
+            self.assertTrue(_registry_degraded(incumbent))
+            with patch.object(incumbent, "call_heroku_api") as call:
+                self.assertFalse(incumbent.downscale_formation_if_allowed())
+            call.assert_not_called()
+        return incumbent
+
+    def test_failed_first_registration_stays_degraded_without_a_heartbeat(self):
+        self._fail_registration(RuntimeError("first write failed"))
+
+    def test_exhausted_watch_retries_stay_degraded_without_a_heartbeat(self):
+        from redis.exceptions import WatchError
+
+        self._fail_registration(WatchError("owner or index changed"))
+
+    def test_registration_grace_clears_only_the_matching_failure(self):
+        from heroku_manager.heroku import (
+            _IndexAdapter,
+            _registry_degraded_grace,
+        )
+
+        incumbent = self._dyno("normal_worker.1")
+        first = time.time()
+        second = first + 10
+        _, client = self._patch_backend({
+            "zrange": MagicMock(return_value=[(b"normal_worker.2", second)]),
+            "zscore": MagicMock(return_value=None),
+            "get": MagicMock(return_value=None),
+        })
+
+        status = _IndexAdapter(
+            incumbent.app_name, primary=True,
+        ).clear_degraded_if_score("normal_worker.2", first)
+        self.assertEqual(status, "changed")
+        client.pipeline_instance.zrem.assert_not_called()
+
+        with patch(
+                    "heroku_manager.heroku.time.time",
+                    return_value=second + _registry_degraded_grace() + 1,
+                ):
+            self.assertFalse(_registry_degraded(incumbent))
+        client.pipeline_instance.zrem.assert_called_once_with(
+            "heroku:dynos:v1:floship:degraded", "normal_worker.2",
+        )
 
     def test_ledger_read_failure_is_degraded(self):
         from heroku_manager.heroku import _registry_degraded
@@ -1547,7 +1911,9 @@ class TestIndexAppIsolation(unittest.TestCase):
         backend = MagicMock()
         client = MagicMock()
         client.zrange.return_value = []  # no failed-writer ledger unless the test sets it
-        client.get.return_value = None  # degraded marker absent unless the test sets it
+        owner_value = object()
+        backend.client.encode.return_value = owner_value
+        client.get.side_effect = lambda key: owner_value if "dyno_owner" in str(key) else None
         zsets = {
             "p:heroku:dynos:v1:app-a": ["a_worker.1", "a_worker.2"],
             "p:heroku:dynos:v1:app-b": ["b_worker.1"],
