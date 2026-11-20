@@ -660,7 +660,7 @@ class TestObservationWriter(unittest.TestCase):
 
         self.assertTrue(parsed)
         cache_key, _logs = set_cache.call_args.args
-        self.assertIn(":strict:v1", cache_key)
+        self.assertIn(":strict:v2", cache_key)
         self.assertEqual(set_cache.call_args.kwargs["timeout"], 30)
 
     def test_failed_strict_check_in_fetch_is_shared_by_memory_and_load(self):

@@ -4180,13 +4180,23 @@ class HerokuDyno:
         dyno_id = self._verified_self_dyno_id
         if dyno_id:
             cache_key = f'{cache_key}:{dyno_id}'
-        if strict_observation:
-            cache_key = f'{cache_key}:strict:v1'
-        logs = cache.get(cache_key)
+        if source != "heroku":
+            cache_key = f'{cache_key}:source:{source}'
+        strict_key = f'{cache_key}:strict:v2'
+        read_key = strict_key if strict_observation else cache_key
+        lock_key = cache_key if dyno_id else read_key
+
+        def cached_logs():
+            logs = cache.get(read_key)
+            if not logs and dyno_id and not strict_observation:
+                return cache.get(strict_key)
+            return logs
+
+        logs = cached_logs()
         if not logs:
             try:
-                with cache.lock(cache_key, expire=90):
-                    logs = cache.get(cache_key)
+                with cache.lock(lock_key, expire=90):
+                    logs = cached_logs()
                     if not logs:
                         # Step 1: Set up API request to retrieve logs
                         url = f"https://api.heroku.com/apps/{self.app_name}/log-sessions"
@@ -4232,9 +4242,9 @@ class HerokuDyno:
                                     settings, 'DYNO_AUTOSCALE_INTERVAL', 30,
                                 ))),
                             )
-                        cache.set(cache_key, logs, timeout=log_cache_ttl)
+                        cache.set(read_key, logs, timeout=log_cache_ttl)
             except _LockExpiryErrors:
-                logger.warning(f"Lock '{cache_key}' expired before release. Logs may already be cached.")
+                logger.warning(f"Lock '{lock_key}' expired before release. Logs may already be cached.")
 
         if not logs:
             return None

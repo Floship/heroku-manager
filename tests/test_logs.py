@@ -80,6 +80,46 @@ class TestGetHerokuLogs(BaseLockTestCase):
         mock_api.assert_called_once()
         self.assertEqual(r1, r2)
 
+    def test_relaxed_reader_reuses_the_same_incarnations_strict_logs(self):
+        dyno = make_dyno()
+        dyno.dyno_id = SELF_DYNO_ID
+        sample = _identified_log_sample()
+        with patch.dict(os.environ, {"DYNO": dyno.dyno_name}), \
+                patch.object(dyno, "call_heroku_api", return_value=_make_log_response(sample)) as api, \
+                patch("heroku_manager.heroku.requests.get", return_value=_make_logplex_response(sample)):
+            strict = dyno.get_heroku_logs(strict_observation=True)
+            relaxed = dyno.get_heroku_logs()
+
+        api.assert_called_once()
+        self.assertEqual(strict, relaxed)
+        self.assertEqual(relaxed[0]["source_dyno_id"], SELF_DYNO_ID)
+
+    def test_strict_reader_refetches_after_a_relaxed_read(self):
+        dyno = make_dyno()
+        dyno.dyno_id = SELF_DYNO_ID
+        sample = _identified_log_sample()
+        with patch.dict(os.environ, {"DYNO": dyno.dyno_name}), \
+                patch.object(dyno, "call_heroku_api", return_value=_make_log_response(sample)) as api, \
+                patch("heroku_manager.heroku.requests.get", return_value=_make_logplex_response(sample)):
+            self.assertTrue(dyno.get_heroku_logs())
+            self.assertTrue(dyno.get_heroku_logs(strict_observation=True))
+
+        self.assertEqual(api.call_count, 2)
+
+    def test_relaxed_reader_refetches_for_another_source_or_incarnation(self):
+        dyno = make_dyno()
+        dyno.dyno_id = SELF_DYNO_ID
+        sample = _identified_log_sample()
+        with patch.dict(os.environ, {"DYNO": dyno.dyno_name}), \
+                patch.object(dyno, "call_heroku_api", return_value=_make_log_response(sample)) as api, \
+                patch("heroku_manager.heroku.requests.get", return_value=_make_logplex_response(sample)):
+            self.assertTrue(dyno.get_heroku_logs(strict_observation=True))
+            self.assertTrue(dyno.get_heroku_logs(source="app"))
+            dyno.dyno_id = OLD_DYNO_ID
+            self.assertTrue(dyno.get_heroku_logs())
+
+        self.assertEqual(api.call_count, 3)
+
     def test_parses_log_entries_correctly(self):
         dyno = make_dyno()
         with patch.object(dyno, "call_heroku_api", return_value=_make_log_response(LOG_SAMPLE)):
