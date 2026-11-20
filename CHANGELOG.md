@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.2.20 - 2026-11-21
+- Add an opt-in shadow observer that also receives the original load sample time.
+
 ## 0.2.19 - 2026-11-21
 - Add an opt-in observer for live dyno check-ins so applications can compare another metric source before switching.
 

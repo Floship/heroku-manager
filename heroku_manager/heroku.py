@@ -2028,10 +2028,15 @@ class HerokuDyno:
     def load_1min_for_observation(self):
         """Return a real load sample, preserving an unavailable reading as None."""
         patterns = [r"sample#load_avg_1m=(\d+\.\d+)"]
-        return self.extract_latest_metric(
+        reading = self._extract_latest_metric_reading(
             patterns, cache_key="heroku:load_avg_1m", result_type=float,
             require_fresh_source=True,
         )
+        if reading is None:
+            return None
+        if '_strict_observation_logs' in self.__dict__:
+            self._strict_load_source_epoch = reading.source_epoch
+        return reading.value
 
     @property
     def _downscale_target_size(self):
@@ -2960,15 +2965,16 @@ class HerokuDyno:
         """Return whether the current process published a new observation."""
         return self._check_in_dyno_status() == 'published'
 
-    def _observe_runtime_shadow(self, memory_mb, memory_source_epoch, load_1m):
-        observer = getattr(settings, 'DYNO_RUNTIME_SHADOW_OBSERVER', None)
+    def _observe_runtime_shadow(self, memory_mb, memory_source_epoch, load_1m, load_source_epoch):
+        observer_v2 = getattr(settings, 'DYNO_RUNTIME_SHADOW_OBSERVER_V2', None)
+        observer = observer_v2 if observer_v2 is not None else getattr(settings, 'DYNO_RUNTIME_SHADOW_OBSERVER', None)
         if observer is None:
             return
         dyno_id = self._verified_self_dyno_id
         if not dyno_id:
             return
         try:
-            observer(
+            observation = dict(
                 app_name=self.app_name,
                 dyno_name=self.dyno_name,
                 dyno_id=dyno_id,
@@ -2977,6 +2983,9 @@ class HerokuDyno:
                 memory_source_epoch=memory_source_epoch,
                 load_1m=load_1m,
             )
+            if observer_v2 is not None:
+                observation["load_source_epoch"] = load_source_epoch
+            observer(**observation)
         except Exception as error:
             logger.warning(
                 "Dyno shadow observation failed for %s/%s: %s",
@@ -2999,6 +3008,7 @@ class HerokuDyno:
         self.__dict__['_strict_observation_logs'] = _STRICT_LOGS_UNSET
         memory_reading = None
         load = None
+        load_source_epoch = None
         try:
             try:
                 memory_reading = self.memory_reading_for_observation
@@ -3025,6 +3035,7 @@ class HerokuDyno:
 
             try:
                 load = self.load_1min_for_observation
+                load_source_epoch = self.__dict__.get('_strict_load_source_epoch')
             except Exception:
                 logger.warning(
                     "Failed to read load telemetry for %s/%s; leaving load unknown.",
@@ -3034,6 +3045,7 @@ class HerokuDyno:
                 load = None
         finally:
             self.__dict__.pop('_strict_observation_logs', None)
+            self.__dict__.pop('_strict_load_source_epoch', None)
 
         try:
             memory_veto = self._current_memory_pressure_veto()
@@ -3066,7 +3078,7 @@ class HerokuDyno:
             observation_epoch=memory_source_epoch,
         )
         if status == 'published':
-            self._observe_runtime_shadow(mem, memory_source_epoch, load)
+            self._observe_runtime_shadow(mem, memory_source_epoch, load, load_source_epoch)
             return status
         if status in ('owner_mismatch', 'contended'):
             owner_status, current_owner, _ = adapter.get_owner_and_score(self.dyno_name)

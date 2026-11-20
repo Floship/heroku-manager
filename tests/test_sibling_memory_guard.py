@@ -363,12 +363,12 @@ class TestCheckInDynoPublishesMemory(unittest.TestCase):
         dyno.dyno_id = "42d70e32-2e25-499e-aca3-cacda1a1378c"
         observer = MagicMock(side_effect=RuntimeError("shadow reader unavailable"))
         memory_epoch = time.time() - 2
+        load_epoch = memory_epoch - 3
         with (
-            override_settings(DYNO_RUNTIME_SHADOW_OBSERVER=observer),
+            override_settings(DYNO_RUNTIME_SHADOW_OBSERVER_V2=observer),
             patch.object(type(dyno), "memory_reading_for_observation",
                          new_callable=PropertyMock, return_value=_MetricReading(512, memory_epoch)),
-            patch.object(type(dyno), "load_1min_for_observation",
-                         new_callable=PropertyMock, return_value=0.0),
+            patch.object(dyno, "_extract_latest_metric_reading", return_value=_MetricReading(0.0, load_epoch)),
         ):
             self.assertTrue(dyno.check_in_dyno())
 
@@ -380,8 +380,23 @@ class TestCheckInDynoPublishesMemory(unittest.TestCase):
             memory_mb=512,
             memory_source_epoch=memory_epoch,
             load_1m=0.0,
+            load_source_epoch=load_epoch,
         )
         self.assertEqual(cache.get("heroku:dyno_memory:normal_worker.3"), 512)
+
+    def test_shadow_observer_keeps_the_original_callback_signature(self):
+        dyno = make_dyno("normal_worker.3")
+        dyno.dyno_id = "42d70e32-2e25-499e-aca3-cacda1a1378c"
+        received = []
+
+        def original_observer(*, app_name, dyno_name, dyno_id, observed_at,
+                              memory_mb, memory_source_epoch, load_1m):
+            received.append((dyno_id, memory_mb, load_1m))
+
+        with override_settings(DYNO_RUNTIME_SHADOW_OBSERVER=original_observer):
+            dyno._observe_runtime_shadow(512, 100.0, 0.0, 99.0)
+
+        self.assertEqual(received, [(dyno.dyno_id, 512, 0.0)])
 
     def test_shadow_observer_requires_a_verified_run_and_successful_publication(self):
         observer = MagicMock()
