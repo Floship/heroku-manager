@@ -119,13 +119,15 @@ readers can reuse a fresh strict snapshot from the same verified dyno and source
 A log-session 429 pauses new log sessions for that app during Retry-After.
 Readers can continue using cached logs during this pause.
 
-Applications can set `DYNO_RUNTIME_SHADOW_OBSERVER` to a callable that compares
+Applications can set `DYNO_RUNTIME_SHADOW_OBSERVER_V2` to a callable that compares
 an alternate metric source. After a successful check-in with a verified dyno
 UUID, the observer receives keyword arguments `app_name`, `dyno_name`, `dyno_id`,
-`observed_at`, `memory_mb`, `memory_source_epoch`, and `load_1m`. Times are Unix
-seconds. Missing metric values and memory timestamps are `None`. Keep the
-observer fast and read-only because it runs synchronously. The autoscaler uses
-its existing observations for decisions.
+`observed_at`, `memory_mb`, `memory_source_epoch`, `load_1m`, and
+`load_source_epoch`. Times are Unix seconds. Missing values or timestamps are
+`None`. The legacy `DYNO_RUNTIME_SHADOW_OBSERVER` remains available without
+`load_source_epoch` when the V2 setting is absent. Keep the observer fast and
+read-only because it runs synchronously. The autoscaler uses its existing
+observations for decisions.
 
 Both formation resize methods read the primary formation tier before taking a
 lock, writing a resize flag, or sending a PATCH. A process whose `DYNO_RAM`
