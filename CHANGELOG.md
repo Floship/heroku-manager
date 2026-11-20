@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.2.19 - 2026-11-21
+- Add an opt-in observer for live dyno check-ins so applications can compare another metric source before switching.
+
 ## 0.2.18 - 2026-11-20
 - Reuse fresh log snapshots from strict observations for other readers of the same dyno and source.
 - Pause new autoscaler log sessions across an app after HTTP 429. Keep using cached logs during the provider's retry window.

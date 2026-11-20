@@ -2960,6 +2960,29 @@ class HerokuDyno:
         """Return whether the current process published a new observation."""
         return self._check_in_dyno_status() == 'published'
 
+    def _observe_runtime_shadow(self, memory_mb, memory_source_epoch, load_1m):
+        observer = getattr(settings, 'DYNO_RUNTIME_SHADOW_OBSERVER', None)
+        if observer is None:
+            return
+        dyno_id = self._verified_self_dyno_id
+        if not dyno_id:
+            return
+        try:
+            observer(
+                app_name=self.app_name,
+                dyno_name=self.dyno_name,
+                dyno_id=dyno_id,
+                observed_at=time.time(),
+                memory_mb=memory_mb,
+                memory_source_epoch=memory_source_epoch,
+                load_1m=load_1m,
+            )
+        except Exception as error:
+            logger.warning(
+                "Dyno shadow observation failed for %s/%s: %s",
+                self.app_name, self.dyno_name, type(error).__name__,
+            )
+
     def _check_in_dyno_status(self):
         """Claim this dyno, sample it, and publish one owner-bound observation."""
         now = timezone.now()
@@ -3033,18 +3056,17 @@ class HerokuDyno:
             (f'heroku:dyno_load:{self.dyno_name}', load, ttl),
         ]
         adapter = _IndexAdapter(self.app_name, primary=True)
+        memory_source_epoch = memory_reading.source_epoch if memory_reading is not None else None
         status = adapter.publish_owned_values(
             self.dyno_name,
             self._dyno_owner_token,
             score,
             values,
             observation_memory=mem,
-            observation_epoch=(
-                memory_reading.source_epoch
-                if memory_reading is not None else None
-            ),
+            observation_epoch=memory_source_epoch,
         )
         if status == 'published':
+            self._observe_runtime_shadow(mem, memory_source_epoch, load)
             return status
         if status in ('owner_mismatch', 'contended'):
             owner_status, current_owner, _ = adapter.get_owner_and_score(self.dyno_name)

@@ -358,6 +358,54 @@ class TestCheckInDynoPublishesMemory(unittest.TestCase):
             dyno.check_in_dyno()
         self.assertEqual(cache.get("heroku:dyno_memory:normal_worker.3"), 512)
 
+    def test_shadow_observer_receives_live_sample_for_exact_dyno_run(self):
+        dyno = make_dyno("normal_worker.3")
+        dyno.dyno_id = "42d70e32-2e25-499e-aca3-cacda1a1378c"
+        observer = MagicMock(side_effect=RuntimeError("shadow reader unavailable"))
+        memory_epoch = time.time() - 2
+        with (
+            override_settings(DYNO_RUNTIME_SHADOW_OBSERVER=observer),
+            patch.object(type(dyno), "memory_reading_for_observation",
+                         new_callable=PropertyMock, return_value=_MetricReading(512, memory_epoch)),
+            patch.object(type(dyno), "load_1min_for_observation",
+                         new_callable=PropertyMock, return_value=0.0),
+        ):
+            self.assertTrue(dyno.check_in_dyno())
+
+        observer.assert_called_once_with(
+            app_name="floship",
+            dyno_name="normal_worker.3",
+            dyno_id=dyno.dyno_id,
+            observed_at=ANY,
+            memory_mb=512,
+            memory_source_epoch=memory_epoch,
+            load_1m=0.0,
+        )
+        self.assertEqual(cache.get("heroku:dyno_memory:normal_worker.3"), 512)
+
+    def test_shadow_observer_requires_a_verified_run_and_successful_publication(self):
+        observer = MagicMock()
+        for dyno_id, publish_status in (
+            (None, "published"),
+            ("42d70e32-2e25-499e-aca3-cacda1a1378c", "memory_pressure"),
+        ):
+            with self.subTest(dyno_id=dyno_id, publish_status=publish_status):
+                dyno = make_dyno("normal_worker.3")
+                dyno.dyno_id = dyno_id
+                with (
+                    override_settings(DYNO_RUNTIME_SHADOW_OBSERVER=observer),
+                    patch.object(dyno, "_claim_current_dyno", return_value=(True, time.time())),
+                    patch.object(type(dyno), "memory_reading_for_observation",
+                                 new_callable=PropertyMock, return_value=_MetricReading(512, time.time())),
+                    patch.object(type(dyno), "load_1min_for_observation",
+                                 new_callable=PropertyMock, return_value=0.0),
+                    patch.object(_IndexAdapter, "publish_owned_values", return_value=publish_status) as publish,
+                ):
+                    self.assertEqual(dyno.check_in_dyno(), publish_status == "published")
+
+                publish.assert_called_once()
+                observer.assert_not_called()
+
     def test_check_in_dyno_does_not_publish_missing_memory_as_zero(self):
         """A missing memory source stays None in the strict observation."""
         dyno = make_dyno("normal_worker.3")
