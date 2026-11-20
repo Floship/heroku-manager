@@ -114,8 +114,10 @@ Strict observations use a separate raw-log cache capped by the autoscale
 interval. Memory and load share one log-session fetch during a check-in. A
 failure is memoized for that check-in, so a missing memory reading cannot cause
 a second request for load. A standalone strict read does not keep the failure
-memoized after that request, so the next metric request can recover. The legacy
-cache keeps its prior behavior.
+memoized after that request, so the next metric request can recover. Relaxed
+readers can reuse a fresh strict snapshot from the same verified dyno and source.
+A log-session 429 pauses new log sessions for that app during Retry-After.
+Readers can continue using cached logs during this pause.
 
 Both formation resize methods read the primary formation tier before taking a
 lock, writing a resize flag, or sending a PATCH. A process whose `DYNO_RAM`
@@ -213,7 +215,8 @@ Deploy prerequisites, all of which held for every Floship app at release time:
 2. The app ZSET exists and the fresh members contain every dyno name
    `heroku ps` reports.
 
-Rollback for this release is v0.2.16. It does not use owner leases or strict
+Version 0.2.18 can roll back to v0.2.17. For a rollback from v0.2.17,
+v0.2.16 does not use owner leases or strict
 observation tuples. Pause destructive scaling and drain the 0.2.17 writers
 before rolling back. The legacy memory, stability, load, and registry keys
 remain compatible with that version.
