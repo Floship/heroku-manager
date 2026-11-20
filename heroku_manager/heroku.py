@@ -16,6 +16,7 @@ from requests.exceptions import SSLError, ConnectionError, Timeout
 from django.conf import settings
 from django.core.cache import cache
 from django.utils.functional import cached_property
+from django.utils.http import parse_http_date_safe
 from django.utils import timezone
 from importlib import import_module
 
@@ -23,6 +24,22 @@ import logging
 from .proxy import HerokuProxy, ProxyResponse
 
 logger = logging.getLogger(__name__)
+
+
+def _is_log_session_request(method, url):
+    return method.upper() == "POST" and re.fullmatch(
+        r"(?:https://api\.heroku\.com)?/apps/[^/?#]+/log-sessions", url
+    ) is not None
+
+
+def _log_session_retry_delay(value):
+    value = value.strip()
+    if re.fullmatch(r"[0-9]{1,6}", value):
+        return max(1, min(86400, int(value)))
+    retry_at = parse_http_date_safe(value)
+    if retry_at is None:
+        return 60
+    return max(1, min(86400, math.ceil(retry_at - time.time())))
 
 
 try:
@@ -2242,10 +2259,7 @@ class HerokuDyno:
         pending_key = None
         request_id = None
         # Creating a log session is a repeatable read, despite Heroku's POST API.
-        log_session_read = method.upper() == "POST" and re.fullmatch(
-            r"(?:https://api\.heroku\.com)?/apps/[^/?#]+/log-sessions", url
-        ) is not None
-        if method.upper() not in ("GET", "HEAD") and not log_session_read:
+        if method.upper() not in ("GET", "HEAD") and not _is_log_session_request(method, url):
             pending_key = self._proxy_pending_key(method.upper(), url, data)
             previous = cache.get(pending_key)
             reserved = False
@@ -2412,6 +2426,8 @@ class HerokuDyno:
 
             # ---- 429 back-off ----
             if response.status_code == 429:
+                if _is_log_session_request(method, url):
+                    return response
                 retry_after = int(response.headers.get('Retry-After', 30))
                 backoff = min(retry_after + random.uniform(1, 5), 120)
                 logger.warning(
@@ -4180,14 +4196,29 @@ class HerokuDyno:
         dyno_id = self._verified_self_dyno_id
         if dyno_id:
             cache_key = f'{cache_key}:{dyno_id}'
-        if strict_observation:
-            cache_key = f'{cache_key}:strict:v1'
-        logs = cache.get(cache_key)
+        if source != "heroku":
+            cache_key = f'{cache_key}:source:{source}'
+        strict_key = f'{cache_key}:strict:v2'
+        read_key = strict_key if strict_observation else cache_key
+        lock_key = cache_key if dyno_id else read_key
+        backoff_key = f'heroku:log_session_backoff:{self.app_name}'
+
+        def cached_logs():
+            logs = cache.get(read_key)
+            if not logs and dyno_id and not strict_observation:
+                return cache.get(strict_key)
+            return logs
+
+        logs = cached_logs()
         if not logs:
+            if (cache.get(backoff_key) or 0) > time.time():
+                return None
             try:
-                with cache.lock(cache_key, expire=90):
-                    logs = cache.get(cache_key)
+                with cache.lock(lock_key, expire=90):
+                    logs = cached_logs()
                     if not logs:
+                        if (cache.get(backoff_key) or 0) > time.time():
+                            return None
                         # Step 1: Set up API request to retrieve logs
                         url = f"https://api.heroku.com/apps/{self.app_name}/log-sessions"
                         payload = {
@@ -4197,8 +4228,18 @@ class HerokuDyno:
                             "lines": 200  # Adjusting this almost does nothing
                         }
 
-                        # Step 2: Start a log session via call_heroku_api (rate-limited + retry)
                         response = self.call_heroku_api("POST", url, data=payload)
+                        if response is not None and response.status_code == 429:
+                            # Share the provider window across dynos and log sources in this app.
+                            until = time.time() + _log_session_retry_delay(response.headers.get("Retry-After", ""))
+                            with cache.lock(backoff_key + ":lock", expire=10):
+                                now = time.time()
+                                previous = cache.get(backoff_key) or 0
+                                delay = max(1, math.ceil(max(until, previous) - now))
+                                cache.set(backoff_key, max(until, previous), timeout=delay)
+                            if previous <= now:
+                                logger.warning("Pausing new autoscaler log sessions for %s for %ss", self.app_name, delay)
+                            return None
                         if not response:
                             logger.warning("Failed to retrieve log session (rate-limited or network error).")
                             return None
@@ -4232,9 +4273,9 @@ class HerokuDyno:
                                     settings, 'DYNO_AUTOSCALE_INTERVAL', 30,
                                 ))),
                             )
-                        cache.set(cache_key, logs, timeout=log_cache_ttl)
+                        cache.set(read_key, logs, timeout=log_cache_ttl)
             except _LockExpiryErrors:
-                logger.warning(f"Lock '{cache_key}' expired before release. Logs may already be cached.")
+                logger.warning(f"Lock '{lock_key}' expired before release. Logs may already be cached.")
 
         if not logs:
             return None

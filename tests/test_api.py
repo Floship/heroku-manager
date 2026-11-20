@@ -142,6 +142,16 @@ class TestCallHerokuApiDirect(BaseLockTestCase):
         self.assertEqual(request.call_count, 1)
         self.assertEqual(first.status_code, second.status_code)
 
+    def test_log_session_429_returns_first_refusal_to_shared_backoff(self):
+        dyno = make_legacy_dyno()
+        response = mock_response(429, headers={"Retry-After": "45"})
+        with patch("heroku_manager.heroku.requests.request", return_value=response) as request, \
+                patch("heroku_manager.heroku.time.sleep") as sleep:
+            self.assertIsNone(dyno.get_heroku_logs())
+        request.assert_called_once()
+        sleep.assert_not_called()
+        self.assertGreater(cache.get(f"heroku:log_session_backoff:{dyno.app_name}", 0), 0)
+
     def test_429_backoff_then_success(self):
         dyno = make_legacy_dyno()
         with patch("heroku_manager.heroku.requests.request",

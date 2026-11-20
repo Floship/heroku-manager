@@ -2,10 +2,13 @@
 Tests: log parsing, extract_latest_metric, metric helpers (memory, load, R14/R15).
 """
 import os
+import time
 import unittest
 from unittest.mock import patch, MagicMock
 from tests.conftest import make_dyno, BaseLockTestCase
 from django.core.cache import cache
+
+from heroku_manager.proxy import ProxyResponse
 
 
 from datetime import datetime, timezone as dt_tz
@@ -79,6 +82,78 @@ class TestGetHerokuLogs(BaseLockTestCase):
         # API called once; second call uses cache
         mock_api.assert_called_once()
         self.assertEqual(r1, r2)
+
+    def test_rate_limit_pauses_new_log_sessions_across_dynos_for_retry_after(self):
+        first = make_dyno()
+        sibling = make_dyno("normal_worker.2")
+        cached = make_dyno("normal_worker.3")
+        independent = make_dyno()
+        independent.app_name = "other-app"
+        throttled = ProxyResponse(429, '{"id":"rate_limit"}', {"Retry-After": "45"})
+
+        with patch.object(cached, "call_heroku_api", return_value=_make_log_response(LOG_SAMPLE)), \
+                patch("heroku_manager.heroku.requests.get", return_value=_make_logplex_response(LOG_SAMPLE)):
+            self.assertTrue(cached.get_heroku_logs())
+
+        with patch.object(first, "call_heroku_api", return_value=throttled) as rejected, \
+                patch.object(sibling, "call_heroku_api", return_value=_make_log_response(LOG_SAMPLE)) as next_call, \
+                patch.object(cached, "call_heroku_api") as cache_miss, \
+                patch.object(independent, "call_heroku_api", return_value=_make_log_response(LOG_SAMPLE)) as other, \
+                patch("heroku_manager.heroku.requests.get", return_value=_make_logplex_response(LOG_SAMPLE)):
+            self.assertIsNone(first.get_heroku_logs())
+            self.assertIsNone(sibling.get_heroku_logs())
+            rejected.assert_called_once()
+            next_call.assert_not_called()
+            self.assertTrue(cached.get_heroku_logs())
+            cache_miss.assert_not_called()
+            self.assertTrue(independent.get_heroku_logs())
+            other.assert_called_once()
+            deadline = cache.get("heroku:log_session_backoff:floship")
+            self.assertIsNotNone(deadline)
+            self.assertGreater(deadline, time.time() + 43)
+            with patch("heroku_manager.heroku.time.time", return_value=deadline + 1):
+                self.assertTrue(sibling.get_heroku_logs())
+            next_call.assert_called_once()
+
+    def test_relaxed_reader_reuses_the_same_incarnations_strict_logs(self):
+        dyno = make_dyno()
+        dyno.dyno_id = SELF_DYNO_ID
+        sample = _identified_log_sample()
+        with patch.dict(os.environ, {"DYNO": dyno.dyno_name}), \
+                patch.object(dyno, "call_heroku_api", return_value=_make_log_response(sample)) as api, \
+                patch("heroku_manager.heroku.requests.get", return_value=_make_logplex_response(sample)):
+            strict = dyno.get_heroku_logs(strict_observation=True)
+            relaxed = dyno.get_heroku_logs()
+
+        api.assert_called_once()
+        self.assertEqual(strict, relaxed)
+        self.assertEqual(relaxed[0]["source_dyno_id"], SELF_DYNO_ID)
+
+    def test_strict_reader_refetches_after_a_relaxed_read(self):
+        dyno = make_dyno()
+        dyno.dyno_id = SELF_DYNO_ID
+        sample = _identified_log_sample()
+        with patch.dict(os.environ, {"DYNO": dyno.dyno_name}), \
+                patch.object(dyno, "call_heroku_api", return_value=_make_log_response(sample)) as api, \
+                patch("heroku_manager.heroku.requests.get", return_value=_make_logplex_response(sample)):
+            self.assertTrue(dyno.get_heroku_logs())
+            self.assertTrue(dyno.get_heroku_logs(strict_observation=True))
+
+        self.assertEqual(api.call_count, 2)
+
+    def test_relaxed_reader_refetches_for_another_source_or_incarnation(self):
+        dyno = make_dyno()
+        dyno.dyno_id = SELF_DYNO_ID
+        sample = _identified_log_sample()
+        with patch.dict(os.environ, {"DYNO": dyno.dyno_name}), \
+                patch.object(dyno, "call_heroku_api", return_value=_make_log_response(sample)) as api, \
+                patch("heroku_manager.heroku.requests.get", return_value=_make_logplex_response(sample)):
+            self.assertTrue(dyno.get_heroku_logs(strict_observation=True))
+            self.assertTrue(dyno.get_heroku_logs(source="app"))
+            dyno.dyno_id = OLD_DYNO_ID
+            self.assertTrue(dyno.get_heroku_logs())
+
+        self.assertEqual(api.call_count, 3)
 
     def test_parses_log_entries_correctly(self):
         dyno = make_dyno()

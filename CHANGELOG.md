@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.18 - 2026-11-20
+- Reuse fresh log snapshots from strict observations for other readers of the same dyno and source.
+- Pause new autoscaler log sessions across an app after HTTP 429. Keep using cached logs during the provider's retry window.
+
 ## 0.2.17 - 2026-11-19
 - Publish one score-bound per-dyno observation tuple containing memory, the stability computed from that same memory history, and load. Keep the legacy metric keys for older readers and rollback.
 - Register a dyno before telemetry sampling so a slow metric read cannot hide a joining worker. Reject stale cached measurements when live logs are unavailable. An owner or score rejection leaves the previous legacy keys unchanged, while an error after a write attempt leaves the outcome uncertain and strict readers closed.
