@@ -21,7 +21,7 @@ from django.utils import timezone
 from importlib import import_module
 
 import logging
-from .proxy import HerokuProxy, ProxyResponse
+from .proxy import HerokuProxy, ProxyResponse, host_size_write_denial, legacy_size_owner
 
 logger = logging.getLogger(__name__)
 
@@ -2253,6 +2253,9 @@ class HerokuDyno:
 
     def _call_heroku_api_via_proxy(self, method, url, custom_headers, data):
         """Use the permissioned HTTP proxy. Never use a local Heroku credential."""
+        denial = host_size_write_denial(method, url, data, headers=custom_headers)
+        if denial is not None:
+            return denial
         if not self.proxy.configured:
             logger.error(
                 "Heroku proxy is selected but not fully configured (%s); refusing to call Heroku directly.",
@@ -2389,6 +2392,9 @@ class HerokuDyno:
         - Retry on transient network errors (SSL, connection, timeout)
         - GET response caching (5 s)
         """
+        denial = host_size_write_denial(method, url, data, headers=custom_headers)
+        if denial is not None:
+            return denial
         custom_headers = custom_headers or {}
         headers = {
             "Accept": "application/vnd.heroku+json; version=3",
@@ -2410,6 +2416,11 @@ class HerokuDyno:
             if not self._acquire_rate_limit_token():
                 return None
 
+            # Recheck before each legacy retry, after the quota acquisition.
+            denial = host_size_write_denial(method, url, data, headers=custom_headers)
+            if denial is not None:
+                # An earlier attempt may already have reached the provider.
+                return denial if attempt == 1 else None
             try:
                 response = requests.request(method, url, headers=headers, json=data, timeout=30)
             except (SSLError, ConnectionError, Timeout) as exc:
@@ -2636,6 +2647,8 @@ class HerokuDyno:
         if 'beatworker' == self.formation_name and not getattr(settings, 'DYNO_AUTOSCALE_ENABLED_FOR_BEATWORKER', True):
             return
 
+        if r15_only and not legacy_size_owner():
+            return
         if self._defer_resize_for_retiring_dyno('autoscale'):
             return
 
@@ -2648,6 +2661,10 @@ class HerokuDyno:
             thread_count = None
             if getattr(settings, 'DYNO_LOG_THREADS_USED', False) and not self.remote_monitoring:
                 thread_count = self.set_threads_used()
+            if not legacy_size_owner():
+                self._restart_for_r14_pressure(require_no_upscale=True)
+                return
+
             if continuous and logger.isEnabledFor(logging.DEBUG):
                 self._log_autoscale_stats(thread_count)
 
@@ -2680,6 +2697,8 @@ class HerokuDyno:
         (e.g., due to Redis key loss or missed downscale) and restore the downscale timer.
         Also ensures original_formation_size is always recorded as a baseline.
         """
+        if not legacy_size_owner():
+            return
         try:
             current_size = self.formation_size
             original_size = self.original_formation_size
@@ -2729,7 +2748,7 @@ class HerokuDyno:
             logger.error(f"Startup formation check failed: {e}", exc_info=True)
 
     def _run_continuous(self):
-        # On startup, check for stuck upscaled state and record baseline
+        # Legacy size recovery is independent of observation and zombie checks.
         self._check_formation_on_startup()
 
         while not self._stop_autoscale_event.is_set():
@@ -3497,7 +3516,7 @@ class HerokuDyno:
         '''
         Upscale the dyno to the next level in the hierarchy for a period of X hours
         '''
-        if self._defer_resize_for_retiring_dyno('upscale'):
+        if not legacy_size_owner() or self._defer_resize_for_retiring_dyno('upscale'):
             return
 
         # Check if not already at max_dyno_size
@@ -3616,7 +3635,7 @@ class HerokuDyno:
 
     def downscale_formation_if_allowed(self, *, on_shutdown=False):
         """Evaluate one policy decision and carry its snapshot into the mutation."""
-        if _index_fail_closed(self) or self.requires_upscale:
+        if not legacy_size_owner() or _index_fail_closed(self) or self.requires_upscale:
             return False
         queue_allowed = (
             True if on_shutdown
@@ -3628,10 +3647,26 @@ class HerokuDyno:
         self.downscale_formation_to_original_size(decision=decision)
         return True
 
+    def _restart_for_r14_pressure(self, *, require_no_upscale=False):
+        if not (
+            self.current_memory_usage_percentage > getattr(settings, 'DOWNSCALE_PERCENTAGE_HIGH_MEM_USE', 105)
+            and self.detected_r14
+            and not self.detected_r15
+        ):
+            return False
+        if require_no_upscale and (self.requires_upscale or self.any_sibling_requires_upscale):
+            return False
+        if not self.no_tasks_in_queue:
+            return False
+        self.restart_dyno()
+        return True
+
     def check_and_downscale_to_original_formation_size(self):
         """
         Checks if formation should be downscaled by checking memory usage and downscale if necessary
         """
+        if not legacy_size_owner():
+            return
         # Check if formation is upscaled and if it should be downscaled
         check_interval = getattr(settings, 'DYNO_DOWNSCALE_CHECK_INTERVAL', 300)
         adapter = _IndexAdapter(self.app_name, primary=True)
@@ -3728,8 +3763,7 @@ class HerokuDyno:
                 return
 
         # if on original formation size and memory usage is high, restart the dyno
-        if self.current_memory_usage_percentage > getattr(settings, 'DOWNSCALE_PERCENTAGE_HIGH_MEM_USE', 105) and self.detected_r14 and not self.detected_r15 and self.no_tasks_in_queue:
-            self.restart_dyno()
+        if self._restart_for_r14_pressure():
             return
 
         # Guard: the upscale_until key may have expired while memory is still
@@ -3777,7 +3811,7 @@ class HerokuDyno:
         expected_upscale_timer_raw=_UPSCALE_TIMER_UNBOUND,
         expected_cleanup_capture=None,
     ):
-        if self._defer_resize_for_retiring_dyno('downscale'):
+        if not legacy_size_owner() or self._defer_resize_for_retiring_dyno('downscale'):
             return
 
         if self.previous_formation_size is None:

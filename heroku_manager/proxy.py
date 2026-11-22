@@ -7,6 +7,7 @@ import json
 import os
 import time
 import uuid
+from posixpath import normpath
 from typing import ClassVar
 from urllib.parse import unquote, urlsplit
 
@@ -20,7 +21,7 @@ class ProxyResponse:
         "already_dispatched_check_provider_state", "bad_request", "body_limit",
         "busy", "cache_state_unavailable_check_provider_state", "conflict",
         "cooldown", "database_unavailable", "deadline_exceeded_check_provider_state",
-        "forbidden", "idempotency_conflict", "idempotency_key_required",
+        "forbidden", "host_size_owner_denied", "idempotency_conflict", "idempotency_key_required",
         "invalid_client", "invalid_credential", "invalid_json", "invalid_params",
         "not_found", "operation_forbidden", "outcome_not_recorded_check_provider_state",
         "path_forbidden", "proxy_outcome_unknown", "proxy_reconciliation_required",
@@ -60,6 +61,38 @@ class ProxyResponse:
         if isinstance(code, str) and code in self._ERROR_IDS:
             return code
         return None
+
+
+def legacy_size_owner():
+    """The app's size owner for this process. Unknown explicit values hold writes."""
+    return os.environ.get("HEROKU_SIZE_OWNER", "legacy") == "legacy"
+
+
+def host_size_write_denial(method, url, data, *, headers=None, request_id=None):
+    if legacy_size_owner():
+        return None
+    method = method.upper()
+    if method == "POST" and headers:
+        method = requests.structures.CaseInsensitiveDict(headers).get("X-Http-Method-Override", method).upper()
+    if method != "PATCH":
+        return None
+    # Accept both the absolute Platform URL and the path passed to the proxy.
+    path = normpath(unquote(urlsplit(url).path)).strip("/").split("/")
+    if len(path) < 3 or path[0] != "apps" or path[2] != "formation":
+        return None
+    if isinstance(data, bytes):  # The signed request already serialized this body.
+        data = json.loads(data)
+    if isinstance(data, dict):
+        if len(path) == 4 and data.keys() == {"quantity"}:
+            return None
+        if len(path) == 3 and data.keys() == {"updates"}:
+            updates = data["updates"]
+            if isinstance(updates, list) and all(
+                isinstance(update, dict) and update.keys() == {"type", "quantity"}
+                for update in updates
+            ):
+                return None
+    return ProxyResponse(403, '{"id":"host_size_owner_denied"}', request_id=request_id)
 
 
 class HerokuProxy:
@@ -248,6 +281,10 @@ class HerokuProxy:
         if prepared is None:
             return None
         request_id = prepared.headers.get("idempotency-key")
+        if upstream == "platform":
+            denial = host_size_write_denial(prepared.method, url, prepared.body, request_id=request_id)
+            if denial is not None:
+                return denial
         # One attempt. A timeout on a mutation requires reconciliation, never a new request ID and automatic redispatch.
         try:
             response = self._session.send(prepared, timeout=(3, 25), allow_redirects=False)
