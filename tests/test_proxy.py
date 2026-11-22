@@ -72,6 +72,29 @@ class ProxyTests(unittest.TestCase):
         return response
 
     @patch("heroku_manager.proxy.requests.Session.send")
+    def test_held_size_owner_preserves_quantity_and_restarts(self, send):
+        send.return_value = self.response()
+        client, _ = self.make_client()
+        formation = "/apps/production/formation"
+        updates = (
+            (formation + "/worker", {"size": "standard-2x"}),
+            (formation + "/worker", {"quantity": 2, "dyno_size": {"name": "standard-2x"}}),
+            (formation, {"updates": [{"type": "worker", "size": "standard-2x"}]}),
+        )
+        for owner in ("held", "central", ""):
+            with patch.dict(os.environ, {"HEROKU_SIZE_OWNER": owner}):
+                for path, data in updates:
+                    with self.subTest(owner=owner, data=data):
+                        result = client.request("PATCH", path, data=data)
+                        self.assertEqual(result.error_id, "host_size_owner_denied")
+                        send.assert_not_called()
+        with patch.dict(os.environ, {"HEROKU_SIZE_OWNER": "central"}):
+            client.request("PATCH", formation + "/worker", data={"quantity": 2})
+            client.request("PATCH", formation, data={"updates": [{"type": "worker", "quantity": 2}]})
+            client.request("DELETE", "/apps/production/dynos/worker.1")
+        self.assertEqual([call.args[0].method for call in send.call_args_list], ["PATCH", "PATCH", "DELETE"])
+
+    @patch("heroku_manager.proxy.requests.Session.send")
     def test_signs_split_message_and_sends_only_a_fresh_capsule(self, send):
         send.return_value = self.response()
         client, inner = self.make_client()

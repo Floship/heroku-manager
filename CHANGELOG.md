@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.2.21
+- Add `HEROKU_SIZE_OWNER` to hold host formation resizing during a central ownership transfer. Keep the legacy owner when the setting is unset. Held hosts continue to report telemetry and may restart individual dynos.
+
 ## 0.2.20 - 2026-11-21
 - Add an opt-in shadow observer that also receives the original load sample time.
 
